@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.turbo/
+npm-debug.log*
+
+# Runtime generated databases, caches & uploads (excluded from git; created on startup/seed)
+backend/data/*.db*
+backend/data/*.sqlite*
+backend/data/*.duckdb*
+backend/data/*.wal
+backend/data/test_run/
+backend/data/uploads/
+backend/data/exports/
+backend/data/cache/
+.env
+.env.local
+*.log

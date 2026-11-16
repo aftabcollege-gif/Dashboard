@@ -1,0 +1,74 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bi_app_db
+    environment:
+      POSTGRES_USER: bi_admin
+      POSTGRES_PASSWORD: ChangeMeStrongPass2026
+      POSTGRES_DB: bi_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./backend/migrations/postgres_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bi_admin -d bi_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: bi_cache_redis
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    container_name: bi_api_server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://bi_admin:ChangeMeStrongPass2026@postgres:5432/bi_platform
+      REDIS_URL: redis://redis:6379/0
+      WAREHOUSE_DUCKDB_PATH: /app/data/warehouse.duckdb
+      UPLOAD_DIR: /app/uploads
+      EXPORT_DIR: /app/exports
+    ports:
+      - "8000:8000"
+    volumes:
+      - bi_warehouse:/app/data
+      - bi_uploads:/app/uploads
+      - bi_exports:/app/exports
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: bi_web_ui
+    depends_on:
+      - backend
+    environment:
+      BACKEND_INTERNAL_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+
+volumes:
+  pg_data:
+  redis_data:
+  bi_warehouse:
+  bi_uploads:
+  bi_exports:
