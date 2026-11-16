@@ -14,8 +14,12 @@ class Settings(BaseSettings):
     API_PREFIX: str = "/api/v1"
     ENVIRONMENT: str = "development"
 
-    # Layer 1: Application Database (PostgreSQL in prod, SQLite WAL locally)
-    DATABASE_URL: str = f"sqlite:///{DATA_DIR / 'app_metadata.db'}"
+    # Layer 1: Application Database (PostgreSQL/Neon in prod, SQLite WAL locally)
+    DATABASE_URL: str = (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("POSTGRES_URL")
+        or f"sqlite:///{DATA_DIR / 'app_metadata.db'}"
+    )
 
     # Layer 2: Analytical Data Warehouse (DuckDB)
     WAREHOUSE_PATH: str = str(DATA_DIR / "warehouse.duckdb")
