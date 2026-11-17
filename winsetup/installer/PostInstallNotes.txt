@@ -1,0 +1,8 @@
+NexusBI Enterprise has been installed.
+
+- Offline Execution: No Python, Node.js, Docker, PostgreSQL, or Redis installation is required.
+- First Launch Security: On first launch, you will create your local Super Administrator
+  account and password. No default admin password is active.
+- User Data Location: %LocalAppData%\NexusBI\data
+- Logs Location: %LocalAppData%\NexusBI\logs
+- Uninstall Behavior: Uninstalling removes application binaries only and preserves %LocalAppData%\NexusBI.

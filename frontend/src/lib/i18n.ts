@@ -49,6 +49,10 @@ export const TRANSLATIONS: Record<Locale, Record<string, string>> = {
     adAuth: "Active Directory / Domain",
     signIn: "Sign In",
     welcome: "Enterprise Intelligence Control Center",
+    initialSetupTitle: "Initial Administrator Setup",
+    initialSetupSubtitle: "Create your local Super Administrator account to secure this NexusBI installation.",
+    createAdminBtn: "Create Administrator & Launch",
+    includeSampleLabel: "Load sample enterprise dashboards & analytical datasets (no demo users or default passwords)",
   },
   fa: {
     brand: "نکسوس BI سازمانی",
@@ -98,5 +102,9 @@ export const TRANSLATIONS: Record<Locale, Record<string, string>> = {
     adAuth: "ورود با Active Directory / دامنه",
     signIn: "ورود به سامانه",
     welcome: "مرکز کنترل و هوش تجاری سازمانی",
+    initialSetupTitle: "راه‌اندازی اولیه حساب مدیر سیستم",
+    initialSetupSubtitle: "برای ایمن‌سازی نصب نکسوس BI، حساب مدیر ارشد (Super Admin) خود را بسازید.",
+    createAdminBtn: "ساخت حساب مدیر و ورود به سامانه",
+    includeSampleLabel: "بارگذاری داشبوردها و دیتاست‌های نمونه (بدون ایجاد هیچ کاربر یا رمز پیش‌فرض)",
   },
 };

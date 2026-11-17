@@ -21,8 +21,16 @@ const DEFAULT_TOKENS: ThemeTokens = {
   chart_palette: ["#2563eb", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899"],
 };
 
+export interface AuthStatusInfo {
+  needs_initial_setup: boolean;
+  demo_mode: boolean;
+  setup_token_required: boolean;
+  environment?: string;
+}
+
 interface BiContextType {
   user: any | null;
+  authStatus: AuthStatusInfo | null;
   loadingAuth: boolean;
   locale: Locale;
   setLocale: (l: Locale) => void;
@@ -42,6 +50,7 @@ const BiContext = createContext<BiContextType | undefined>(undefined);
 
 export function BiProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<any | null>(null);
+  const [authStatus, setAuthStatus] = useState<AuthStatusInfo | null>(null);
   const [loadingAuth, setLoadingAuth] = useState(true);
   const [locale, setLocaleState] = useState<Locale>("en");
   const [themes, setThemes] = useState<BiTheme[]>([]);
@@ -94,7 +103,24 @@ export function BiProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  const refreshAuthStatus = async () => {
+    try {
+      const st = await apiFetch<AuthStatusInfo>("/auth/status");
+      setAuthStatus(st);
+      return st;
+    } catch {
+      return null;
+    }
+  };
+
   const refreshUser = async () => {
+    const status = await refreshAuthStatus();
+    if (status?.needs_initial_setup) {
+      setStoredToken(null);
+      setUser(null);
+      setLoadingAuth(false);
+      return;
+    }
     const tok = getStoredToken();
     if (!tok) {
       setUser(null);
@@ -121,6 +147,7 @@ export function BiProvider({ children }: { children: React.ReactNode }) {
     }
     setStoredToken(null);
     setUser(null);
+    await refreshAuthStatus();
   };
 
   useEffect(() => {
@@ -136,6 +163,7 @@ export function BiProvider({ children }: { children: React.ReactNode }) {
     <BiContext.Provider
       value={{
         user,
+        authStatus,
         loadingAuth,
         locale,
         setLocale,

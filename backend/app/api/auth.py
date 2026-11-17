@@ -1,3 +1,6 @@
+import re
+import secrets
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -21,15 +24,20 @@ from app.core.security import (
 )
 from app.database import get_db
 from app.engines.ad_ldap import ActiveDirectoryEngine
+from app.engines.scheduler import sync_scheduler_jobs
+from app.models.dashboard import Workspace
 from app.models.identity import (
     DirectoryConnection,
     ExternalIdentity,
     User,
     UserProfile,
+    UserRole,
     UserSession,
 )
+from app.seed.bootstrap import seed_core_catalog, seed_sample_bi_content
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+_BOOTSTRAP_LOCK = threading.Lock()
 
 
 class LoginRequest(BaseModel):
@@ -38,6 +46,16 @@ class LoginRequest(BaseModel):
     auth_mode: str = "local"  # local | active_directory
     domain: Optional[str] = None
     mfa_code: Optional[str] = None
+
+
+class BootstrapAdminRequest(BaseModel):
+    username: str
+    password: str
+    email: str
+    full_name: str = "Administrator"
+    organization_name: str = "Enterprise Analytics"
+    include_sample_data: bool = True
+    setup_token: Optional[str] = None
 
 
 class RefreshRequest(BaseModel):
@@ -51,6 +69,144 @@ class ChangePasswordRequest(BaseModel):
 
 class MfaConfirmRequest(BaseModel):
     code: str
+
+
+def _validate_strong_password(password: str) -> None:
+    if len(password) < 10:
+        raise HTTPException(status_code=400, detail="Password must be at least 10 characters long")
+    if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password):
+        raise HTTPException(status_code=400, detail="Password must include both uppercase and lowercase letters")
+    if not re.search(r"[0-9\W_]", password):
+        raise HTTPException(status_code=400, detail="Password must include at least one number or symbol")
+    if password in ("Admin!2026", "Designer!2026", "Analyst!2026", "Viewer!2026", "Manager!2026"):
+        raise HTTPException(status_code=400, detail="Default demo passwords cannot be used for initial setup")
+
+
+@router.get("/status")
+def auth_status(db: Session = Depends(get_db)):
+    user_count = db.query(User).count()
+    return {
+        "needs_initial_setup": user_count == 0,
+        "demo_mode": bool(settings.BI_SEED_DEMO_USERS and settings.ENVIRONMENT != "production"),
+        "setup_token_required": bool(user_count == 0 and settings.BI_INITIAL_SETUP_TOKEN),
+        "environment": settings.ENVIRONMENT,
+    }
+
+
+@router.post("/bootstrap-admin")
+def bootstrap_admin(body: BootstrapAdminRequest, request: Request, db: Session = Depends(get_db)):
+    ip = get_client_ip(request)
+    now = datetime.now(timezone.utc)
+
+    with _BOOTSTRAP_LOCK:
+        if db.query(User).count() > 0:
+            raise HTTPException(status_code=403, detail="Initial setup already completed")
+
+        if settings.BI_INITIAL_SETUP_TOKEN:
+            provided = (body.setup_token or request.headers.get("x-setup-token") or "").strip()
+            if not provided or not secrets.compare_digest(provided, settings.BI_INITIAL_SETUP_TOKEN):
+                raise HTTPException(status_code=403, detail="Invalid or missing initial setup token")
+
+        uname = body.username.strip()
+        if not re.match(r"^[A-Za-z0-9._-]{3,64}$", uname):
+            raise HTTPException(status_code=400, detail="Username must be 3-64 alphanumeric, dot, underscore, or dash characters")
+        if "@" not in body.email:
+            raise HTTPException(status_code=400, detail="Valid email address is required")
+        _validate_strong_password(body.password)
+
+        org, roles, theme_objs = seed_core_catalog(db)
+        if body.organization_name.strip():
+            org.name = body.organization_name.strip()[:200]
+
+        admin_user = User(
+            organization_id=org.id,
+            username=uname,
+            email=body.email.strip(),
+            password_hash=hash_password(body.password),
+            auth_source="local",
+            is_active=True,
+            last_login_at=now,
+        )
+        db.add(admin_user)
+        db.flush()
+        db.add(
+            UserProfile(
+                user_id=admin_user.id,
+                full_name=body.full_name.strip() or uname,
+                department="Administration",
+                org_unit="Administration",
+                region="All",
+            )
+        )
+        db.add(UserRole(user_id=admin_user.id, role_id=roles["super_admin"].id))
+
+        if not db.query(Workspace).filter(Workspace.organization_id == org.id).first():
+            db.add(
+                Workspace(
+                    organization_id=org.id,
+                    name="Executive Intelligence Workspace",
+                    description="Primary BI workspace",
+                    created_by=admin_user.id,
+                )
+            )
+        db.commit()
+
+        if body.include_sample_data:
+            seed_sample_bi_content(
+                db,
+                org=org,
+                owner_user=admin_user,
+                theme_objs=theme_objs,
+                scoped_role=None,
+                rls_group=None,
+            )
+            try:
+                sync_scheduler_jobs()
+            except Exception:
+                pass
+
+        access_token, jti, exp = create_access_token(
+            admin_user.id, admin_user.username, admin_user.organization_id, admin_user.permission_version
+        )
+        refresh_tok = create_refresh_token(admin_user.id, admin_user.organization_id, jti)
+        db.add(
+            UserSession(
+                user_id=admin_user.id,
+                jti=jti,
+                ip_address=ip,
+                user_agent=request.headers.get("user-agent", "")[:280],
+                expires_at=exp,
+            )
+        )
+        record_audit(
+            db, org.id, "initial_admin_bootstrapped", "user", status="success",
+            user_id=admin_user.id, username=admin_user.username, resource_id=admin_user.id, ip_address=ip,
+            details={"include_sample_data": body.include_sample_data}
+        )
+        db.commit()
+
+        eff = permission_resolver.get_effective_permissions_summary(db, admin_user)
+        return {
+            "mfa_required": False,
+            "access_token": access_token,
+            "refresh_token": refresh_tok,
+            "token_type": "bearer",
+            "user": {
+                "id": admin_user.id,
+                "username": admin_user.username,
+                "email": admin_user.email,
+                "organization_id": admin_user.organization_id,
+                "auth_source": admin_user.auth_source,
+                "mfa_enabled": admin_user.mfa_enabled,
+                "full_name": admin_user.profile.full_name if admin_user.profile else admin_user.username,
+                "department": admin_user.profile.department if admin_user.profile else None,
+                "region": admin_user.profile.region if admin_user.profile else None,
+                "locale": admin_user.profile.locale if admin_user.profile else "en",
+                "roles": eff["roles"],
+                "is_super_admin": eff["is_super_admin"],
+            },
+            "effective_permissions": eff,
+        }
 
 
 @router.post("/login")

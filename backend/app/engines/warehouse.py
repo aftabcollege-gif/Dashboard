@@ -39,7 +39,15 @@ class AnalyticalWarehouse:
                 pass
             if db_path:
                 self.db_path = db_path
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             self._conn = duckdb.connect(self.db_path)
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def execute_raw(self, sql: str, params: Optional[list[Any]] = None) -> None:
         with self._lock:

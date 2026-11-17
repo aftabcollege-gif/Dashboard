@@ -431,51 +431,44 @@ def _create_role_with_perms(
     return role
 
 
-def seed_database(db: Session) -> None:
-    """Idempotent Enterprise Bootstrapper."""
-    create_sample_erp_database(settings.SAMPLE_ERP_DB_PATH)
-
-    existing_org = db.query(Organization).filter(Organization.slug == "enterprise-corp").first()
-    if existing_org:
-        # Ensure warehouse tables exist (in case warehouse file was cleaned)
-        if not warehouse.table_exists("wh_enterprise_sales"):
-            for pl in db.query(EtlPipeline).all():
-                try:
-                    run_etl_pipeline(db, pl.id, trigger_type="seed")
-                except Exception:
-                    pass
-        return
-
-    org = Organization(name="Enterprise Analytics Corp", slug="enterprise-corp")
-    db.add(org)
-    db.flush()
+def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[str, DashboardTheme]]:
+    """Idempotently seeds Organization, Permissions, Roles & Themes (zero user accounts/passwords)."""
+    org = db.query(Organization).filter(Organization.slug == "enterprise-corp").first()
+    if not org:
+        org = Organization(name="Enterprise Analytics Corp", slug="enterprise-corp")
+        db.add(org)
+        db.flush()
 
     # 1. Permission Catalog
     perm_map: dict[tuple[str, str], Permission] = {}
+    for p in db.query(Permission).all():
+        perm_map[(p.resource_type, p.action)] = p
     for rt, act, desc in PERMISSION_CATALOG:
-        p = Permission(resource_type=rt, action=act, description=desc)
-        db.add(p)
-        db.flush()
-        perm_map[(rt, act)] = p
+        if (rt, act) not in perm_map:
+            p = Permission(resource_type=rt, action=act, description=desc)
+            db.add(p)
+            db.flush()
+            perm_map[(rt, act)] = p
 
     # 2. Roles (10 Enterprise Roles + Scoped Viewer)
     all_pairs = list(perm_map.keys())
-    super_role = _create_role_with_perms(
+    roles: dict[str, Role] = {}
+    roles["super_admin"] = _create_role_with_perms(
         db, org.id, "Super Administrator", "super_admin", "Full unrestricted platform control", perm_map, all_pairs, is_super=True
     )
-    _create_role_with_perms(
+    roles["org_admin"] = _create_role_with_perms(
         db, org.id, "Organization Administrator", "org_admin", "Manage organization users, data & dashboards",
         perm_map, [k for k in all_pairs if k[0] != "organization" or k[1] == "view"]
     )
-    _create_role_with_perms(
+    roles["security_admin"] = _create_role_with_perms(
         db, org.id, "Security Administrator", "security_admin", "Manage RBAC, AD, RLS/CLS & Audit logs",
         perm_map, [k for k in all_pairs if k[0] in ("admin", "organization", "dashboard", "widget")]
     )
-    _create_role_with_perms(
+    roles["dashboard_admin"] = _create_role_with_perms(
         db, org.id, "Dashboard Administrator", "dashboard_admin", "Manage dashboards, layouts, themes & permissions",
         perm_map, [k for k in all_pairs if k[0] in ("workspace", "dashboard", "dashboard_page", "widget", "drill_down", "filter", "export", "dataset", "query")]
     )
-    designer_role = _create_role_with_perms(
+    roles["dashboard_designer"] = _create_role_with_perms(
         db, org.id, "Dashboard Designer", "dashboard_designer", "Design dashboards, widgets, themes & queries",
         perm_map,
         [
@@ -496,7 +489,7 @@ def seed_database(db: Session) -> None:
             ("filter", "add"), ("export", "view"), ("export", "export_pdf"), ("export", "export_excel"), ("export", "export_csv"),
         ],
     )
-    analyst_role = _create_role_with_perms(
+    roles["data_analyst"] = _create_role_with_perms(
         db, org.id, "Data Analyst", "data_analyst", "Explore datasets, execute queries & analyze dashboards",
         perm_map,
         [
@@ -511,12 +504,12 @@ def seed_database(db: Session) -> None:
             ("export", "export_excel"), ("export", "export_csv"),
         ],
     )
-    _create_role_with_perms(
+    roles["data_engineer"] = _create_role_with_perms(
         db, org.id, "Data Engineer", "data_engineer", "Manage Data Sources, Datasets & ETL Pipelines",
         perm_map,
         [k for k in all_pairs if k[0] in ("data_source", "dataset", "query", "workspace", "dashboard")]
     )
-    viewer_role = _create_role_with_perms(
+    roles["report_viewer"] = _create_role_with_perms(
         db, org.id, "Report Viewer", "report_viewer", "Read-only viewer with interactive filtering",
         perm_map,
         [
@@ -526,7 +519,7 @@ def seed_database(db: Session) -> None:
             ("export", "view"), ("export", "export_pdf"),
         ],
     )
-    _create_role_with_perms(
+    roles["executive_viewer"] = _create_role_with_perms(
         db, org.id, "Executive Viewer", "executive_viewer", "Executive view with drill down and exports",
         perm_map,
         [
@@ -537,79 +530,48 @@ def seed_database(db: Session) -> None:
             ("filter", "view"), ("filter", "edit"), ("export", "view"), ("export", "export_pdf"), ("export", "export_excel"),
         ],
     )
-    scoped_role = _create_role_with_perms(
+    roles["custom_scoped"] = _create_role_with_perms(
         db, org.id, "Scoped Custom Role", "custom_scoped", "Zero blanket allows; requires explicit resource grants",
         perm_map, [("workspace", "view")]
     )
 
-    # 3. Users
-    def _mk_user(username: str, email: str, pw: str, full_name: str, dept: str, region: str, role: Role):
-        u = User(
-            organization_id=org.id,
-            username=username,
-            email=email,
-            password_hash=hash_password(pw),
-            auth_source="local",
-            is_active=True,
-        )
-        db.add(u)
-        db.flush()
-        db.add(UserProfile(user_id=u.id, full_name=full_name, department=dept, org_unit=dept, region=region))
-        db.add(UserRole(user_id=u.id, role_id=role.id))
-        return u
-
-    admin_user = _mk_user("admin", "admin@enterprise.local", "Admin!2026", "System Administrator", "IT & Security", "All", super_role)
-    _mk_user("designer", "designer@enterprise.local", "Designer!2026", "Darius BI Designer", "Analytics", "All", designer_role)
-    _mk_user("analyst", "analyst@enterprise.local", "Analyst!2026", "Laleh Data Analyst", "Finance", "All", analyst_role)
-    _mk_user("viewer", "viewer@enterprise.local", "Viewer!2026", "Kian Report Viewer", "Operations", "All", viewer_role)
-    north_mgr = _mk_user("north_mgr", "north.mgr@enterprise.local", "Manager!2026", "Neda North Manager", "Sales", "North", viewer_role)
-    south_mgr = _mk_user("south_mgr", "south.mgr@enterprise.local", "Manager!2026", "Reza South Manager", "Sales", "South", viewer_role)
-
-    # Groups
-    grp_exec = Group(organization_id=org.id, name="Executive Leadership", description="Executive Dashboard Access", source="local")
-    grp_north = Group(organization_id=org.id, name="Regional Sales Managers", description="RLS Regional Managers", source="local")
-    db.add_all([grp_exec, grp_north])
-    db.flush()
-    db.add_all([
-        GroupMember(group_id=grp_exec.id, user_id=admin_user.id),
-        GroupMember(group_id=grp_north.id, user_id=north_mgr.id),
-        GroupMember(group_id=grp_north.id, user_id=south_mgr.id),
-    ])
-
-    # Default Active Directory Connection (Ready to Test & Sync)
-    db.add(
-        DirectoryConnection(
-            organization_id=org.id,
-            name="Corporate Active Directory",
-            domain_name="corp.enterprise.local",
-            server_url="ldap://dc01.corp.enterprise.local:389",
-            use_ldaps=False,
-            base_dn="DC=corp,DC=enterprise,DC=local",
-            bind_dn="CN=bi-svc,OU=ServiceAccounts,DC=corp,DC=enterprise,DC=local",
-            bind_password_encrypted=encrypt_secret("AdServiceBind!2026"),
-            directory_mode="mock_ad",
-            sync_policy="manual",
-            selected_groups_json=[],
-        )
-    )
-
-    # 4. Built-in 8 Themes
+    # Built-in 8 Themes
     theme_objs: dict[str, DashboardTheme] = {}
+    for dt in db.query(DashboardTheme).filter(DashboardTheme.organization_id == org.id).all():
+        theme_objs[dt.slug] = dt
     for t in BUILTIN_THEMES:
-        dt = DashboardTheme(
-            organization_id=org.id,
-            name=t["name"],
-            slug=t["slug"],
-            is_builtin=True,
-            mode=t["mode"],
-            tokens_json=t["tokens"],
-            created_by=admin_user.id,
-        )
-        db.add(dt)
-        db.flush()
-        theme_objs[t["slug"]] = dt
+        if t["slug"] not in theme_objs:
+            dt = DashboardTheme(
+                organization_id=org.id,
+                name=t["name"],
+                slug=t["slug"],
+                is_builtin=True,
+                mode=t["mode"],
+                tokens_json=t["tokens"],
+                created_by=None,
+            )
+            db.add(dt)
+            db.flush()
+            theme_objs[t["slug"]] = dt
 
-    # 5. Operational ERP Data Source & Datasets & ETL Pipelines
+    return org, roles, theme_objs
+
+
+def seed_sample_bi_content(
+    db: Session,
+    org: Organization,
+    owner_user: User | None,
+    theme_objs: dict[str, DashboardTheme],
+    scoped_role: Role | None = None,
+    rls_group: Group | None = None,
+) -> None:
+    """Seeds sample ERP data source, DuckDB analytical datasets, ETL pipelines & 3 dashboards."""
+    create_sample_erp_database(settings.SAMPLE_ERP_DB_PATH)
+    if db.query(Dataset).filter(Dataset.organization_id == org.id, Dataset.warehouse_table == "wh_enterprise_sales").first():
+        return
+    owner_id = owner_user.id if owner_user else None
+
+    # Operational ERP Data Source & Datasets & ETL Pipelines
     erp_source = DataSource(
         organization_id=org.id,
         name="Enterprise ERP Operational DB",
@@ -619,7 +581,7 @@ def seed_database(db: Session) -> None:
         refresh_policy="scheduled",
         health_status="healthy",
         last_tested_at=datetime.now(timezone.utc),
-        created_by=admin_user.id,
+        created_by=owner_id,
     )
     db.add(erp_source)
     db.flush()
@@ -731,22 +693,20 @@ def seed_database(db: Session) -> None:
         )
     )
 
-    # Row-Level Security Rule for Regional Managers Group:
-    # north_mgr (region='North') & south_mgr (region='South') automatically see ONLY their region!
-    db.add(
-        AccessPolicy(
-            organization_id=org.id,
-            name="Regional Manager Row-Level Security",
-            policy_type="rls",
-            dataset_id=ds_sales.id,
-            target_type="group",
-            target_id=grp_north.id,
-            rule_json={"column": "region", "operator": "eq", "value": "${user.region}"},
-            priority=10,
-            is_active=True,
+    if rls_group is not None:
+        db.add(
+            AccessPolicy(
+                organization_id=org.id,
+                name="Regional Manager Row-Level Security",
+                policy_type="rls",
+                dataset_id=ds_sales.id,
+                target_type="group",
+                target_id=rls_group.id,
+                rule_json={"column": "region", "operator": "eq", "value": "${user.region}"},
+                priority=10,
+                is_active=True,
+            )
         )
-    )
-    # Column-Level Masking on HR Salary & Email for non-admins
     db.add(
         AccessPolicy(
             organization_id=org.id,
@@ -782,14 +742,16 @@ def seed_database(db: Session) -> None:
                 "ROUND(SUM(profit), 2) AS total_profit "
                 "FROM wh_enterprise_sales GROUP BY region ORDER BY total_revenue DESC"
             ),
-            created_by=admin_user.id,
+            created_by=owner_id,
         )
     )
 
     # 6. Workspaces & 3 Enterprise Dashboards
-    ws = Workspace(organization_id=org.id, name="Executive Intelligence Workspace", description="Core enterprise BI dashboards", created_by=admin_user.id)
-    db.add(ws)
-    db.flush()
+    ws = db.query(Workspace).filter(Workspace.organization_id == org.id).first()
+    if not ws:
+        ws = Workspace(organization_id=org.id, name="Executive Intelligence Workspace", description="Core enterprise BI dashboards", created_by=owner_id)
+        db.add(ws)
+        db.flush()
 
     # Helper to create widgets cleanly
     def _add_widget(
@@ -834,7 +796,7 @@ def seed_database(db: Session) -> None:
         title="Enterprise Revenue & Executive Intelligence",
         description="Executive revenue, profitability, regional performance, and hierarchical time drill-down",
         theme_id=theme_objs["light-enterprise"].id,
-        created_by=admin_user.id,
+        created_by=owner_id,
     )
     db.add(d1)
     db.flush()
@@ -905,7 +867,7 @@ def seed_database(db: Session) -> None:
         title="Departmental Cost & Budget Control",
         description="Operational expenditure tracking, budget variance, and financial efficiency",
         theme_id=theme_objs["dark-enterprise"].id,
-        created_by=admin_user.id,
+        created_by=owner_id,
     )
     db.add(d2)
     db.flush()
@@ -933,7 +895,7 @@ def seed_database(db: Session) -> None:
         theme_id=theme_objs["glassmorphism"].id,
         is_template=True,
         is_public=True,
-        created_by=admin_user.id,
+        created_by=owner_id,
     )
     db.add(d3)
     db.flush()
@@ -954,17 +916,102 @@ def seed_database(db: Session) -> None:
         layout_json=[{"i": w.id, "x": w.layout_x, "y": w.layout_y, "w": w.layout_w, "h": w.layout_h} for w in d3_widgets],
     ))
 
-    # Resource Permissions baseline: keep seeded viewer read-only, while scoped_role stays isolated
-    db.add(
-        ResourcePermission(
+    if scoped_role is not None:
+        db.add(
+            ResourcePermission(
+                organization_id=org.id,
+                subject_type="role",
+                subject_id=scoped_role.id,
+                resource_type="dashboard",
+                resource_id=d1.id,
+                action="view",
+                effect="allow",
+                inherit_to_children=False,
+            )
+        )
+    db.commit()
+
+
+def seed_database(db: Session) -> None:
+    """Idempotent Enterprise Bootstrapper.
+    In development/demo mode (BI_SEED_DEMO_USERS=True), creates demo users + mock AD + dashboards.
+    In production/Windows standalone mode (BI_SEED_DEMO_USERS=False), seeds ONLY roles & themes
+    with zero default passwords or demo user accounts.
+    """
+    existing_org = db.query(Organization).filter(Organization.slug == "enterprise-corp").first()
+    if existing_org:
+        # Ensure warehouse tables exist if already seeded earlier and warehouse file was cleaned
+        if db.query(EtlPipeline).count() > 0 and not warehouse.table_exists("wh_enterprise_sales"):
+            for pl in db.query(EtlPipeline).all():
+                try:
+                    run_etl_pipeline(db, pl.id, trigger_type="seed")
+                except Exception:
+                    pass
+        return
+
+    org, roles, theme_objs = seed_core_catalog(db)
+
+    if not settings.BI_SEED_DEMO_USERS:
+        # Production / Windows Secure Mode: zero default passwords, zero demo accounts, zero mock AD!
+        db.commit()
+        return
+
+    # Development / Acceptance Demo Mode
+    def _mk_user(username: str, email: str, pw: str, full_name: str, dept: str, region: str, role: Role):
+        u = User(
             organization_id=org.id,
-            subject_type="role",
-            subject_id=scoped_role.id,
-            resource_type="dashboard",
-            resource_id=d1.id,
-            action="view",
-            effect="allow",
-            inherit_to_children=False,
+            username=username,
+            email=email,
+            password_hash=hash_password(pw),
+            auth_source="local",
+            is_active=True,
+        )
+        db.add(u)
+        db.flush()
+        db.add(UserProfile(user_id=u.id, full_name=full_name, department=dept, org_unit=dept, region=region))
+        db.add(UserRole(user_id=u.id, role_id=role.id))
+        return u
+
+    admin_user = _mk_user("admin", "admin@enterprise.local", "Admin!2026", "System Administrator", "IT & Security", "All", roles["super_admin"])
+    _mk_user("designer", "designer@enterprise.local", "Designer!2026", "Darius BI Designer", "Analytics", "All", roles["dashboard_designer"])
+    _mk_user("analyst", "analyst@enterprise.local", "Analyst!2026", "Laleh Data Analyst", "Finance", "All", roles["data_analyst"])
+    _mk_user("viewer", "viewer@enterprise.local", "Viewer!2026", "Kian Report Viewer", "Operations", "All", roles["report_viewer"])
+    north_mgr = _mk_user("north_mgr", "north.mgr@enterprise.local", "Manager!2026", "Neda North Manager", "Sales", "North", roles["report_viewer"])
+    south_mgr = _mk_user("south_mgr", "south.mgr@enterprise.local", "Manager!2026", "Reza South Manager", "Sales", "South", roles["report_viewer"])
+
+    # Groups
+    grp_exec = Group(organization_id=org.id, name="Executive Leadership", description="Executive Dashboard Access", source="local")
+    grp_north = Group(organization_id=org.id, name="Regional Sales Managers", description="RLS Regional Managers", source="local")
+    db.add_all([grp_exec, grp_north])
+    db.flush()
+    db.add_all([
+        GroupMember(group_id=grp_exec.id, user_id=admin_user.id),
+        GroupMember(group_id=grp_north.id, user_id=north_mgr.id),
+        GroupMember(group_id=grp_north.id, user_id=south_mgr.id),
+    ])
+
+    # Default Active Directory Connection (Demo Mode Only)
+    db.add(
+        DirectoryConnection(
+            organization_id=org.id,
+            name="Corporate Active Directory",
+            domain_name="corp.enterprise.local",
+            server_url="ldap://dc01.corp.enterprise.local:389",
+            use_ldaps=False,
+            base_dn="DC=corp,DC=enterprise,DC=local",
+            bind_dn="CN=bi-svc,OU=ServiceAccounts,DC=corp,DC=enterprise,DC=local",
+            bind_password_encrypted=encrypt_secret("AdServiceBind!2026"),
+            directory_mode="mock_ad",
+            sync_policy="manual",
+            selected_groups_json=[],
         )
     )
-    db.commit()
+
+    seed_sample_bi_content(
+        db,
+        org=org,
+        owner_user=admin_user,
+        theme_objs=theme_objs,
+        scoped_role=roles["custom_scoped"],
+        rls_group=grp_north,
+    )

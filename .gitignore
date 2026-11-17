@@ -28,3 +28,9 @@ backend/data/cache/
 .env
 .env.local
 *.log
+
+# Windows installer staging, cache & build output
+winsetup/stage/
+winsetup/dist/
+winsetup/.cache/
+

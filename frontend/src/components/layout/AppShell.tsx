@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
@@ -24,11 +24,216 @@ import {
 import { apiFetch, setStoredToken } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
+function InitialSetupScreen() {
+  const { t, locale, setLocale, refreshUser, authStatus, showToast } = useBi();
+  const [username, setUsername] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [orgName, setOrgName] = useState("Enterprise Analytics");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [setupToken, setSetupToken] = useState("");
+  const [includeSampleData, setIncludeSampleData] = useState(true);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const tok = params.get("setup_token");
+      if (tok) {
+        setSetupToken(tok);
+      }
+    }
+  }, []);
+
+  const handleBootstrap = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    if (password.length < 10) {
+      setError("Password must be at least 10 characters with uppercase, lowercase, and a number or symbol.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("Passwords do not match.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await apiFetch("/auth/bootstrap-admin", {
+        method: "POST",
+        body: JSON.stringify({
+          username,
+          password,
+          email,
+          full_name: fullName || username,
+          organization_name: orgName,
+          include_sample_data: includeSampleData,
+          setup_token: setupToken || undefined,
+        }),
+      });
+      setStoredToken(res.access_token);
+      if (typeof window !== "undefined" && window.location.search.includes("setup_token")) {
+        window.history.replaceState({}, "", window.location.pathname);
+      }
+      showToast("Administrator account created successfully");
+      await refreshUser();
+    } catch (err: any) {
+      setError(err.message || "Initial setup failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4" style={{ background: "var(--bi-bg)" }}>
+      <div className="bi-card w-full max-w-lg p-8 space-y-5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div
+              className="w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold"
+              style={{ background: "var(--bi-primary)" }}
+            >
+              <ShieldCheck className="w-5 h-5" />
+            </div>
+            <div>
+              <h1 className="text-lg font-bold">{t("initialSetupTitle")}</h1>
+              <p className="text-xs" style={{ color: "var(--bi-muted)" }}>{t("initialSetupSubtitle")}</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setLocale(locale === "en" ? "fa" : "en")}
+            className="px-2.5 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1"
+            style={{ borderColor: "var(--bi-border)" }}
+          >
+            <Languages className="w-3.5 h-3.5" />
+            {locale === "en" ? "فارسی" : "EN"}
+          </button>
+        </div>
+
+        <form onSubmit={handleBootstrap} className="space-y-3.5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold mb-1">Admin Username</label>
+              <input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="e.g. sysadmin"
+                className="w-full px-3 py-2 rounded-lg border text-sm bg-transparent"
+                style={{ borderColor: "var(--bi-border)" }}
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1">Full Name</label>
+              <input
+                value={fullName}
+                onChange={(e) => setFullName(e.target.value)}
+                placeholder="System Administrator"
+                className="w-full px-3 py-2 rounded-lg border text-sm bg-transparent"
+                style={{ borderColor: "var(--bi-border)" }}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold mb-1">Email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="admin@company.local"
+                className="w-full px-3 py-2 rounded-lg border text-sm bg-transparent"
+                style={{ borderColor: "var(--bi-border)" }}
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1">Organization Name</label>
+              <input
+                value={orgName}
+                onChange={(e) => setOrgName(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border text-sm bg-transparent"
+                style={{ borderColor: "var(--bi-border)" }}
+                required
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold mb-1">Strong Password (10+ chars)</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password"
+                className="w-full px-3 py-2 rounded-lg border text-sm bg-transparent"
+                style={{ borderColor: "var(--bi-border)" }}
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1">Confirm Password</label>
+              <input
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                autoComplete="new-password"
+                className="w-full px-3 py-2 rounded-lg border text-sm bg-transparent"
+                style={{ borderColor: "var(--bi-border)" }}
+                required
+              />
+            </div>
+          </div>
+
+          {authStatus?.setup_token_required && (
+            <div>
+              <label className="block text-xs font-semibold mb-1">Local Setup Token</label>
+              <input
+                value={setupToken}
+                onChange={(e) => setSetupToken(e.target.value)}
+                placeholder="Paste setup token from %LocalAppData%\NexusBI\config\setup_token.txt"
+                className="w-full px-3 py-2 rounded-lg border text-xs font-mono bg-transparent"
+                style={{ borderColor: "var(--bi-border)" }}
+                required
+              />
+            </div>
+          )}
+
+          <label className="flex items-start gap-2 text-xs pt-1 cursor-pointer" style={{ color: "var(--bi-muted)" }}>
+            <input
+              type="checkbox"
+              checked={includeSampleData}
+              onChange={(e) => setIncludeSampleData(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span>{t("includeSampleLabel")}</span>
+          </label>
+
+          {error && <div className="text-xs text-red-500 font-medium">{error}</div>}
+          <button
+            type="submit"
+            disabled={busy}
+            className="w-full py-2.5 rounded-lg text-sm font-semibold text-white transition flex items-center justify-center gap-2"
+            style={{ background: "var(--bi-primary)" }}
+          >
+            <ShieldCheck className="w-4 h-4" />
+            {busy ? "..." : t("createAdminBtn")}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function LoginScreen() {
-  const { t, locale, setLocale, refreshUser, showToast } = useBi();
+  const { t, locale, setLocale, refreshUser, showToast, authStatus } = useBi();
+  const demoMode = authStatus?.demo_mode === true;
   const [authMode, setAuthMode] = useState<"local" | "active_directory">("local");
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("Admin!2026");
+  const [username, setUsername] = useState(demoMode ? "admin" : "");
+  const [password, setPassword] = useState(demoMode ? "Admin!2026" : "");
   const [domain, setDomain] = useState("corp.enterprise.local");
   const [mfaRequired, setMfaRequired] = useState(false);
   const [mfaCode, setMfaCode] = useState("");
@@ -93,7 +298,11 @@ function LoginScreen() {
         <div className="flex rounded-lg p-1 border" style={{ borderColor: "var(--bi-border)" }}>
           <button
             type="button"
-            onClick={() => { setAuthMode("local"); setUsername("admin"); setPassword("Admin!2026"); }}
+            onClick={() => {
+              setAuthMode("local");
+              setUsername(demoMode ? "admin" : "");
+              setPassword(demoMode ? "Admin!2026" : "");
+            }}
             className="flex-1 py-1.5 text-xs font-semibold rounded-md transition"
             style={{
               background: authMode === "local" ? "var(--bi-primary)" : "transparent",
@@ -104,7 +313,11 @@ function LoginScreen() {
           </button>
           <button
             type="button"
-            onClick={() => { setAuthMode("active_directory"); setUsername("sara.ahmadi"); setPassword("DomainUser!123"); }}
+            onClick={() => {
+              setAuthMode("active_directory");
+              setUsername(demoMode ? "sara.ahmadi" : "");
+              setPassword(demoMode ? "DomainUser!123" : "");
+            }}
             className="flex-1 py-1.5 text-xs font-semibold rounded-md transition"
             style={{
               background: authMode === "active_directory" ? "var(--bi-primary)" : "transparent",
@@ -132,6 +345,7 @@ function LoginScreen() {
             <input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
+              autoComplete="username"
               className="w-full px-3 py-2 rounded-lg border text-sm bg-transparent"
               style={{ borderColor: "var(--bi-border)" }}
               required
@@ -143,6 +357,7 @@ function LoginScreen() {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              autoComplete="current-password"
               className="w-full px-3 py-2 rounded-lg border text-sm bg-transparent"
               style={{ borderColor: "var(--bi-border)" }}
               required
@@ -173,30 +388,32 @@ function LoginScreen() {
           </button>
         </form>
 
-        <div className="pt-3 border-t text-xs space-y-1.5" style={{ borderColor: "var(--bi-border)", color: "var(--bi-muted)" }}>
-          <div className="font-semibold">Quick Demo Accounts (Enterprise Roles):</div>
-          <div className="grid grid-cols-2 gap-1.5">
-            <button type="button" onClick={() => { setAuthMode("local"); setUsername("admin"); setPassword("Admin!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
-              admin / Admin!2026 (Super Admin)
-            </button>
-            <button type="button" onClick={() => { setAuthMode("local"); setUsername("designer"); setPassword("Designer!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
-              designer / Designer!2026
-            </button>
-            <button type="button" onClick={() => { setAuthMode("local"); setUsername("north_mgr"); setPassword("Manager!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
-              north_mgr (RLS North)
-            </button>
-            <button type="button" onClick={() => { setAuthMode("local"); setUsername("south_mgr"); setPassword("Manager!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
-              south_mgr (RLS South)
-            </button>
+        {demoMode && (
+          <div className="pt-3 border-t text-xs space-y-1.5" style={{ borderColor: "var(--bi-border)", color: "var(--bi-muted)" }}>
+            <div className="font-semibold">Quick Demo Accounts (Enterprise Roles):</div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button type="button" onClick={() => { setAuthMode("local"); setUsername("admin"); setPassword("Admin!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
+                admin / Admin!2026 (Super Admin)
+              </button>
+              <button type="button" onClick={() => { setAuthMode("local"); setUsername("designer"); setPassword("Designer!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
+                designer / Designer!2026
+              </button>
+              <button type="button" onClick={() => { setAuthMode("local"); setUsername("north_mgr"); setPassword("Manager!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
+                north_mgr (RLS North)
+              </button>
+              <button type="button" onClick={() => { setAuthMode("local"); setUsername("south_mgr"); setPassword("Manager!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
+                south_mgr (RLS South)
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );
 }
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
-  const { user, loadingAuth, t, locale, setLocale, logout } = useBi();
+  const { user, authStatus, loadingAuth, t, locale, setLocale, logout } = useBi();
   const pathname = usePathname();
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -206,6 +423,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         Loading Enterprise BI Platform...
       </div>
     );
+  }
+
+  if (authStatus?.needs_initial_setup) {
+    return <InitialSetupScreen />;
   }
 
   if (!user) {
