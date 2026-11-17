@@ -13,6 +13,7 @@ import {
   Download,
   Edit3,
   Eye,
+  Filter,
   History,
   Layers,
   MessageSquare,
@@ -45,7 +46,7 @@ import {
 const ResponsiveGridLayout = WidthProvider(Responsive);
 
 export default function DashboardWorkspace({ dashboardId }: { dashboardId: string }) {
-  const { t, themes, applyThemeTokens, showToast } = useBi();
+  const { locale, t, themes, applyThemeTokens, showToast } = useBi();
 
   const [dash, setDash] = useState<DashboardDetail | null>(null);
   const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
@@ -66,6 +67,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [drillStates, setDrillStates] = useState<
     Record<string, { field: string; value: any }[]>
   >({});
+  const [widgetChartOverrides, setWidgetChartOverrides] = useState<Record<string, string>>({});
+  const [clickModes, setClickModes] = useState<Record<string, "drill" | "cross_filter">>({});
 
   // Undo / Redo Stack for Layout & Edits
   const [undoStack, setUndoStack] = useState<any[]>([]);
@@ -121,6 +124,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       }
       if (savedState?.drill_state && Object.keys(drillStates).length === 0) {
         setDrillStates(savedState.drill_state);
+      }
+      if (savedState?.widget_overrides && Object.keys(widgetChartOverrides).length === 0) {
+        setWidgetChartOverrides(savedState.widget_overrides);
       }
       if (dsList.length > 0 && !newWDs) setNewWDs(dsList[0].id);
     } catch (err: any) {
@@ -191,6 +197,15 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
 
   // Execute single widget (used on drill down / manual widget refresh)
   const executeSingleWidget = async (w: DashboardWidget, nextDrillStack: { field: string; value: any }[], useCache = true) => {
+    const prevLen = (drillStates[w.id] || []).length;
+    if (nextDrillStack.length !== prevLen) {
+      setWidgetChartOverrides((prev) => {
+        if (!(w.id in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[w.id];
+        return copy;
+      });
+    }
     setLoadingWidgets((p) => ({ ...p, [w.id]: true }));
     try {
       const res = await apiFetch<WidgetDataResult>(`/dashboards/widgets/${w.id}/data`, {
@@ -211,27 +226,55 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     }
   };
 
+  const getWidgetClickMode = (w: DashboardWidget): "drill" | "cross_filter" => {
+    if (clickModes[w.id]) return clickModes[w.id];
+    const hasDrill = (w.drill_rule?.hierarchy?.length || 0) > 0;
+    if (!hasDrill) return "cross_filter";
+    if (w.chart_type === "donut" && w.config.interactions?.cross_filter !== false) return "cross_filter";
+    return "drill";
+  };
+
   // Handle click on any chart point (Drill Down OR Cross-Filter!)
   const handleWidgetPointClick = async (w: DashboardWidget, field: string, value: any) => {
     const hierarchy = w.drill_rule?.hierarchy || [];
     const currentStack = drillStates[w.id] || [];
+    const mode = getWidgetClickMode(w);
 
-    // 1. If widget has deeper drill level and user can drill down -> Drill Down!
-    if (hierarchy.length > 0 && currentStack.length < hierarchy.length && w.permissions.drill_down) {
+    // 1. If in Drill mode and widget has deeper drill level and user can drill down -> Drill Down!
+    if (mode === "drill" && hierarchy.length > 0 && currentStack.length < hierarchy.length && w.permissions.drill_down) {
       const currentDim = hierarchy[currentStack.length]?.field || field;
       const nextStack = [...currentStack, { field: currentDim, value }];
       await executeSingleWidget(w, nextStack);
       return;
     }
 
-    // 2. Otherwise trigger Cross-Filtering if enabled!
+    // 2. Otherwise trigger Cross-Filtering if enabled (replace prior selection from same widget)!
     if (w.config.interactions?.cross_filter !== false) {
       setCrossFilters((prev) => {
-        const exists = prev.some((cf) => cf.field_name === field && cf.value === value);
-        if (exists) return prev.filter((cf) => !(cf.field_name === field && cf.value === value));
-        return [...prev, { field_name: field, operator: "eq", value, source_widget_id: w.id }];
+        const sameExact = prev.some(
+          (cf) => cf.source_widget_id === w.id && cf.field_name === field && String(cf.value) === String(value)
+        );
+        const withoutThisWidget = prev.filter((cf) => cf.source_widget_id !== w.id);
+        if (sameExact) return withoutThisWidget;
+        return [...withoutThisWidget, { field_name: field, operator: "eq", value, source_widget_id: w.id }];
       });
     }
+  };
+
+  const applyDrillToDashboardCrossFilter = (w: DashboardWidget) => {
+    const stack = drillStates[w.id] || [];
+    if (stack.length === 0) return;
+    setCrossFilters((prev) => {
+      const withoutThisWidget = prev.filter((cf) => cf.source_widget_id !== w.id);
+      const nextEntries = stack.map((item) => ({
+        field_name: item.field,
+        operator: "eq",
+        value: item.value,
+        source_widget_id: w.id,
+      }));
+      return [...withoutThisWidget, ...nextEntries];
+    });
+    showToast(`Applied ${stack.map((s) => `${s.field}=${s.value}`).join(" & ")} to all dashboard widgets`);
   };
 
   // Layout change handler with Undo stack
@@ -334,6 +377,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           active_page_id: activePageId,
           filter_state: filterValues,
           drill_state: drillStates,
+          widget_overrides: widgetChartOverrides,
         }),
       });
       showToast("Personal dashboard state saved");
@@ -691,6 +735,62 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         )}
       </div>
 
+      {/* Interactive Analytics Guide Strip */}
+      {pageWidgets.some((w) => (w.drill_rule?.hierarchy?.length || 0) > 0 || w.config.interactions?.cross_filter !== false) && (
+        <div
+          className="px-3.5 py-2 rounded-xl border text-[11px] flex flex-wrap items-center justify-between gap-2"
+          style={{
+            background: "color-mix(in srgb, var(--bi-primary) 6%, var(--bi-card))",
+            borderColor: "color-mix(in srgb, var(--bi-primary) 24%, var(--bi-border))",
+          }}
+        >
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+            {locale === "fa" ? (
+              <>
+                <span>
+                  <strong className="text-blue-500">۱. دریل‌داون:</strong> روی میله‌های نمودار دارای نشانگر{" "}
+                  <span className="px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-semibold">Drill-Down</span> کلیک کنید (مثلاً سال ← فصل ← ماه ← روز).
+                </span>
+                <span>
+                  <strong className="text-emerald-500">۲. فیلتر کل داشبورد:</strong> روی هر بخش از نمودارهای{" "}
+                  <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 font-semibold">Cross-Filter</span> کلیک کنید تا تمام ویجت‌ها فیلتر شوند.
+                </span>
+                <span>
+                  <strong className="text-violet-500">۳. تبدیل ویجت بعد دریل‌داون:</strong> علاوه بر تبدیل خودکار نمودار در هر سطح، از منوی بالای ویجت آن را به هر ویجت دیگری تبدیل کنید.
+                </span>
+              </>
+            ) : (
+              <>
+                <span>
+                  <strong className="text-blue-500">1. Drill-Down:</strong> Click bars on{" "}
+                  <span className="px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-semibold">Drill-Down</span> widgets (e.g., Year → Quarter → Month → Day).
+                </span>
+                <span>
+                  <strong className="text-emerald-500">2. Dashboard Cross-Filter:</strong> Click any slice/bar on{" "}
+                  <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 font-semibold">Cross-Filter</span> widgets to filter the entire dashboard.
+                </span>
+                <span>
+                  <strong className="text-violet-500">3. Post-Drill Conversion:</strong> Widgets auto-convert per drill level and can be switched anytime via the header chart selector.
+                </span>
+              </>
+            )}
+          </div>
+          {(crossFilters.length > 0 || Object.values(drillStates).some((s) => s.length > 0) || Object.keys(widgetChartOverrides).length > 0) && (
+            <button
+              onClick={() => {
+                setFilterValues({});
+                setCrossFilters([]);
+                setDrillStates({});
+                setWidgetChartOverrides({});
+              }}
+              className="px-2.5 py-1 rounded-lg bg-red-500/10 text-red-500 font-semibold hover:bg-red-500/20 shrink-0"
+            >
+              {locale === "fa" ? "بازنشانی تعاملات" : "Reset Interactions"}
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Global & Dashboard Filter Bar */}
       <GlobalFilterBar
         dashboardId={dash.id}
@@ -699,7 +799,12 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         datasets={datasets}
         filterValues={filterValues}
         onChangeValue={(fid, val) => setFilterValues((prev) => ({ ...prev, [fid]: val }))}
-        onResetAll={() => { setFilterValues({}); setCrossFilters([]); setDrillStates({}); }}
+        onResetAll={() => {
+          setFilterValues({});
+          setCrossFilters([]);
+          setDrillStates({});
+          setWidgetChartOverrides({});
+        }}
         crossFilters={crossFilters}
         onClearCrossFilter={(idx) =>
           setCrossFilters((prev) => (idx === undefined ? [] : prev.filter((_, i) => i !== idx)))
@@ -731,8 +836,35 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             {pageWidgets.map((w) => {
               const wd = widgetData[w.id];
               const isSelected = selectedWidgetId === w.id;
-              const effType = wd?.effective_chart_type || w.chart_type;
+              const autoType = wd?.effective_chart_type || w.chart_type;
+              const effType = widgetChartOverrides[w.id] || autoType;
               const drillCrumbs = wd?.drill?.breadcrumbs || [];
+              const hasDrill = (w.drill_rule?.hierarchy?.length || 0) > 0;
+              const isDrilled = drillCrumbs.length > 1;
+              const clickMode = getWidgetClickMode(w);
+              const isCrossSource = crossFilters.some((cf) => cf.source_widget_id === w.id);
+              const canCrossFilter = w.config.interactions?.cross_filter !== false && w.chart_type !== "kpi" && w.chart_type !== "gauge" && w.chart_type !== "table";
+              const canConvertChart = w.chart_type !== "kpi" && w.chart_type !== "gauge";
+              const convertOptions = Array.from(
+                new Set([
+                  effType,
+                  autoType,
+                  w.chart_type,
+                  "bar",
+                  "horizontal_bar",
+                  "line",
+                  "area",
+                  "pie",
+                  "donut",
+                  "stacked_bar",
+                  "combo",
+                  "waterfall",
+                  "funnel",
+                  "treemap",
+                  "radar",
+                  "table",
+                ])
+              );
               const customStyle = w.config.style || {};
 
               return (
@@ -740,7 +872,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                   key={w.id}
                   onClick={() => editMode && setSelectedWidgetId(w.id)}
                   className={`bi-card flex flex-col overflow-hidden transition-shadow ${
-                    isSelected ? "ring-2 ring-blue-500" : ""
+                    isSelected ? "ring-2 ring-blue-500" : isCrossSource ? "ring-2 ring-emerald-500/70" : ""
                   }`}
                   style={{
                     background: customStyle.background_color || "var(--bi-card)",
@@ -750,14 +882,64 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                 >
                   {/* Widget Header */}
                   <div
-                    className={`px-3.5 py-2.5 border-b flex items-center justify-between gap-2 ${
+                    className={`px-3.5 py-2 border-b flex items-center justify-between gap-2 ${
                       editMode ? "widget-drag-handle cursor-move" : ""
                     }`}
                     style={{ borderColor: "var(--bi-border)" }}
                   >
                     <div className="min-w-0">
-                      <div className="text-xs font-bold truncate">{w.title}</div>
-                      {drillCrumbs.length > 1 && (
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-xs font-bold truncate">{w.title}</span>
+                        {hasDrill && canCrossFilter ? (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const nextMode = clickMode === "drill" ? "cross_filter" : "drill";
+                              setClickModes((prev) => ({ ...prev, [w.id]: nextMode }));
+                              showToast(
+                                nextMode === "drill"
+                                  ? `${w.title}: Click points to Drill-Down`
+                                  : `${w.title}: Click points to Cross-Filter whole dashboard`
+                              );
+                            }}
+                            className={`text-[9px] px-1.5 py-0.5 rounded font-semibold shrink-0 transition ${
+                              clickMode === "drill"
+                                ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25"
+                                : isCrossSource
+                                ? "bg-emerald-500 text-white"
+                                : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/25"
+                            }`}
+                            title="Click badge to toggle between Drill-Down and Dashboard Cross-Filter"
+                          >
+                            {clickMode === "drill"
+                              ? "Drill-Down ⇄"
+                              : isCrossSource
+                              ? "Filtering Dashboard ⇄"
+                              : "Cross-Filter ⇄"}
+                          </button>
+                        ) : hasDrill ? (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-semibold shrink-0">
+                            Drill-Down
+                          </span>
+                        ) : canCrossFilter ? (
+                          <span
+                            className={`text-[9px] px-1.5 py-0.5 rounded font-semibold shrink-0 ${
+                              isCrossSource
+                                ? "bg-emerald-500 text-white"
+                                : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                            }`}
+                          >
+                            {isCrossSource ? "Filtering Dashboard" : "Cross-Filter"}
+                          </span>
+                        ) : null}
+                        {isDrilled && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-500 font-semibold shrink-0">
+                            {w.chart_type} → {effType}
+                          </span>
+                        )}
+                      </div>
+                      {isDrilled && (
                         <div className="flex items-center gap-1 text-[10px] mt-0.5 flex-wrap">
                           {drillCrumbs.map((bc, idx) => (
                             <React.Fragment key={bc.level}>
@@ -784,18 +966,68 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                           CACHE
                         </span>
                       )}
-                      {drillCrumbs.length > 1 && (
-                        <button
-                          onClick={(e) => {
+                      {isDrilled && (
+                        <>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              applyDrillToDashboardCrossFilter(w);
+                            }}
+                            className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold flex items-center gap-1 transition ${
+                              isCrossSource
+                                ? "bg-emerald-500 text-white border-emerald-500"
+                                : "border-emerald-500/40 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10"
+                            }`}
+                            title={locale === "fa" ? "اعمال این دریل‌داون روی کل داشبورد" : "Filter entire dashboard by this drill level"}
+                          >
+                            <Filter className="w-2.5 h-2.5" />
+                            <span>{locale === "fa" ? "فیلتر داشبورد" : "Filter All"}</span>
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const nextStack = (drillStates[w.id] || []).slice(0, -1);
+                              executeSingleWidget(w, nextStack);
+                            }}
+                            className="p-1 rounded hover:bg-blue-500/10 text-blue-500"
+                            title={t("drillUp")}
+                          >
+                            <ArrowUp className="w-3.5 h-3.5" />
+                          </button>
+                        </>
+                      )}
+                      {canConvertChart && (
+                        <select
+                          aria-label={`Convert ${w.title} chart type`}
+                          value={effType}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) => {
                             e.stopPropagation();
-                            const nextStack = (drillStates[w.id] || []).slice(0, -1);
-                            executeSingleWidget(w, nextStack);
+                            const nextChart = e.target.value;
+                            setWidgetChartOverrides((prev) => ({ ...prev, [w.id]: nextChart }));
+                            if (dash.permissions.edit) {
+                              apiFetch(`/dashboards/widgets/${w.id}/switch-chart`, {
+                                method: "POST",
+                                body: JSON.stringify({ target_chart_type: nextChart }),
+                              }).catch(() => {});
+                            }
+                            showToast(`Widget converted to ${nextChart}`);
                           }}
-                          className="p-1 rounded hover:bg-blue-500/10 text-blue-500"
-                          title={t("drillUp")}
+                          className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold cursor-pointer ${
+                            isDrilled ? "border-violet-500/60 text-violet-500" : ""
+                          }`}
+                          style={{ background: "var(--bi-surface)", borderColor: isDrilled ? undefined : "var(--bi-border)" }}
+                          title={locale === "fa" ? "تبدیل نوع ویجت (قبل یا بعد از دریل‌داون)" : "Convert widget type (works after drill-down too)"}
                         >
-                          <ArrowUp className="w-3.5 h-3.5" />
-                        </button>
+                          {convertOptions.map((ct) => {
+                            const meta = CHART_REGISTRY.find((c) => c.id === ct);
+                            return (
+                              <option key={ct} value={ct}>
+                                {meta ? (locale === "fa" ? meta.labelFa : meta.label) : ct}
+                              </option>
+                            );
+                          })}
+                        </select>
                       )}
                       {w.drill_rule?.drill_through_page_id && (
                         <button
@@ -881,6 +1113,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             pages={dash.pages}
             onClose={() => setSelectedWidgetId(null)}
             onUpdated={loadDashboard}
+            onChartSwitched={(wid, chartType) =>
+              setWidgetChartOverrides((prev) => ({ ...prev, [wid]: chartType }))
+            }
           />
         )}
 

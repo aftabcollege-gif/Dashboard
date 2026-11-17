@@ -92,7 +92,11 @@ function executeVisualSpec(
   const limit = Number(spec?.limit || 200);
 
   if (rawMode || agg === "RAW") {
-    const cols = Array.isArray(spec?.columns) && spec.columns.length > 0 ? spec.columns : tableCols.slice(0, 9);
+    const cleanCols = tableCols.filter((c) => c !== "id" && !c.endsWith("_id"));
+    const cols =
+      Array.isArray(spec?.columns) && spec.columns.length > 0
+        ? spec.columns
+        : (cleanCols.length > 0 ? cleanCols : tableCols).slice(0, 10);
     const sliced = filtered.slice(0, limit).map((r) => {
       const item: Row = {};
       for (const c of cols) item[c] = r[c];
@@ -412,10 +416,62 @@ export async function handleVercelDemoApi(
   }
 
   // Public embed dashboard (no auth required)
-  if (method === "GET" && segments[0] === "dashboards" && segments[1] === "public" && segments[2]) {
-    const pub = demoData.public_dashboards?.[segments[2]];
-    if (!pub) return { status: 404, body: { detail: "Public dashboard not found" } };
+  if (method === "GET" && segments[0] === "dashboards" && segments[1] === "public" && segments[2] && segments.length === 3) {
+    const token = segments[2];
+    const detMatch = Object.values(demoData.dashboards_detail || {}).find(
+      (d: any) => d.is_public && d.embed_token === token
+    ) as any;
+    const pub = demoData.public_dashboards?.[token];
+    if (!detMatch && !pub) return { status: 404, body: { detail: "Public dashboard not found" } };
+    if (detMatch) {
+      return {
+        status: 200,
+        body: {
+          id: detMatch.id,
+          title: detMatch.title,
+          description: detMatch.description,
+          theme: detMatch.theme || pub?.theme || null,
+          pages: (detMatch.pages || []).map((p: any) => ({ id: p.id, title: p.title })),
+          widgets: (detMatch.widgets || []).map((w: any) => {
+            const res = executeWidgetForDemo(w, null, [], [], []);
+            return {
+              id: w.id,
+              page_id: w.page_id,
+              title: w.title,
+              chart_type: w.chart_type,
+              layout: w.layout,
+              config: w.config,
+              query: w.query,
+              drill_rule: w.drill_rule,
+              data: { columns: res.columns, rows: res.rows, row_count: res.row_count },
+            };
+          }),
+        },
+      };
+    }
     return { status: 200, body: pub };
+  }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "public" && segments[2] && segments[3] === "execute-batch") {
+    const token = segments[2];
+    const detMatch = Object.values(demoData.dashboards_detail || {}).find(
+      (d: any) => d.is_public && d.embed_token === token
+    ) as any;
+    if (!detMatch) return { status: 404, body: { detail: "Public dashboard not found" } };
+    const widgets: Record<string, any> = {};
+    for (const w of detMatch.widgets || []) {
+      const hierarchy = w.drill_rule?.hierarchy || [];
+      const rawStack = body?.drill_states?.[w.id] || [];
+      const dStack = hierarchy.length > 0 ? rawStack.slice(0, Math.max(0, hierarchy.length - 1)) : [];
+      widgets[w.id] = executeWidgetForDemo(w, null, body?.active_filters || [], body?.cross_filters || [], dStack);
+    }
+    return {
+      status: 200,
+      body: {
+        dashboard_id: detMatch.id,
+        load_ms: 9.4,
+        widgets,
+      },
+    };
   }
 
   // Themes (accessible on login too)
@@ -520,12 +576,16 @@ export async function handleVercelDemoApi(
   }
   if (method === "POST" && segments[0] === "datasets" && segments[2] === "filter-options") {
     const { rows } = getTableForDataset(segments[1]);
-    const parentFilters = Object.entries(body?.parent_values || {})
+    const fromArray = Array.isArray(body?.parent_filters) ? body.parent_filters : [];
+    const fromMap = Object.entries(body?.parent_values || {})
       .filter(([, v]) => v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0))
       .map(([k, v]) => ({ field_name: k, operator: Array.isArray(v) ? "in" : "eq", value: v, is_active: true }));
-    const visible = applyRlsAndFilters(rows, username, parentFilters);
+    const visible = applyRlsAndFilters(rows, username, [...fromArray, ...fromMap]);
     const field = body?.field_name;
-    const vals = Array.from(new Set(visible.map((r) => r[field]).filter((v) => v !== undefined && v !== null))).sort();
+    const limit = Number(body?.limit || 500);
+    const vals = Array.from(new Set(visible.map((r) => r[field]).filter((v) => v !== undefined && v !== null)))
+      .sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true }))
+      .slice(0, limit);
     return { status: 200, body: { field_name: field, values: vals } };
   }
 

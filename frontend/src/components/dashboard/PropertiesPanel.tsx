@@ -13,9 +13,10 @@ interface Props {
   pages: { id: string; title: string }[];
   onClose: () => void;
   onUpdated: () => void;
+  onChartSwitched?: (widgetId: string, chartType: string) => void;
 }
 
-export default function PropertiesPanel({ widget, datasets, pages, onClose, onUpdated }: Props) {
+export default function PropertiesPanel({ widget, datasets, pages, onClose, onUpdated, onChartSwitched }: Props) {
   const { t, locale, showToast } = useBi();
   const [tab, setTab] = useState<"data" | "viz" | "style" | "filters" | "drill" | "advanced">("data");
 
@@ -75,6 +76,7 @@ export default function PropertiesPanel({ widget, datasets, pages, onClose, onUp
         method: "POST",
         body: JSON.stringify({ target_chart_type: targetType }),
       });
+      onChartSwitched?.(widget.id, targetType);
       if (res.warnings?.length) {
         showToast(res.warnings[0]);
       } else {

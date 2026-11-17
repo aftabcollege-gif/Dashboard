@@ -299,6 +299,7 @@ def get_public_dashboard(embed_token: str, db: Session = Depends(get_db)):
     for w in widgets:
         wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
         cfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
+        wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
         ds = db.query(Dataset).filter(Dataset.id == w.dataset_id).first() if w.dataset_id else None
         data = {"columns": [], "rows": []}
         if ds and wq:
@@ -311,16 +312,115 @@ def get_public_dashboard(embed_token: str, db: Session = Depends(get_db)):
             except Exception:
                 pass
         out_widgets.append({
-            "id": w.id, "page_id": w.page_id, "title": w.title, "chart_type": w.chart_type,
+            "id": w.id,
+            "page_id": w.page_id,
+            "title": w.title,
+            "chart_type": w.chart_type,
             "layout": {"x": w.layout_x, "y": w.layout_y, "w": w.layout_w, "h": w.layout_h},
-            "config": {"style": cfg.style_json if cfg else {}, "visualization": cfg.visualization_json if cfg else {}},
+            "config": {
+                "style": cfg.style_json if cfg else {},
+                "visualization": cfg.visualization_json if cfg else {},
+                "interactions": cfg.interactions_json if cfg else {"cross_filter": True},
+            },
+            "query": {
+                "query_mode": wq.query_mode if wq else "visual",
+                "visual_spec": wq.visual_spec_json if wq else {},
+            },
+            "drill_rule": {
+                "hierarchy": wdr.hierarchy_json if wdr else [],
+                "level_rules": wdr.level_rules_json if wdr else [],
+            },
             "data": data,
         })
     return {
-        "id": dash.id, "title": dash.title, "description": dash.description,
+        "id": dash.id,
+        "title": dash.title,
+        "description": dash.description,
         "theme": {"name": theme.name, "slug": theme.slug, "mode": theme.mode, "tokens": theme.tokens_json} if theme else None,
         "pages": [{"id": p.id, "title": p.title} for p in pages],
         "widgets": out_widgets,
+    }
+
+
+@router.post("/public/{embed_token}/execute-batch")
+def execute_public_dashboard_batch(
+    embed_token: str,
+    body: BatchExecuteRequest,
+    db: Session = Depends(get_db),
+):
+    dash = db.query(Dashboard).filter(Dashboard.embed_token == embed_token, Dashboard.is_public == True).first()
+    if not dash:
+        raise HTTPException(status_code=404, detail="Shared dashboard not found or not public")
+
+    t0 = time.perf_counter()
+    widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
+    results: dict[str, Any] = {}
+
+    for w in widgets:
+        wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
+        wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
+        ds = db.query(Dataset).filter(Dataset.id == (wq.dataset_id if wq and wq.dataset_id else w.dataset_id)).first()
+        hierarchy = (wdr.hierarchy_json if wdr else []) or []
+        level_rules = (wdr.level_rules_json if wdr else []) or []
+        d_stack = body.drill_states.get(w.id, [])
+        level = min(len(d_stack), len(hierarchy) - 1) if hierarchy else 0
+
+        eff_dim: Optional[str] = None
+        eff_chart = w.chart_type
+        if hierarchy and 0 <= level < len(hierarchy):
+            step = hierarchy[level]
+            eff_dim = step.get("field") if isinstance(step, dict) else str(step)
+        for lr in level_rules:
+            if isinstance(lr, dict) and int(lr.get("level", -1)) == level:
+                if lr.get("chart_type"):
+                    eff_chart = str(lr["chart_type"])
+                if lr.get("field"):
+                    eff_dim = str(lr["field"])
+
+        breadcrumbs = [{"level": 0, "label": "All", "field": None, "value": None}]
+        drill_filters: list[dict[str, Any]] = []
+        for idx, item in enumerate(d_stack[: max(0, len(hierarchy) - 1)]):
+            fn = item.get("field")
+            fv = item.get("value")
+            if fn and fv is not None:
+                drill_filters.append({"field_name": fn, "operator": "eq", "value": fv, "is_active": True})
+                breadcrumbs.append({"level": idx + 1, "label": f"{fn}: {fv}", "field": fn, "value": fv})
+
+        eff_filters = list(body.active_filters or [])
+        for cf in body.cross_filters or []:
+            if cf.get("source_widget_id") != w.id:
+                eff_filters.append(cf)
+        eff_filters.extend(drill_filters)
+
+        data = {"columns": [], "rows": [], "row_count": 0, "execution_ms": 0.0}
+        if ds and wq:
+            try:
+                if wq.query_mode == "sql" and wq.sql_text:
+                    data = warehouse.execute_query(wq.sql_text)
+                else:
+                    sql, params, _ = build_visual_query_sql(
+                        db, ds, wq.visual_spec_json or {}, eff_filters, [], [], override_dimension=eff_dim
+                    )
+                    data = warehouse.execute_query(sql, params)
+            except Exception as exc:
+                data = {"columns": [], "rows": [], "error": str(exc)}
+
+        results[w.id] = {
+            "widget_id": w.id,
+            "effective_chart_type": eff_chart,
+            "drill": {
+                "level": len(drill_filters),
+                "breadcrumbs": breadcrumbs,
+                "can_drill_down": bool(hierarchy and len(drill_filters) < len(hierarchy) - 1),
+                "effective_dimension": eff_dim,
+            },
+            **data,
+        }
+
+    return {
+        "dashboard_id": dash.id,
+        "load_ms": round((time.perf_counter() - t0) * 1000, 3),
+        "widgets": results,
     }
 
 

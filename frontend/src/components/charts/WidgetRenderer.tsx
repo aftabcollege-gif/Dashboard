@@ -399,9 +399,16 @@ function EChartsCanvas(props: {
     chart.off("click");
     chart.on("click", (params: any) => {
       if (!props.onPointClick) return;
-      const clickedVal =
-        params.name || (Array.isArray(params.value) ? params.value[2] || params.value[0] : params.value);
-      if (clickedVal !== undefined && clickedVal !== null) {
+      if (props.chartType === "radar") return;
+      let clickedVal: any = params.name;
+      if (props.chartType === "sankey" && params.dataType === "edge") {
+        clickedVal = params.data?.source;
+      } else if (!clickedVal && Array.isArray(params.value)) {
+        clickedVal = params.value[3] ?? params.value[0];
+      } else if (clickedVal === undefined || clickedVal === "") {
+        clickedVal = params.value;
+      }
+      if (clickedVal !== undefined && clickedVal !== null && clickedVal !== "") {
         props.onPointClick(props.xField, clickedVal);
       }
     });
@@ -428,7 +435,7 @@ function EChartsCanvas(props: {
     };
   }, []);
 
-  return <div ref={containerRef} className="w-full h-full min-h-[160px]" />;
+  return <div ref={containerRef} className="w-full h-full min-h-[160px] cursor-pointer" />;
 }
 
 function buildEChartsOption(ctx: {
