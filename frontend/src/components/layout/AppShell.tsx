@@ -390,6 +390,11 @@ function LoginScreen() {
 
         {demoMode && (
           <div className="pt-3 border-t text-xs space-y-1.5" style={{ borderColor: "var(--bi-border)", color: "var(--bi-muted)" }}>
+            {authStatus?.environment === "vercel-preview-demo" && (
+              <div className="px-2.5 py-1.5 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 text-[11px] font-medium">
+                Preview Demo Mode — serving built-in sample BI data (1,200 sales &amp; 450 expense rows).
+              </div>
+            )}
             <div className="font-semibold">Quick Demo Accounts (Enterprise Roles):</div>
             <div className="grid grid-cols-2 gap-1.5">
               <button type="button" onClick={() => { setAuthMode("local"); setUsername("admin"); setPassword("Admin!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
@@ -546,7 +551,22 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             {locale === "en" ? "FA" : "EN"}
           </button>
         </header>
-        <main className="flex-1 min-w-0 p-4 lg:p-6">{children}</main>
+        <main className="flex-1 min-w-0 p-4 lg:p-6">
+          {authStatus?.environment === "vercel-preview-demo" && (
+            <div
+              className="mb-4 px-3 py-2 rounded-lg border text-xs flex flex-wrap items-center justify-between gap-2"
+              style={{ borderColor: "var(--bi-border)", background: "rgba(37, 99, 235, 0.08)", color: "var(--bi-text)" }}
+            >
+              <span>
+                <strong>Vercel UI Preview (Demo Data):</strong> Interactive sample warehouse loaded (RLS, Drill-Down, Charts &amp; SQL Explorer active).
+              </span>
+              <span className="text-[11px]" style={{ color: "var(--bi-muted)" }}>
+                Connect <code>BACKEND_INTERNAL_URL</code> for persistent Neon/FastAPI storage
+              </span>
+            </div>
+          )}
+          {children}
+        </main>
       </div>
     </div>
   );
