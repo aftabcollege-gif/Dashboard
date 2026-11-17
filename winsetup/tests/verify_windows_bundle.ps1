@@ -14,7 +14,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$WinSetupDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$TestsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$WinSetupDir = Split-Path -Parent $TestsDir
 if (-not $InstallerPath) { $InstallerPath = Join-Path $WinSetupDir "dist\setup.exe" }
 if (-not $InstallDir) { $InstallDir = Join-Path $env:TEMP ("NexusBI_CleanVerify_" + [Guid]::NewGuid().ToString("N").Substring(0, 8)) }
 $TestDataRoot = Join-Path $env:LOCALAPPDATA ("NexusBI_VerifyData_" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
@@ -23,6 +24,10 @@ $DataDir = Join-Path $TestDataRoot "data"
 if (-not (Test-Path $InstallerPath)) {
     throw "Installer not found at $InstallerPath. Run winsetup\build.ps1 first."
 }
+
+$InstallerInfo = Get-Item $InstallerPath
+$InstallerSha = (Get-FileHash -Path $InstallerPath -Algorithm SHA256).Hash
+Write-Host "Installer: $($InstallerInfo.FullName) ($([Math]::Round($InstallerInfo.Length / 1MB, 2)) MB, SHA256=$InstallerSha)"
 
 Write-Host "=== 1. Installing setup.exe silently into $InstallDir ==="
 $proc = Start-Process -FilePath $InstallerPath -ArgumentList "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES", "/DIR=`"$InstallDir`"" -Wait -PassThru
@@ -65,19 +70,17 @@ try {
     $standaloneDir = Join-Path $InstallDir "frontend\.next\standalone"
 
     # Negative check: production without generated secrets MUST fail
-    $badEnv = @{
-        ENVIRONMENT = "production"
-        BI_DATA_DIR = $DataDir
-        BI_REQUIRE_GENERATED_SECRETS = "1"
-        PYTHONNOUSERSITE = "1"
-        PYTHONDONTWRITEBYTECODE = "1"
-    }
     $badPsi = New-Object System.Diagnostics.ProcessStartInfo
     $badPsi.FileName = $pyExe
     $badPsi.Arguments = "-c `"from app.config import settings; settings.validate_runtime_security()`""
     $badPsi.WorkingDirectory = (Join-Path $InstallDir "backend")
     $badPsi.UseShellExecute = $false
-    foreach ($k in $badEnv.Keys) { $badPsi.EnvironmentVariables[$k] = $badEnv[$k] }
+    $badPsi.RedirectStandardError = $true
+    $badPsi.EnvironmentVariables["ENVIRONMENT"] = "production"
+    $badPsi.EnvironmentVariables["BI_DATA_DIR"] = $DataDir
+    $badPsi.EnvironmentVariables["BI_REQUIRE_GENERATED_SECRETS"] = "1"
+    $badPsi.EnvironmentVariables["PYTHONNOUSERSITE"] = "1"
+    $badPsi.EnvironmentVariables["PYTHONDONTWRITEBYTECODE"] = "1"
     $badProc = [System.Diagnostics.Process]::Start($badPsi)
     $badProc.WaitForExit()
     if ($badProc.ExitCode -eq 0) {
@@ -123,6 +126,8 @@ try {
     $baseUrl = "http://127.0.0.1:$uiPort"
     $healthy = $false
     for ($i = 0; $i -lt 90; $i++) {
+        if ($backendProc.HasExited) { throw "Bundled backend exited early with code $($backendProc.ExitCode)" }
+        if ($gatewayProc.HasExited) { throw "Bundled web gateway exited early with code $($gatewayProc.ExitCode)" }
         try {
             $r1 = Invoke-WebRequest -Uri "$baseUrl/__gateway/health" -UseBasicParsing -TimeoutSec 2
             $r2 = Invoke-WebRequest -Uri "$baseUrl/api/v1/health" -UseBasicParsing -TimeoutSec 2
@@ -173,6 +178,17 @@ try {
     $execRes = Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards/$dashId/execute-batch" -Headers $headers -Method POST -ContentType "application/json" -Body "{}"
     if ($execRes.widgets.Count -lt 1) { throw "Expected widget execution results from DuckDB" }
 
+    # Upload CSV through web_gateway -> FastAPI -> DuckDB
+    $tmpCsv = Join-Path $TestDataRoot "ci_sample.csv"
+    Set-Content -Path $tmpCsv -Value "region,product,sales`nNorth,WidgetA,1500`nSouth,WidgetB,2900" -Encoding UTF8
+    $impOut = & curl.exe -sS -f -X POST "$baseUrl/api/v1/data-sources/files/import" `
+        -H "Authorization: Bearer $tok" `
+        -F "dataset_name=Windows CI CSV" `
+        -F "file=@$tmpCsv;type=text/csv"
+    if ($LASTEXITCODE -ne 0) { throw "CSV file upload via bundled web gateway failed" }
+    $impJson = $impOut | ConvertFrom-Json
+    if ($impJson.row_count -ne 2) { throw "Expected 2 imported CSV rows, got $($impJson.row_count)" }
+
     # Shutdown gracefully
     Invoke-RestMethod -Uri "$baseUrl/__gateway/shutdown" -Method POST -Headers @{ "X-Gateway-Token" = $ctrlTok } | Out-Null
     Invoke-RestMethod -Uri "http://127.0.0.1:$backendPort/_internal/shutdown" -Method POST -Headers @{ "X-Desktop-Control-Token" = $ctrlTok } | Out-Null
@@ -186,6 +202,7 @@ finally {
 
 if (-not (Test-Path (Join-Path $DataDir "app_metadata.db"))) { throw "SQLite DB missing in BI_DATA_DIR" }
 if (-not (Test-Path (Join-Path $DataDir "warehouse.duckdb"))) { throw "DuckDB warehouse missing in BI_DATA_DIR" }
+if (-not (Get-ChildItem -Path (Join-Path $DataDir "uploads") -File)) { throw "Uploaded CSV missing in BI_DATA_DIR\uploads" }
 
 Write-Host "=== 4. Running silent uninstall and verifying user data is preserved ==="
 $unins = Join-Path $InstallDir "unins000.exe"

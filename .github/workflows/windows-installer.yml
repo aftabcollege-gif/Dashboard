@@ -36,6 +36,14 @@ jobs:
         run: |
           .\winsetup\tests\verify_windows_bundle.ps1
 
+      - name: Record setup.exe metadata in summary
+        shell: pwsh
+        run: |
+          $f = Get-Item "winsetup\dist\setup.exe"
+          $sha = (Get-FileHash -Path $f.FullName -Algorithm SHA256).Hash
+          $mb = [Math]::Round($f.Length / 1MB, 2)
+          "### Windows Installer Build Succeeded`n- File: ``winsetup/dist/setup.exe```n- Size: **$mb MB**`n- SHA256: ``$sha``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
       - name: Upload Windows setup.exe artifact
         uses: actions/upload-artifact@v4
         with:
