@@ -1,0 +1,16 @@
+NexusBI Enterprise Intelligence Platform - Desktop Edition
+Copyright (c) 2026 NexusBI Contributors.
+
+This offline Windows x64 installer packages the NexusBI web dashboard,
+analytical engine (DuckDB), local metadata store (SQLite WAL), and
+self-contained Python & Node.js runtimes.
+
+Third-party bundled runtimes and libraries (Python, Node.js, DuckDB, FastAPI,
+Next.js, Apache ECharts, SQLAlchemy, Pandas, and supporting packages) remain
+subject to their respective open-source licenses.
+
+Runtime Data & Security Notice:
+- User databases, uploads, exports, logs, and DPAPI-protected local keys are
+  stored in %LocalAppData%\NexusBI.
+- Uninstalling the application removes program binaries only and preserves your
+  data directory in %LocalAppData%\NexusBI.
