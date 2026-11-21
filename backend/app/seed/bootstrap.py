@@ -557,6 +557,90 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
     return org, roles, theme_objs
 
 
+def ensure_contractor_sample_dataset(db: Session, org: Organization) -> None:
+    """Idempotently seeds the Persian sample dataset 'تعداد' (Contractor Counts & Performance) into DuckDB & metadata."""
+    existing = db.query(Dataset).filter(
+        Dataset.organization_id == org.id, Dataset.warehouse_table == "wh_contractor_counts"
+    ).first()
+    if existing and warehouse.table_exists("wh_contractor_counts"):
+        return
+
+    rows = [
+        {"contractor_name": "پیمانکاری آفتاب", "region": "North", "project_type": "فناوری اطلاعات", "project_count": 14, "completed_tasks": 128, "performance_score": 94.5, "contract_value": 4200},
+        {"contractor_name": "پیمانکاری آفتاب", "region": "South", "project_type": "عمرانی", "project_count": 9, "completed_tasks": 76, "performance_score": 89.0, "contract_value": 3100},
+        {"contractor_name": "سازه گستر پارس", "region": "South", "project_type": "عمرانی", "project_count": 18, "completed_tasks": 152, "performance_score": 91.2, "contract_value": 5800},
+        {"contractor_name": "سازه گستر پارس", "region": "West", "project_type": "صنعتی", "project_count": 11, "completed_tasks": 90, "performance_score": 87.5, "contract_value": 3950},
+        {"contractor_name": "فناوران البرز", "region": "North", "project_type": "فناوری اطلاعات", "project_count": 21, "completed_tasks": 195, "performance_score": 96.4, "contract_value": 4900},
+        {"contractor_name": "فناوران البرز", "region": "East", "project_type": "فناوری اطلاعات", "project_count": 8, "completed_tasks": 64, "performance_score": 92.0, "contract_value": 2400},
+        {"contractor_name": "توسعه انرژی شرق", "region": "East", "project_type": "برق و تاسیسات", "project_count": 16, "completed_tasks": 134, "performance_score": 88.8, "contract_value": 5100},
+        {"contractor_name": "توسعه انرژی شرق", "region": "North", "project_type": "برق و تاسیسات", "project_count": 7, "completed_tasks": 58, "performance_score": 86.0, "contract_value": 2150},
+        {"contractor_name": "مهندسی کارا", "region": "West", "project_type": "صنعتی", "project_count": 13, "completed_tasks": 110, "performance_score": 90.5, "contract_value": 4450},
+        {"contractor_name": "مهندسی کارا", "region": "North", "project_type": "عمرانی", "project_count": 10, "completed_tasks": 82, "performance_score": 88.2, "contract_value": 3300},
+        {"contractor_name": "پارس نیرو", "region": "South", "project_type": "برق و تاسیسات", "project_count": 15, "completed_tasks": 124, "performance_score": 93.1, "contract_value": 4700},
+        {"contractor_name": "پارس نیرو", "region": "East", "project_type": "صنعتی", "project_count": 9, "completed_tasks": 71, "performance_score": 89.7, "contract_value": 2950},
+    ]
+    df = pd.DataFrame(rows)
+    warehouse.load_dataframe("wh_contractor_counts", df, mode="replace")
+
+    if existing:
+        existing.row_count = len(rows)
+        existing.freshness_status = "fresh"
+        existing.last_refreshed_at = datetime.now(timezone.utc)
+        db.commit()
+        return
+
+    src = db.query(DataSource).filter(DataSource.organization_id == org.id).first()
+    if not src:
+        src = DataSource(
+            organization_id=org.id,
+            name="Enterprise ERP Operational DB",
+            source_type="sqlite",
+            read_only=True,
+            config_json={"file_path": settings.SAMPLE_ERP_DB_PATH, "default_table": "erp_orders"},
+            refresh_policy="manual",
+            health_status="healthy",
+            last_tested_at=datetime.now(timezone.utc),
+        )
+        db.add(src)
+        db.flush()
+
+    ds_contractors = Dataset(
+        organization_id=org.id,
+        data_source_id=src.id,
+        name="تعداد",
+        description="آمار تعداد پروژه‌ها و عملکرد پیمانکاران (نمونه تستی فارسی)",
+        warehouse_table="wh_contractor_counts",
+        schema_type="fact",
+        refresh_policy="cached",
+        row_count=len(rows),
+        last_refreshed_at=datetime.now(timezone.utc),
+        freshness_status="fresh",
+    )
+    db.add(ds_contractors)
+    db.flush()
+
+    fields_spec = [
+        ("contractor_name", "نام پیمانکار", "string", "dimension"),
+        ("region", "منطقه", "string", "geo"),
+        ("project_type", "حوزه پروژه", "string", "dimension"),
+        ("project_count", "تعداد پروژه", "integer", "measure"),
+        ("completed_tasks", "تعداد کار انجام‌شده", "integer", "measure"),
+        ("performance_score", "امتیاز عملکرد", "float", "measure"),
+        ("contract_value", "مبلغ قرارداد", "float", "measure"),
+    ]
+    for fname, disp, dtype, srole in fields_spec:
+        db.add(
+            DatasetField(
+                dataset_id=ds_contractors.id,
+                field_name=fname,
+                display_name=disp,
+                data_type=dtype,
+                semantic_role=srole,
+            )
+        )
+    db.commit()
+
+
 def seed_sample_bi_content(
     db: Session,
     org: Organization,
@@ -930,6 +1014,7 @@ def seed_sample_bi_content(
             )
         )
     db.commit()
+    ensure_contractor_sample_dataset(db, org)
 
 
 def seed_database(db: Session) -> None:
@@ -947,6 +1032,8 @@ def seed_database(db: Session) -> None:
                     run_etl_pipeline(db, pl.id, trigger_type="seed")
                 except Exception:
                     pass
+        if db.query(Dataset).filter(Dataset.organization_id == existing_org.id, Dataset.warehouse_table == "wh_enterprise_sales").first():
+            ensure_contractor_sample_dataset(db, existing_org)
         return
 
     org, roles, theme_objs = seed_core_catalog(db)

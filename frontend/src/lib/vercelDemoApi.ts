@@ -444,10 +444,19 @@ function getDemoDatasetSchema(ds: any) {
   }
   const tbl = demoData.tables?.[ds.warehouse_table] || { columns: [], rows: [] };
   const sample = tbl.rows?.[0] || {};
+  const fieldMetaMap = new Map<string, any>();
+  for (const f of ds.fields || []) {
+    if (f?.field_name) fieldMetaMap.set(f.field_name, f);
+  }
   const colsInfo = (tbl.columns || []).map((name: string) => {
-    const isNum = typeof sample[name] === "number" && !name.endsWith("_id") && !["year", "month", "quarter", "day"].includes(name);
-    const role = isNum ? "measure" : ["year", "quarter", "month", "day", "date"].includes(name) ? "time" : "dimension";
-    return { name, label: name.replace(/_/g, " "), role };
+    const fmeta = fieldMetaMap.get(name);
+    const isNum =
+      fmeta?.semantic_role === "measure" ||
+      (typeof sample[name] === "number" && !name.endsWith("_id") && !["year", "month", "quarter", "day"].includes(name));
+    const role =
+      fmeta?.semantic_role ||
+      (isNum ? "measure" : ["year", "quarter", "month", "day", "date"].includes(name) ? "time" : "dimension");
+    return { name, label: fmeta?.display_name || name.replace(/_/g, " "), role };
   });
   return {
     colsInfo,
@@ -493,6 +502,13 @@ function matchDemoColumn(mention: string, colsInfo: any[], roleFilter?: "measure
     "حقوق": ["salary", "payroll", "wage"],
     "پیمانکار": ["contractor", "vendor", "supplier", "partner", "پیمانکار"],
     "نام پیمانکار": ["contractor_name", "contractor", "vendor_name", "vendor", "supplier", "پیمانکار"],
+    "حوزه پروژه": ["project_type", "حوزه"],
+    "تعداد پروژه": ["project_count", "تعداد پروژه"],
+    "کار انجام شده": ["completed_tasks", "انجام"],
+    "امتیاز عملکرد": ["performance_score", "امتیاز"],
+    "امتیاز": ["performance_score", "score", "امتیاز"],
+    "مبلغ قرارداد": ["contract_value", "مبلغ قرارداد"],
+    "عملکرد": ["performance_score", "performance", "score", "revenue"],
     "منطقه": ["region", "area", "zone"],
     "استان": ["province", "state", "region"],
     "شهر": ["city"],
@@ -617,11 +633,17 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
   const chartType = clar.chart_type || extractChartTypeFromText(semanticLow);
   let agg: string | null = clar.aggregation || null;
   if (!agg) {
-    if (["تعداد", "شمارش", "count", "how many"].some((k) => semanticLow.includes(k))) agg = "COUNT";
-    else if (["میانگین", "متوسط", "avg", "average", "mean"].some((k) => semanticLow.includes(k))) agg = "AVG";
+    if (["میانگین", "متوسط", "avg", "average", "mean"].some((k) => semanticLow.includes(k))) agg = "AVG";
     else if (["بیشترین", "حداکثر", "ماکزیمم", "max", "highest"].some((k) => semanticLow.includes(k))) agg = "MAX";
     else if (["کمترین", "حداقل", "مینیمم", "min", "lowest"].some((k) => semanticLow.includes(k))) agg = "MIN";
-    else if (["مجموع", "جمع", "کل", "سرجمع", "sum", "total"].some((k) => semanticLow.includes(k))) agg = "SUM";
+    else if (["مجموع", "جمع", "سرجمع", "sum", "total"].some((k) => semanticLow.includes(k))) agg = "SUM";
+    else if (["شمارش", "تعداد رکورد", "تعداد کل", "چند تا", "count", "how many"].some((k) => semanticLow.includes(k))) agg = "COUNT";
+    else if (
+      semanticLow.includes("تعداد") &&
+      !["تعداد پروژه", "تعداد کار", "تعداد قرارداد"].some((cp) => semanticLow.includes(cp))
+    ) {
+      agg = "COUNT";
+    }
   }
 
   const questions: any[] = [];
@@ -701,7 +723,10 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
           { value: "__COUNT__", label: "تعداد رکوردها (شمارش / COUNT)", hint: "COUNT(*)" },
           ...numCols.slice(0, 6).map((nc: string) => {
             const lbl = colsInfo.find((c: any) => c.name === nc)?.label || nc;
-            return { value: nc, label: `مجموع ${lbl}`, hint: `SUM(${nc})` };
+            const isAvg = ["score", "pct", "rate", "ratio", "margin"].some((k) => nc.toLowerCase().includes(k));
+            return isAvg
+              ? { value: `AVG:${nc}`, label: `میانگین ${lbl}`, hint: `AVG(${nc})` }
+              : { value: nc, label: `مجموع ${lbl}`, hint: `SUM(${nc})` };
           }),
         ],
       });
@@ -711,8 +736,16 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
   if (yField === "__COUNT__") {
     yField = "*";
     agg = "COUNT";
+  } else if (typeof yField === "string" && yField.startsWith("AVG:")) {
+    yField = yField.slice(4);
+    agg = "AVG";
+  } else if (typeof yField === "string" && yField.startsWith("SUM:")) {
+    yField = yField.slice(4);
+    agg = "SUM";
   } else if (yField && !agg) {
-    agg = yField === "*" ? "COUNT" : "SUM";
+    if (yField === "*") agg = "COUNT";
+    else if (["score", "pct", "rate", "ratio", "margin"].some((k) => yField!.toLowerCase().includes(k))) agg = "AVG";
+    else agg = "SUM";
   }
 
   if (questions.length > 0) {

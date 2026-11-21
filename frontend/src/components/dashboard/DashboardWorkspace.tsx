@@ -187,6 +187,16 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   }, [loadDashboard]);
 
   useEffect(() => {
+    if (typeof window !== "undefined") {
+      const sp = new URLSearchParams(window.location.search);
+      if (sp.get("ai") === "1") {
+        setAiTab("builder");
+        setShowAiDrawer(true);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
     if (typeof window === "undefined" || authStatus?.environment !== "vercel-preview-demo" || !dash || themes.length === 0) return;
     const storedThemeId = localStorage.getItem(`bi_demo_theme_${dash.id}`);
     if (!storedThemeId || storedThemeId === dash.theme_id) return;
@@ -1475,22 +1485,32 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                       <button
                         type="button"
                         onClick={() =>
-                          setTwPrompt("از روی منبع فروش یک ویجت میله ای از مجموع فروش بر اساس منطقه بساز تحت عنوان عملکرد مناطق")
-                        }
-                        className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
-                        style={{ borderColor: "var(--bi-border)" }}
-                      >
-                        مثال آماده: عملکرد مناطق
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
                           setTwPrompt("از روی منبع تعداد یک ویجت میله ای بر اساس نام پیمانکار بساز تحت عنوان عملکرد پیمانکار")
                         }
                         className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
                         style={{ borderColor: "var(--bi-border)" }}
                       >
-                        مثال رفع ابهام: پیمانکار
+                        مثال نمونه تستی: عملکرد پیمانکار
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setTwPrompt("از روی منبع فروش یک ویجت میله ای از مجموع فروش بر اساس منطقه بساز تحت عنوان عملکرد مناطق")
+                        }
+                        className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        مثال مستقیم: عملکرد مناطق
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setTwPrompt("یک ویجت بساز برای مقایسه وضعیت شعب")
+                        }
+                        className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        مثال رفع ابهام کامل
                       </button>
                     </div>
                     <div className="flex gap-2">

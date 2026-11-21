@@ -585,7 +585,15 @@ class AiAnalyticsEngine:
             "روز": ["day"],
             "تاریخ": ["order_date", "transaction_date", "date", "created_at"],
             "کارمند": ["employee", "staff", "name"],
-            "عملکرد": ["performance", "score", "revenue", "efficiency"],
+            "پیمانکار": ["contractor", "vendor", "supplier", "پیمانکار"],
+            "نام پیمانکار": ["contractor_name", "contractor", "پیمانکار"],
+            "حوزه پروژه": ["project_type", "حوزه"],
+            "تعداد پروژه": ["project_count", "تعداد پروژه"],
+            "کار انجام شده": ["completed_tasks", "انجام"],
+            "امتیاز عملکرد": ["performance_score", "امتیاز"],
+            "امتیاز": ["performance_score", "score", "امتیاز"],
+            "مبلغ قرارداد": ["contract_value", "مبلغ قرارداد"],
+            "عملکرد": ["performance_score", "performance", "score", "revenue", "efficiency"],
         }
         for fa_key, en_list in fa_en_synonyms.items():
             if fa_key in m_norm or m_norm in fa_key:
@@ -739,16 +747,20 @@ class AiAnalyticsEngine:
         chart_type = clarifications.get("chart_type") or AiAnalyticsEngine._extract_chart_type(semantic_low)
         agg: Optional[str] = clarifications.get("aggregation")
         if not agg:
-            if any(k in semantic_low for k in ("تعداد", "شمارش", "count", "how many")):
-                agg = "COUNT"
-            elif any(k in semantic_low for k in ("میانگین", "متوسط", "avg", "average", "mean")):
+            if any(k in semantic_low for k in ("میانگین", "متوسط", "avg", "average", "mean")):
                 agg = "AVG"
             elif any(k in semantic_low for k in ("بیشترین", "حداکثر", "ماکزیمم", "max", "highest")):
                 agg = "MAX"
             elif any(k in semantic_low for k in ("کمترین", "حداقل", "مینیمم", "min", "lowest")):
                 agg = "MIN"
-            elif any(k in semantic_low for k in ("مجموع", "جمع", "کل", "سرجمع", "sum", "total")):
+            elif any(k in semantic_low for k in ("مجموع", "جمع", "سرجمع", "sum", "total")):
                 agg = "SUM"
+            elif any(k in semantic_low for k in ("شمارش", "تعداد رکورد", "تعداد کل", "چند تا", "count", "how many")):
+                agg = "COUNT"
+            elif "تعداد" in semantic_low and not any(
+                col_phrase in semantic_low for col_phrase in ("تعداد پروژه", "تعداد کار", "تعداد قرارداد")
+            ):
+                agg = "COUNT"
 
         questions: list[dict[str, Any]] = []
 
@@ -874,7 +886,11 @@ class AiAnalyticsEngine:
                 measure_opts = [{"value": "__COUNT__", "label": "تعداد رکوردها (شمارش / COUNT)", "hint": "COUNT(*)"}]
                 for nc in num_cols[:6]:
                     lbl = next((c["label"] for c in cols_info if c["name"] == nc), nc)
-                    measure_opts.append({"value": nc, "label": f"مجموع {lbl}", "hint": f"SUM({nc})"})
+                    is_avg_metric = any(k in nc.lower() for k in ("score", "pct", "rate", "ratio", "margin"))
+                    if is_avg_metric:
+                        measure_opts.append({"value": f"AVG:{nc}", "label": f"میانگین {lbl}", "hint": f"AVG({nc})"})
+                    else:
+                        measure_opts.append({"value": nc, "label": f"مجموع {lbl}", "hint": f"SUM({nc})"})
                 questions.append(
                     {
                         "key": "y_field",
@@ -886,8 +902,17 @@ class AiAnalyticsEngine:
         if y_field == "__COUNT__":
             y_field = "*"
             agg = "COUNT"
+        elif isinstance(y_field, str) and y_field.startswith("AVG:"):
+            y_field = y_field[4:]
+            agg = "AVG"
+        elif isinstance(y_field, str) and y_field.startswith("SUM:"):
+            y_field = y_field[4:]
+            agg = "SUM"
         elif y_field and not agg:
-            agg = "SUM" if y_field != "*" else "COUNT"
+            if any(k in y_field.lower() for k in ("score", "pct", "rate", "ratio", "margin")):
+                agg = "AVG"
+            else:
+                agg = "SUM" if y_field != "*" else "COUNT"
 
         if questions:
             return {
