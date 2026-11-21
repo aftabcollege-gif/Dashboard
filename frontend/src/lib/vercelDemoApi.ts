@@ -372,6 +372,428 @@ function toCsv(columns: string[], rows: Row[]) {
   return [columns.join(","), ...rows.map((r) => columns.map((c) => esc(r[c])).join(","))].join("\n");
 }
 
+function normalizeFaText(text: string): string {
+  return (text || "")
+    .trim()
+    .replace(/ي/g, "ی")
+    .replace(/ى/g, "ی")
+    .replace(/ك/g, "ک")
+    .replace(/\u200c/g, " ")
+    .replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
+    .replace(/\s+/g, " ");
+}
+
+function extractChartTypeFromText(normLow: string): string | null {
+  const rules: [string[], string][] = [
+    [["میله ای افقی", "نمودار افقی", "ستونی افقی", "horizontal bar", "horizontal_bar"], "horizontal_bar"],
+    [["میله ای پشته", "ستونی پشته", "پشته ای", "stacked bar", "stacked_bar"], "stacked_bar"],
+    [["میله ای", "ستونی", "نمودار میله", "ویجت میله", "bar chart", "bar"], "bar"],
+    [["مساحتی پشته", "stacked area", "stacked_area"], "stacked_area"],
+    [["مساحتی", "سطحی", "area chart", "area"], "area"],
+    [["خطی", "روند", "نمودار خط", "line chart", "line"], "line"],
+    [["دونات", "حلقوی", "donut"], "donut"],
+    [["دایره ای", "پای", "نمودار دایره", "pie chart", "pie"], "pie"],
+    [["گیج", "عقربه ای", "سرعت سنج", "gauge"], "gauge"],
+    [["جدول محوری", "پیوت", "pivot"], "pivot_table"],
+    [["جدول", "لیست", "table"], "table"],
+    [["آبشاری", "waterfall"], "waterfall"],
+    [["قیف", "فانل", "funnel"], "funnel"],
+    [["رادار", "عنکبوتی", "radar"], "radar"],
+    [["پراکندگی", "scatter"], "scatter"],
+    [["حبابی", "bubble"], "bubble"],
+    [["درختی", "treemap"], "treemap"],
+    [["نقشه", "جغرافیا", "geo_map", "map"], "geo_map"],
+    [["حرارتی", "هیت مپ", "heatmap"], "heatmap"],
+    [["ترکیبی", "combo"], "combo"],
+    [["کارت شاخص", "کارت عدد", "تک عددی", "شاخص کل", "کارت kpi", "kpi"], "kpi"],
+  ];
+  for (const [kws, ct] of rules) {
+    if (kws.some((kw) => normLow.includes(kw))) return ct;
+  }
+  return null;
+}
+
+function getDemoDatasetSchema(ds: any) {
+  const profile = demoData.dataset_profiles?.[ds.id];
+  if (profile?.columns?.length) {
+    const colsInfo = profile.columns.map((c: any) => {
+      const name = String(c.field_name || c.column_name);
+      const dtype = String(c.data_type || "").toLowerCase();
+      const role =
+        c.semantic_role ||
+        ((dtype.includes("int") || dtype.includes("double") || dtype.includes("float") || dtype.includes("decimal")) &&
+        !name.endsWith("_id") &&
+        !["year", "month", "quarter", "day"].includes(name)
+          ? "measure"
+          : ["year", "quarter", "month", "day", "date"].includes(name)
+          ? "time"
+          : "dimension");
+      return {
+        name,
+        label: normalizeFaText(c.display_name || name.replace(/_/g, " ")),
+        role,
+      };
+    });
+    return {
+      colsInfo,
+      numCols: colsInfo.filter((c: any) => c.role === "measure").map((c: any) => c.name),
+      dimCols: colsInfo
+        .filter((c: any) => c.role !== "measure" && !c.name.endsWith("_id") && c.name !== "id")
+        .map((c: any) => c.name),
+    };
+  }
+  const tbl = demoData.tables?.[ds.warehouse_table] || { columns: [], rows: [] };
+  const sample = tbl.rows?.[0] || {};
+  const colsInfo = (tbl.columns || []).map((name: string) => {
+    const isNum = typeof sample[name] === "number" && !name.endsWith("_id") && !["year", "month", "quarter", "day"].includes(name);
+    const role = isNum ? "measure" : ["year", "quarter", "month", "day", "date"].includes(name) ? "time" : "dimension";
+    return { name, label: name.replace(/_/g, " "), role };
+  });
+  return {
+    colsInfo,
+    numCols: colsInfo.filter((c: any) => c.role === "measure").map((c: any) => c.name),
+    dimCols: colsInfo
+      .filter((c: any) => c.role !== "measure" && !c.name.endsWith("_id") && c.name !== "id")
+      .map((c: any) => c.name),
+  };
+}
+
+function matchDemoColumn(mention: string, colsInfo: any[], roleFilter?: "measure" | "dim"): string | null {
+  const mNorm = normalizeFaText(mention).toLowerCase().replace(/^[«»"'،,.؟?\s]+|[«»"'،,.؟?\s]+$/g, "");
+  if (!mNorm) return null;
+  const candidates =
+    roleFilter === "measure"
+      ? colsInfo.filter((c) => c.role === "measure")
+      : roleFilter === "dim"
+      ? colsInfo.filter((c) => c.role !== "measure" && !c.name.endsWith("_id") && c.name !== "id")
+      : colsInfo;
+
+  for (const c of candidates) {
+    const cn = c.name.toLowerCase();
+    const cl = c.label.toLowerCase();
+    if (mNorm === cn || mNorm === cn.replace(/_/g, " ") || mNorm === cl) return c.name;
+  }
+  for (const c of candidates) {
+    const cn = c.name.toLowerCase().replace(/_/g, " ");
+    const cl = c.label.toLowerCase();
+    if (mNorm.length >= 2 && (mNorm.includes(cn) || cn.includes(mNorm) || mNorm.includes(cl) || cl.includes(mNorm))) {
+      return c.name;
+    }
+  }
+  const syn: Record<string, string[]> = {
+    "فروش": ["revenue", "sales", "total_sales"],
+    "درامد": ["revenue", "income", "sales"],
+    "درآمد": ["revenue", "income", "sales"],
+    "سود": ["profit", "net_profit", "margin"],
+    "هزینه": ["cost", "expense", "amount", "budget"],
+    "بودجه": ["budget", "planned"],
+    "تعداد": ["quantity", "qty", "units", "count", "headcount", "employees"],
+    "مقدار": ["quantity", "amount", "value"],
+    "مبلغ": ["amount", "revenue", "cost", "price", "total"],
+    "حقوق": ["salary", "payroll", "wage"],
+    "پیمانکار": ["contractor", "vendor", "supplier", "partner", "پیمانکار"],
+    "نام پیمانکار": ["contractor_name", "contractor", "vendor_name", "vendor", "supplier", "پیمانکار"],
+    "منطقه": ["region", "area", "zone"],
+    "استان": ["province", "state", "region"],
+    "شهر": ["city"],
+    "کشور": ["country"],
+    "محصول": ["product", "item"],
+    "دسته": ["category", "group"],
+    "دپارتمان": ["department", "dept"],
+    "بخش": ["department", "division", "unit"],
+    "کانال": ["channel"],
+    "سال": ["year"],
+    "فصل": ["quarter"],
+    "ماه": ["month", "month_name"],
+    "روز": ["day"],
+    "تاریخ": ["order_date", "transaction_date", "date"],
+  };
+  for (const [fk, list] of Object.entries(syn)) {
+    if (mNorm.includes(fk) || fk.includes(mNorm)) {
+      for (const kw of list) {
+        const hit = candidates.find((c) => c.name.toLowerCase().includes(kw) || c.label.toLowerCase().includes(kw));
+        if (hit) return hit.name;
+      }
+    }
+  }
+  return null;
+}
+
+function handleTextToWidgetDemo(body: any, username: string | null) {
+  const clar = { ...(body?.clarifications || {}) };
+  const rawPrompt = String(body?.prompt || "").trim();
+  const freeReply = normalizeFaText(String(clar.free_text || "").trim());
+  const norm = normalizeFaText(rawPrompt);
+  const datasets: any[] = demoData.datasets || [];
+
+  if (datasets.length === 0) {
+    return {
+      status: "needs_clarification",
+      message_fa: "هیچ منبع داده (دیتاست) در سیستم ثبت نشده است.",
+      questions: [],
+      parsed: {},
+    };
+  }
+
+  let extractedTitle: string | null = clar.title || null;
+  let titlePhrase: string | null = null;
+  if (!extractedTitle) {
+    const mTitle = norm.match(
+      /(?:تحت\s+عنوان|با\s+عنوان|به\s+نام|با\s+نام|عنوان\s*[:：]|title\s*[:：])\s*["«']?([^"»'\n]+?)["»']?(?=\s*(?:بساز|ایجاد\s*کن|تولید\s*کن|درست\s*کن|اضافه\s*کن|بگذار|نشان\s*بده|نمایش\s*بده|$))/i
+    );
+    if (mTitle) {
+      titlePhrase = mTitle[0];
+      extractedTitle = mTitle[1].replace(/^[،,.«»"'\s]+|[،,.«»"'\s]+$/g, "");
+    }
+  }
+
+  let sourceMention: string | null = null;
+  const mSrc = norm.match(
+    /(?:از\s+روی|از|روی)\s+(?:منبع\s+داده|منبع|دیتاست|جدول|source|dataset|table)\s+["«']?(.+?)["»']?(?=\s+(?:یک|یه|ویجت|نمودار|کارت|شاخص|جدول|بر\s+اساس|به\s+تفکیک|بر\s+حسب|تحت\s+عنوان|با\s+عنوان|بساز|ایجاد|تولید|by|per|$))/i
+  );
+  if (mSrc) sourceMention = mSrc[1].replace(/^[،,.«»"'\s]+|[،,.«»"'\s]+$/g, "");
+
+  let semanticBody = norm;
+  if (mSrc) semanticBody = semanticBody.replace(mSrc[0], " ");
+  if (titlePhrase) semanticBody = semanticBody.replace(titlePhrase, " ");
+  else if (extractedTitle) semanticBody = semanticBody.replace(extractedTitle, " ");
+  if (freeReply) semanticBody = `${semanticBody} ${freeReply}`.trim();
+  const semanticLow = normalizeFaText(semanticBody).toLowerCase();
+
+  let dimMention: string | null = null;
+  const mDim = semanticBody.match(
+    /(?:بر\s+اساس|به\s+تفکیک|بر\s+حسب|برای\s+هر|روی\s+محور|by|per)\s+["«']?(.+?)["»']?(?=\s+(?:بساز|ایجاد|تولید|درست|اضافه|نشان|نمایش|تحت\s+عنوان|با\s+عنوان|به\s+نام|با\s+نام|از\s+روی|از\s+منبع|title|$))/i
+  );
+  if (mDim) dimMention = mDim[1].replace(/^[،,.«»"'\s]+|[،,.«»"'\s]+$/g, "");
+
+  let chosenDs: any = null;
+  const dsOverride = clar.dataset_id || body?.dataset_id;
+  if (dsOverride) chosenDs = datasets.find((d) => d.id === dsOverride) || null;
+
+  let sourceNotFoundName: string | null = null;
+  if (!chosenDs && sourceMention) {
+    const smLow = sourceMention.toLowerCase();
+    let hits = datasets.filter(
+      (d) =>
+        smLow === d.name.toLowerCase() ||
+        smLow.includes(d.name.toLowerCase()) ||
+        d.name.toLowerCase().includes(smLow) ||
+        smLow.includes(d.warehouse_table.toLowerCase())
+    );
+    if (hits.length === 0) {
+      const srcSyn: Record<string, string[]> = {
+        "فروش": ["sales", "revenue"],
+        "هزینه": ["expense", "cost", "budget"],
+        "منابع انسانی": ["hr", "workforce", "employee"],
+        "نیروی انسانی": ["hr", "workforce", "employee"],
+        "کارکنان": ["hr", "workforce", "employee"],
+      };
+      for (const [k, tgs] of Object.entries(srcSyn)) {
+        if (smLow.includes(k)) {
+          hits = datasets.filter((d) =>
+            tgs.some((tg) => d.name.toLowerCase().includes(tg) || d.warehouse_table.toLowerCase().includes(tg))
+          );
+          if (hits.length) break;
+        }
+      }
+    }
+    if (hits.length === 1) chosenDs = hits[0];
+    else if (hits.length === 0) sourceNotFoundName = sourceMention;
+  }
+
+  if (!chosenDs && !sourceNotFoundName) {
+    if (datasets.length === 1) chosenDs = datasets[0];
+    else {
+      const matches = datasets.filter((d) => {
+        const { colsInfo } = getDemoDatasetSchema(d);
+        return dimMention
+          ? !!matchDemoColumn(dimMention, colsInfo, "dim")
+          : !!matchDemoColumn(semanticLow, colsInfo);
+      });
+      if (matches.length === 1) chosenDs = matches[0];
+    }
+  }
+
+  const chartType = clar.chart_type || extractChartTypeFromText(semanticLow);
+  let agg: string | null = clar.aggregation || null;
+  if (!agg) {
+    if (["تعداد", "شمارش", "count", "how many"].some((k) => semanticLow.includes(k))) agg = "COUNT";
+    else if (["میانگین", "متوسط", "avg", "average", "mean"].some((k) => semanticLow.includes(k))) agg = "AVG";
+    else if (["بیشترین", "حداکثر", "ماکزیمم", "max", "highest"].some((k) => semanticLow.includes(k))) agg = "MAX";
+    else if (["کمترین", "حداقل", "مینیمم", "min", "lowest"].some((k) => semanticLow.includes(k))) agg = "MIN";
+    else if (["مجموع", "جمع", "کل", "سرجمع", "sum", "total"].some((k) => semanticLow.includes(k))) agg = "SUM";
+  }
+
+  const questions: any[] = [];
+  if (!chosenDs) {
+    questions.push({
+      key: "dataset_id",
+      question: sourceNotFoundName
+        ? `منبع داده «${sourceNotFoundName}» در سیستم پیدا نشد. لطفاً مشخص کنید از کدام منبع داده استفاده کنم؟`
+        : "چند منبع داده در سیستم وجود دارد؛ کدام منبع داده (دیتاست) را برای ساخت این ویجت انتخاب می‌کنید؟",
+      options: datasets.map((d) => ({ value: d.id, label: d.name, hint: `${d.row_count} ردیف` })),
+    });
+    return {
+      status: "needs_clarification",
+      message_fa: "برای ساخت دقیق ویجت، ابتدا منبع داده را مشخص کنید:",
+      questions,
+      parsed: { title: extractedTitle, chart_type: chartType, source_mention: sourceMention, dim_mention: dimMention, aggregation: agg },
+    };
+  }
+
+  const { colsInfo, numCols, dimCols } = getDemoDatasetSchema(chosenDs);
+
+  if (!chartType) {
+    questions.push({
+      key: "chart_type",
+      question: "نوع ویجت / نمودار مشخص نیست. چه نوع نمایشی بسازم؟",
+      options: [
+        { value: "bar", label: "نمودار میله‌ای (Bar)" },
+        { value: "kpi", label: "کارت شاخص عددی (KPI)" },
+        { value: "line", label: "نمودار خطی (Line)" },
+        { value: "pie", label: "نمودار دایره‌ای (Pie)" },
+        { value: "table", label: "جدول داده (Table)" },
+      ],
+    });
+  }
+
+  let xField: string | null = clar.x_field || null;
+  if (xField === "__none__") xField = null;
+  else if (!xField && chartType !== "kpi" && chartType !== "gauge") {
+    if (dimMention) {
+      xField = matchDemoColumn(dimMention, colsInfo, "dim") || matchDemoColumn(dimMention, colsInfo);
+      if (!xField) {
+        questions.push({
+          key: "x_field",
+          question: `فیلد «${dimMention}» در منبع «${chosenDs.name}» پیدا نشد. کدام ستون را برای دسته‌بندی (محور X) انتخاب می‌کنید؟`,
+          options: colsInfo.filter((c: any) => dimCols.includes(c.name)).slice(0, 10).map((c: any) => ({ value: c.name, label: c.label, hint: c.name })),
+        });
+      }
+    } else {
+      xField = matchDemoColumn(semanticLow, colsInfo, "dim");
+      if (!xField && dimCols.length > 0 && chartType !== "table") {
+        questions.push({
+          key: "x_field",
+          question: `نمودار بر اساس کدام ستون از «${chosenDs.name}» گروه‌بندی شود؟`,
+          options: colsInfo.filter((c: any) => dimCols.includes(c.name)).slice(0, 10).map((c: any) => ({ value: c.name, label: c.label, hint: c.name })),
+        });
+      }
+    }
+  }
+
+  let yField: string | null = clar.y_field || null;
+  if (!yField) {
+    const probe = dimMention ? semanticLow.replace(dimMention.toLowerCase(), " ") : semanticLow;
+    yField = matchDemoColumn(probe, colsInfo, "measure");
+  }
+  if (agg === "COUNT" && !yField) yField = "*";
+  if (!yField) {
+    if (numCols.length === 1 && agg && ["SUM", "AVG", "MAX", "MIN"].includes(agg)) {
+      yField = numCols[0];
+    } else if (numCols.length === 0) {
+      agg = agg || "COUNT";
+      yField = "*";
+    } else {
+      questions.push({
+        key: "y_field",
+        question: `کدام شاخص/ستون عددی از منبع «${chosenDs.name}» محاسبه شود؟`,
+        options: [
+          { value: "__COUNT__", label: "تعداد رکوردها (شمارش / COUNT)", hint: "COUNT(*)" },
+          ...numCols.slice(0, 6).map((nc: string) => {
+            const lbl = colsInfo.find((c: any) => c.name === nc)?.label || nc;
+            return { value: nc, label: `مجموع ${lbl}`, hint: `SUM(${nc})` };
+          }),
+        ],
+      });
+    }
+  }
+
+  if (yField === "__COUNT__") {
+    yField = "*";
+    agg = "COUNT";
+  } else if (yField && !agg) {
+    agg = yField === "*" ? "COUNT" : "SUM";
+  }
+
+  if (questions.length > 0) {
+    return {
+      status: "needs_clarification",
+      message_fa: "برای تکمیل و ساخت دقیق ویجت، لطفاً موارد زیر را مشخص کنید:",
+      questions,
+      parsed: {
+        dataset_id: chosenDs.id,
+        dataset_name: chosenDs.name,
+        title: extractedTitle,
+        chart_type: chartType,
+        x_field: xField,
+        y_field: yField,
+        aggregation: agg,
+      },
+    };
+  }
+
+  const effChart = chartType || "bar";
+  const effAgg = agg || (yField === "*" ? "COUNT" : "SUM");
+  const effY = yField || "*";
+  const finalTitle =
+    extractedTitle ||
+    (xField ? `${effY === "*" ? "تعداد" : effY} بر اساس ${xField}` : `${effAgg} ${effY === "*" ? "تعداد" : effY}`);
+
+  const visualSpec: any = { y_field: effY, aggregation: effAgg, limit: 100 };
+  if (xField && effChart !== "kpi" && effChart !== "gauge") visualSpec.x_field = xField;
+  const isCurr = ["rev", "cost", "profit", "price", "amount", "salary", "budget"].some((k) => effY.toLowerCase().includes(k));
+  const styleCfg = { number_format: isCurr && effAgg !== "COUNT" ? "currency" : "number" };
+  const vizCfg = { show_legend: true, show_tooltip: true, data_labels: false };
+  const previewData = executeVisualSpec(chosenDs.id, visualSpec, username, []);
+
+  let createdWidget: any = null;
+  if (body?.create_widget !== false && body?.dashboard_id) {
+    const det = findDashboard(body.dashboard_id);
+    const targetPageId = body.page_id || det?.pages?.[0]?.id || "page-1";
+    const existing = (det?.widgets || []).filter((w: any) => w.page_id === targetPageId);
+    const nextY = existing.reduce((mx: number, w: any) => Math.max(mx, Number(w.layout?.y || 0) + Number(w.layout?.h || 0)), 0);
+    const wid = `aiw_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    createdWidget = {
+      id: wid,
+      dashboard_id: body.dashboard_id,
+      page_id: targetPageId,
+      title: finalTitle,
+      description: `AI Text-to-Widget (${chosenDs.name})`,
+      chart_type: effChart,
+      dataset_id: chosenDs.id,
+      dataset_freshness: { status: "fresh", last_refreshed_at: new Date().toISOString(), row_count: chosenDs.row_count || 0, data_version: 1 },
+      layout: { x: 0, y: nextY, w: effChart === "kpi" || effChart === "gauge" ? 4 : 6, h: effChart === "kpi" || effChart === "gauge" ? 3 : 7 },
+      config: { style: styleCfg, visualization: vizCfg, interactions: { cross_filter: true }, advanced: { ai_text_prompt: `${rawPrompt} ${freeReply}`.trim() } },
+      query: { query_mode: "visual", sql_text: null, visual_spec: visualSpec, parameters: {} },
+      drill_rule: { hierarchy: [], level_rules: [], drill_through_page_id: null },
+      widget_filters: [],
+      permissions: { view: true, edit: true, delete: true, drill_down: true },
+    };
+    if (det && Array.isArray(det.widgets)) {
+      det.widgets.push(createdWidget);
+    }
+  }
+
+  return {
+    status: createdWidget ? "created" : "ready",
+    message_fa: createdWidget
+      ? `ویجت «${finalTitle}» از منبع «${chosenDs.name}» با موفقیت ساخته شد و به داشبورد اضافه گردید.`
+      : `پیکربندی ویجت «${finalTitle}» از منبع «${chosenDs.name}» آماده شد.`,
+    widget: createdWidget,
+    widget_spec: {
+      title: finalTitle,
+      chart_type: effChart,
+      dataset_id: chosenDs.id,
+      dataset_name: chosenDs.name,
+      visual_spec: visualSpec,
+      style: styleCfg,
+      visualization: vizCfg,
+    },
+    generated_sql: `SELECT ${xField ? `${xField}, ` : ""}${effAgg}(${effY}) AS value FROM ${chosenDs.warehouse_table}${xField ? ` GROUP BY ${xField}` : ""}`,
+    preview_data: previewData,
+  };
+}
+
 export async function handleVercelDemoApi(
   method: string,
   segments: string[],
@@ -786,6 +1208,9 @@ export async function handleVercelDemoApi(
   if (method === "POST" && path === "/ai/generate-dashboard") {
     const first = demoData.dashboards_list?.[0];
     return { status: 200, body: { dashboard_id: first?.id, title: first?.title || "Executive Dashboard" } };
+  }
+  if (method === "POST" && path === "/ai/text-to-widget") {
+    return { status: 200, body: handleTextToWidgetDemo(body, username) };
   }
 
   // Fallback for preview demo mutations (read-only preview note)

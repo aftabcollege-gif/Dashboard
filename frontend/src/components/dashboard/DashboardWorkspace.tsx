@@ -102,6 +102,13 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [newWAgg, setNewWAgg] = useState("SUM");
 
   // AI Drawer State
+  const [aiTab, setAiTab] = useState<"builder" | "nlq">("builder");
+  const [twPrompt, setTwPrompt] = useState("");
+  const [twClarifications, setTwClarifications] = useState<Record<string, any>>({});
+  const [twAnswerDraft, setTwAnswerDraft] = useState("");
+  const [twResponse, setTwResponse] = useState<any>(null);
+  const [twHistory, setTwHistory] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
+  const [twLoading, setTwLoading] = useState(false);
   const [nlqQuestion, setNlqQuestion] = useState("");
   const [nlqResult, setNlqResult] = useState<any>(null);
   const [aiInsights, setAiInsights] = useState<any>(null);
@@ -132,6 +139,22 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             theme_id: overrideTh.id,
             theme: overrideTh,
           };
+        }
+        try {
+          const rawCustom = localStorage.getItem(`bi_demo_custom_widgets_${dashboardId}`);
+          const customWidgets: DashboardWidget[] = rawCustom ? JSON.parse(rawCustom) : [];
+          if (customWidgets.length > 0) {
+            const existingIds = new Set((resolvedDash.widgets || []).map((w) => w.id));
+            resolvedDash = {
+              ...resolvedDash,
+              widgets: [
+                ...(resolvedDash.widgets || []),
+                ...customWidgets.filter((cw) => !existingIds.has(cw.id)),
+              ],
+            };
+          }
+        } catch {
+          // ignore malformed localStorage
         }
       }
       setDash(resolvedDash);
@@ -210,7 +233,42 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             use_cache: useCache,
           }),
         });
-        setWidgetData((prev) => ({ ...prev, ...res.widgets }));
+        const mergedWidgets: Record<string, any> = { ...(res.widgets || {}) };
+        const missingCustom = pageWidgets.filter(
+          (w) => !(w.id in mergedWidgets) && w.dataset_id && w.query?.visual_spec
+        );
+        if (missingCustom.length > 0) {
+          const allFilters = [
+            ...compiledActiveFilters,
+            ...crossFilters.map((cf) => ({
+              field_name: cf.field_name,
+              operator: cf.operator,
+              value: cf.value,
+              is_active: true,
+            })),
+          ];
+          await Promise.all(
+            missingCustom.map(async (cw) => {
+              try {
+                const vr = await apiFetch<any>("/queries/execute-visual", {
+                  method: "POST",
+                  body: JSON.stringify({
+                    dataset_id: cw.dataset_id,
+                    visual_spec: cw.query.visual_spec,
+                    filters: allFilters,
+                  }),
+                });
+                mergedWidgets[cw.id] = {
+                  ...vr,
+                  effective_chart_type: cw.chart_type,
+                };
+              } catch {
+                // ignore
+              }
+            })
+          );
+        }
+        setWidgetData((prev) => ({ ...prev, ...mergedWidgets }));
         setLastBatchMs(res.load_ms);
       } catch (err: any) {
         showToast(err.message);
@@ -499,8 +557,20 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     try {
       await apiFetch(`/dashboards/widgets/${wId}`, { method: "DELETE" });
       if (selectedWidgetId === wId) setSelectedWidgetId(null);
-      showToast("Widget deleted");
-      loadDashboard();
+      if (dash && typeof window !== "undefined" && authStatus?.environment === "vercel-preview-demo") {
+        try {
+          const rawCustom = localStorage.getItem(`bi_demo_custom_widgets_${dash.id}`);
+          const list: DashboardWidget[] = rawCustom ? JSON.parse(rawCustom) : [];
+          const next = list.filter((x) => x.id !== wId);
+          localStorage.setItem(`bi_demo_custom_widgets_${dash.id}`, JSON.stringify(next));
+          setDash((prev) => (prev ? { ...prev, widgets: prev.widgets.filter((x) => x.id !== wId) } : prev));
+        } catch {
+          // ignore
+        }
+      } else {
+        loadDashboard();
+      }
+      showToast(locale === "fa" ? "ویجت حذف شد" : "Widget deleted");
     } catch (err: any) {
       showToast(err.message);
     }
@@ -520,6 +590,96 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     } catch (err: any) {
       showToast(err.message);
     }
+  };
+
+  const submitTextToWidget = async (
+    overridePrompt?: string,
+    overrideClar?: Record<string, any>,
+    userMessageForLog?: string
+  ) => {
+    if (!dash) return;
+    const activePrompt = (overridePrompt !== undefined ? overridePrompt : twPrompt).trim();
+    const activeClar = overrideClar !== undefined ? overrideClar : twClarifications;
+    if (!activePrompt) return;
+
+    if (userMessageForLog || overridePrompt !== undefined) {
+      const msg = userMessageForLog || activePrompt;
+      setTwHistory((prev) => [...prev, { role: "user", text: msg }]);
+    }
+
+    setTwLoading(true);
+    try {
+      const res = await apiFetch<any>("/ai/text-to-widget", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt: activePrompt,
+          dashboard_id: dash.id,
+          page_id: activePageId,
+          clarifications: activeClar,
+          create_widget: Boolean(dash.permissions.add_widget),
+        }),
+      });
+      setTwResponse(res);
+      if (res.parsed) {
+        setTwClarifications((prev) => ({
+          ...prev,
+          ...(res.parsed.dataset_id ? { dataset_id: res.parsed.dataset_id } : {}),
+          ...(res.parsed.chart_type ? { chart_type: res.parsed.chart_type } : {}),
+          ...(res.parsed.x_field ? { x_field: res.parsed.x_field } : {}),
+          ...(res.parsed.y_field ? { y_field: res.parsed.y_field } : {}),
+          ...(res.parsed.aggregation ? { aggregation: res.parsed.aggregation } : {}),
+          ...(res.parsed.title ? { title: res.parsed.title } : {}),
+        }));
+      }
+      if (res.message_fa) {
+        setTwHistory((prev) => [...prev, { role: "assistant", text: res.message_fa }]);
+      }
+
+      if (res.status === "created" || res.status === "ready") {
+        if (res.widget) {
+          if (authStatus?.environment === "vercel-preview-demo") {
+            try {
+              const rawCustom = localStorage.getItem(`bi_demo_custom_widgets_${dash.id}`);
+              const list: DashboardWidget[] = rawCustom ? JSON.parse(rawCustom) : [];
+              localStorage.setItem(`bi_demo_custom_widgets_${dash.id}`, JSON.stringify([...list, res.widget]));
+            } catch {
+              // ignore
+            }
+            setDash((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    widgets: prev.widgets.some((x) => x.id === res.widget.id)
+                      ? prev.widgets
+                      : [...prev.widgets, res.widget],
+                  }
+                : prev
+            );
+            if (res.preview_data) {
+              setWidgetData((prev) => ({
+                ...prev,
+                [res.widget.id]: { ...res.preview_data, effective_chart_type: res.widget.chart_type },
+              }));
+            }
+          } else {
+            await loadDashboard();
+          }
+          showToast(res.message_fa || (locale === "fa" ? "ویجت جدید به داشبورد اضافه شد" : "Widget added to dashboard"));
+        }
+      }
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setTwLoading(false);
+    }
+  };
+
+  const resetTextToWidget = () => {
+    setTwPrompt("");
+    setTwClarifications({});
+    setTwAnswerDraft("");
+    setTwResponse(null);
+    setTwHistory([]);
   };
 
   const handleNlq = async (e: React.FormEvent) => {
@@ -965,13 +1125,24 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           {editMode && (
             <>
               {dash.permissions.add_widget && (
-                <button
-                  onClick={() => setShowAddWidget(true)}
-                  className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1"
-                  style={{ borderColor: "var(--bi-border)" }}
-                >
-                  <Plus className="w-3.5 h-3.5" /> {t("addWidget")}
-                </button>
+                <>
+                  <button
+                    onClick={() => setShowAddWidget(true)}
+                    className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1"
+                    style={{ borderColor: "var(--bi-border)" }}
+                  >
+                    <Plus className="w-3.5 h-3.5" /> {t("addWidget")}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setAiTab("builder");
+                      setShowAiDrawer(true);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1 text-violet-500 border-violet-500/40 hover:bg-violet-500/10"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" /> {locale === "fa" ? "ساخت ویجت با متن" : "Text KPI"}
+                  </button>
+                </>
               )}
               <button onClick={handleUndo} disabled={undoStack.length === 0} className="p-1.5 rounded-lg border disabled:opacity-30" style={{ borderColor: "var(--bi-border)" }} title={t("undo")}>
                 <Undo2 className="w-3.5 h-3.5" />
@@ -1039,8 +1210,15 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           <button onClick={savePersonalState} className="p-1.5 rounded-lg border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }} title={t("saveState")}>
             <BookmarkCheck className="w-3.5 h-3.5" />
           </button>
-          <button onClick={() => setShowAiDrawer((s) => !s)} className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1 text-violet-500" style={{ borderColor: "var(--bi-border)" }}>
-            <Bot className="w-3.5 h-3.5" /> AI
+          <button
+            onClick={() => {
+              setAiTab("builder");
+              setShowAiDrawer((s) => !s);
+            }}
+            className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1 text-violet-500"
+            style={{ borderColor: "var(--bi-border)" }}
+          >
+            <Bot className="w-3.5 h-3.5" /> {locale === "fa" ? "ساخت ویجت با متن / AI" : "AI / Text KPI"}
           </button>
           <button onClick={openVersions} className="p-1.5 rounded-lg border" style={{ borderColor: "var(--bi-border)" }} title={t("versions")}>
             <History className="w-3.5 h-3.5" />
@@ -1230,71 +1408,305 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         {/* AI Assistant Drawer */}
         {showAiDrawer && (
           <div className="fixed inset-0 z-50 bg-black/50 p-3 flex items-end sm:items-center justify-center lg:static lg:inset-auto lg:bg-transparent lg:p-0 lg:block shrink-0">
-            <div className="w-full max-w-md lg:w-96 shrink-0 bi-card p-4 space-y-4 max-h-[88vh] lg:h-[calc(100vh-140px)] overflow-y-auto lg:sticky lg:top-4">
-            <div className="flex items-center justify-between border-b pb-2" style={{ borderColor: "var(--bi-border)" }}>
-              <div className="flex items-center gap-2 font-bold text-sm">
-                <Sparkles className="w-4 h-4 text-violet-500" /> AI Analytics Copilot
-              </div>
-              <button onClick={() => setShowAiDrawer(false)}><X className="w-4 h-4" /></button>
-            </div>
-
-            <form onSubmit={handleNlq} className="space-y-2">
-              <label className="block text-xs font-semibold">Natural Language Query (EN / فارسی)</label>
-              <input
-                value={nlqQuestion}
-                onChange={(e) => setNlqQuestion(e.target.value)}
-                placeholder="e.g., total revenue by region / مجموع فروش بر اساس منطقه"
-                className="w-full px-3 py-2 rounded-lg border text-xs bg-transparent"
-                style={{ borderColor: "var(--bi-border)" }}
-              />
-              <button type="submit" className="w-full py-2 rounded-lg text-xs font-bold text-white bg-violet-600">
-                Ask AI Data Engine
-              </button>
-            </form>
-
-            {nlqResult && (
-              <div className="space-y-2 pt-2 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
-                <div className="font-mono text-[10px] p-2 rounded bg-slate-900/80 text-emerald-400 overflow-x-auto">
-                  {nlqResult.generated_sql}
+            <div className="w-full max-w-md lg:w-96 shrink-0 bi-card p-4 space-y-3 max-h-[88vh] lg:h-[calc(100vh-140px)] overflow-y-auto lg:sticky lg:top-4">
+              <div className="flex items-center justify-between border-b pb-2" style={{ borderColor: "var(--bi-border)" }}>
+                <div className="flex items-center gap-2 font-bold text-sm">
+                  <Sparkles className="w-4 h-4 text-violet-500" />
+                  {locale === "fa" ? "دستیار هوشمند ساخت ویجت و KPI" : "AI KPI & Widget Copilot"}
                 </div>
-                <div className="h-48">
-                  <WidgetRenderer
-                    chartType={nlqResult.recommended_chart_type}
-                    columns={nlqResult.result.columns}
-                    rows={nlqResult.result.rows}
-                  />
-                </div>
+                <button onClick={() => setShowAiDrawer(false)} aria-label="Close AI Copilot">
+                  <X className="w-4 h-4" />
+                </button>
               </div>
-            )}
 
-            <div className="pt-2 border-t space-y-2 text-xs" style={{ borderColor: "var(--bi-border)" }}>
-              <div className="font-semibold">Statistical Anomaly Detection & Forecast</div>
-              <div className="space-y-1">
-                {pageWidgets.filter((w) => w.chart_type !== "kpi").slice(0, 4).map((w) => (
-                  <button
-                    key={w.id}
-                    onClick={() => handleRunAnomalyForecast(w.id)}
-                    className="w-full text-start px-2.5 py-1.5 rounded border hover:bg-violet-500/10 truncate"
-                    style={{ borderColor: "var(--bi-border)" }}
+              {/* Tabs */}
+              <div className="grid grid-cols-2 gap-1 p-1 rounded-lg border text-[11px] font-semibold" style={{ borderColor: "var(--bi-border)" }}>
+                <button
+                  type="button"
+                  onClick={() => setAiTab("builder")}
+                  className="py-1.5 px-2 rounded-md transition"
+                  style={{
+                    background: aiTab === "builder" ? "var(--bi-primary)" : "transparent",
+                    color: aiTab === "builder" ? "#fff" : "var(--bi-muted)",
+                  }}
+                >
+                  {locale === "fa" ? "ساخت ویجت / KPI متنی" : "Text-to-Widget & KPI"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAiTab("nlq")}
+                  className="py-1.5 px-2 rounded-md transition"
+                  style={{
+                    background: aiTab === "nlq" ? "var(--bi-primary)" : "transparent",
+                    color: aiTab === "nlq" ? "#fff" : "var(--bi-muted)",
+                  }}
+                >
+                  {locale === "fa" ? "پرسش تحلیلی و پیش‌بینی" : "NLQ & Insights"}
+                </button>
+              </div>
+
+              {aiTab === "builder" ? (
+                <div className="space-y-3 text-xs">
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      setTwClarifications({});
+                      setTwHistory([]);
+                      setTwResponse(null);
+                      submitTextToWidget(twPrompt, {}, twPrompt);
+                    }}
+                    className="space-y-2"
                   >
-                    Analyze: {w.title}
-                  </button>
-                ))}
-              </div>
-              {aiInsights && (
-                <div className="p-2.5 rounded border space-y-1.5 text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
-                  <div className="font-bold">{aiInsights.widgetTitle}</div>
-                  <div>Trend: <b>{aiInsights.trend_direction}</b> (slope {aiInsights.trend_slope})</div>
-                  <div>Mean: {aiInsights.mean} · StdDev: {aiInsights.std_dev}</div>
-                  <div>Anomalies detected: <b>{aiInsights.anomalies?.length || 0}</b></div>
-                  {aiInsights.forecast?.length > 0 && (
-                    <div>
-                      Forecast: {aiInsights.forecast.map((f: any) => `${f.label}: ${f.value}`).join(" | ")}
+                    <label className="block font-semibold">
+                      {locale === "fa"
+                        ? "ویجت یا KPI مورد نظرتان را به فارسی بنویسید:"
+                        : "Describe the KPI or chart widget to create (FA / EN):"}
+                    </label>
+                    <textarea
+                      dir="auto"
+                      rows={3}
+                      value={twPrompt}
+                      onChange={(e) => setTwPrompt(e.target.value)}
+                      placeholder="مثال: از روی منبع فروش یک ویجت میله‌ای بر اساس منطقه بساز تحت عنوان عملکرد مناطق"
+                      className="w-full px-3 py-2 rounded-lg border text-xs bg-transparent leading-relaxed"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    />
+                    <div className="flex flex-wrap gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setTwPrompt("از روی منبع فروش یک ویجت میله ای از مجموع فروش بر اساس منطقه بساز تحت عنوان عملکرد مناطق")
+                        }
+                        className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        مثال آماده: عملکرد مناطق
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setTwPrompt("از روی منبع تعداد یک ویجت میله ای بر اساس نام پیمانکار بساز تحت عنوان عملکرد پیمانکار")
+                        }
+                        className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        مثال رفع ابهام: پیمانکار
+                      </button>
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        type="submit"
+                        disabled={twLoading || !twPrompt.trim()}
+                        className="flex-1 py-2 rounded-lg text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 disabled:opacity-50"
+                      >
+                        {twLoading
+                          ? locale === "fa"
+                            ? "در حال تحلیل..."
+                            : "Analyzing..."
+                          : locale === "fa"
+                          ? "تولید خودکار ویجت"
+                          : "Build Widget"}
+                      </button>
+                      {(twResponse || twHistory.length > 0) && (
+                        <button
+                          type="button"
+                          onClick={resetTextToWidget}
+                          className="px-2.5 py-2 rounded-lg border text-[11px]"
+                          style={{ borderColor: "var(--bi-border)" }}
+                        >
+                          {locale === "fa" ? "جدید" : "Reset"}
+                        </button>
+                      )}
+                    </div>
+                  </form>
+
+                  {/* Conversational Q&A History */}
+                  {twHistory.length > 0 && (
+                    <div dir="rtl" className="space-y-1.5 max-h-40 overflow-y-auto pt-2 border-t" style={{ borderColor: "var(--bi-border)" }}>
+                      {twHistory.map((item, idx) => (
+                        <div
+                          key={idx}
+                          className={`p-2 rounded-lg text-[11px] leading-relaxed ${
+                            item.role === "user"
+                              ? "bg-blue-500/10 text-blue-600 dark:text-blue-300 ms-4"
+                              : "bg-violet-500/10 me-4"
+                          }`}
+                        >
+                          <span className="font-bold me-1">
+                            {item.role === "user" ? "شما:" : "دستیار:"}
+                          </span>
+                          {item.text}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Ambiguity Resolution Questions in Persian */}
+                  {twResponse?.status === "needs_clarification" && twResponse.questions?.length > 0 && (
+                    <div dir="rtl" className="p-3 rounded-xl border space-y-3 bg-amber-500/5 border-amber-500/30">
+                      <div className="text-[11px] font-bold text-amber-600 dark:text-amber-400">
+                        {twResponse.message_fa}
+                      </div>
+                      {twResponse.questions.map((q: any) => (
+                        <div key={q.key} className="space-y-1.5">
+                          <div className="text-xs font-semibold">{q.question}</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {(q.options || []).map((opt: any) => {
+                              const selected = twClarifications[q.key] === opt.value;
+                              return (
+                                <button
+                                  key={opt.value}
+                                  type="button"
+                                  disabled={twLoading}
+                                  onClick={() => {
+                                    const nextClar = { ...twClarifications, [q.key]: opt.value };
+                                    setTwClarifications(nextClar);
+                                    const allAnswered = twResponse.questions.every((item: any) => nextClar[item.key]);
+                                    if (allAnswered) {
+                                      submitTextToWidget(twPrompt, nextClar, opt.label);
+                                    }
+                                  }}
+                                  className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-medium transition flex items-center gap-1 ${
+                                    selected ? "bg-violet-600 text-white border-violet-600" : "hover:bg-violet-500/10"
+                                  }`}
+                                  style={{ borderColor: selected ? undefined : "var(--bi-border)" }}
+                                >
+                                  <span>{opt.label}</span>
+                                  {opt.hint && (
+                                    <span className="opacity-70 text-[10px]">({opt.hint})</span>
+                                  )}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+
+                      {/* Free-text Persian answer + Continue button */}
+                      <div className="pt-2 border-t space-y-2" style={{ borderColor: "var(--bi-border)" }}>
+                        <input
+                          dir="rtl"
+                          value={twAnswerDraft}
+                          onChange={(e) => setTwAnswerDraft(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !e.shiftKey) {
+                              e.preventDefault();
+                              const draft = twAnswerDraft.trim();
+                              const nextClar = draft
+                                ? { ...twClarifications, free_text: `${twClarifications.free_text || ""} ${draft}`.trim() }
+                                : twClarifications;
+                              setTwClarifications(nextClar);
+                              setTwAnswerDraft("");
+                              submitTextToWidget(twPrompt, nextClar, draft || "ادامه با گزینه‌های انتخاب‌شده");
+                            }
+                          }}
+                          placeholder="یا پاسخ خود را به فارسی تایپ کنید..."
+                          className="w-full px-2.5 py-1.5 rounded-lg border text-xs bg-transparent"
+                          style={{ borderColor: "var(--bi-border)" }}
+                        />
+                        <button
+                          type="button"
+                          disabled={twLoading}
+                          onClick={() => {
+                            const draft = twAnswerDraft.trim();
+                            const nextClar = draft
+                              ? { ...twClarifications, free_text: `${twClarifications.free_text || ""} ${draft}`.trim() }
+                              : twClarifications;
+                            setTwClarifications(nextClar);
+                            setTwAnswerDraft("");
+                            submitTextToWidget(twPrompt, nextClar, draft || "ادامه با گزینه‌های انتخاب‌شده");
+                          }}
+                          className="w-full py-1.5 rounded-lg text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-50"
+                        >
+                          {twLoading ? "در حال بررسی..." : "ارسال پاسخ و ادامه ساخت ویجت"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Success Preview */}
+                  {(twResponse?.status === "created" || twResponse?.status === "ready") && twResponse.preview_data && (
+                    <div dir="rtl" className="space-y-2 p-3 rounded-xl border border-emerald-500/40 bg-emerald-500/5">
+                      <div className="text-xs font-bold text-emerald-600 dark:text-emerald-400">
+                        {twResponse.message_fa}
+                      </div>
+                      <div dir="ltr" className="font-mono text-[10px] p-2 rounded bg-slate-900/80 text-emerald-400 overflow-x-auto">
+                        {twResponse.generated_sql}
+                      </div>
+                      <div className="h-44">
+                        <WidgetRenderer
+                          chartType={twResponse.widget_spec?.chart_type || "bar"}
+                          columns={twResponse.preview_data.columns || []}
+                          rows={twResponse.preview_data.rows || []}
+                          styleConfig={twResponse.widget_spec?.style || {}}
+                          vizConfig={twResponse.widget_spec?.visualization || {}}
+                          visualSpec={twResponse.widget_spec?.visual_spec}
+                        />
+                      </div>
                     </div>
                   )}
                 </div>
+              ) : (
+                <>
+                  <form onSubmit={handleNlq} className="space-y-2">
+                    <label className="block text-xs font-semibold">Natural Language Query (EN / فارسی)</label>
+                    <input
+                      value={nlqQuestion}
+                      onChange={(e) => setNlqQuestion(e.target.value)}
+                      placeholder="e.g., total revenue by region / مجموع فروش بر اساس منطقه"
+                      className="w-full px-3 py-2 rounded-lg border text-xs bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    />
+                    <button type="submit" className="w-full py-2 rounded-lg text-xs font-bold text-white bg-violet-600">
+                      Ask AI Data Engine
+                    </button>
+                  </form>
+
+                  {nlqResult && (
+                    <div className="space-y-2 pt-2 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
+                      <div className="font-mono text-[10px] p-2 rounded bg-slate-900/80 text-emerald-400 overflow-x-auto">
+                        {nlqResult.generated_sql}
+                      </div>
+                      <div className="h-48">
+                        <WidgetRenderer
+                          chartType={nlqResult.recommended_chart_type}
+                          columns={nlqResult.result.columns}
+                          rows={nlqResult.result.rows}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="pt-2 border-t space-y-2 text-xs" style={{ borderColor: "var(--bi-border)" }}>
+                    <div className="font-semibold">Statistical Anomaly Detection & Forecast</div>
+                    <div className="space-y-1">
+                      {pageWidgets.filter((w) => w.chart_type !== "kpi").slice(0, 4).map((w) => (
+                        <button
+                          key={w.id}
+                          onClick={() => handleRunAnomalyForecast(w.id)}
+                          className="w-full text-start px-2.5 py-1.5 rounded border hover:bg-violet-500/10 truncate"
+                          style={{ borderColor: "var(--bi-border)" }}
+                        >
+                          Analyze: {w.title}
+                        </button>
+                      ))}
+                    </div>
+                    {aiInsights && (
+                      <div className="p-2.5 rounded border space-y-1.5 text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
+                        <div className="font-bold">{aiInsights.widgetTitle}</div>
+                        <div>Trend: <b>{aiInsights.trend_direction}</b> (slope {aiInsights.trend_slope})</div>
+                        <div>Mean: {aiInsights.mean} · StdDev: {aiInsights.std_dev}</div>
+                        <div>Anomalies detected: <b>{aiInsights.anomalies?.length || 0}</b></div>
+                        {aiInsights.forecast?.length > 0 && (
+                          <div>
+                            Forecast: {aiInsights.forecast.map((f: any) => `${f.label}: ${f.value}`).join(" | ")}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </>
               )}
-            </div>
             </div>
           </div>
         )}

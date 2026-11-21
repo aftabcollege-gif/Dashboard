@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import sqlite3
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
@@ -39,15 +40,19 @@ def infer_bi_type(dtype_str: str) -> str:
     return "string"
 
 
-def infer_semantic_role(col_name: str, bi_type: str) -> str:
-    low = col_name.lower()
-    if bi_type in ("date", "datetime") or any(k in low for k in ("date", "time", "year", "month", "quarter")):
+def infer_semantic_role(col_name: str, bi_type: str, display_name: str = "") -> str:
+    low = f"{col_name} {display_name}".lower()
+    if bi_type in ("date", "datetime") or any(
+        k in low for k in ("date", "time", "year", "month", "quarter", "تاریخ", "سال", "ماه", "فصل")
+    ):
         return "time"
-    if any(k in low for k in ("country", "province", "state", "city", "region", "lat", "lon", "geo")):
+    if any(
+        k in low for k in ("country", "province", "state", "city", "region", "lat", "lon", "geo", "کشور", "استان", "شهر", "منطقه")
+    ):
         return "geo"
-    if low == "id" or low.endswith("_id"):
+    if col_name.lower() == "id" or col_name.lower().endswith("_id"):
         return "id"
-    if bi_type in ("integer", "float") and not any(k in low for k in ("year", "month", "day", "code", "zip")):
+    if bi_type in ("integer", "float") and not any(k in low for k in ("year", "month", "day", "code", "zip", "کد", "سال")):
         return "measure"
     return "dimension"
 
@@ -143,16 +148,42 @@ def parse_file_to_preview(
     else:
         raise ValueError(f"Unsupported file format: {ext}")
 
-    # Clean column names
-    df.columns = [sanitize_identifier(str(c)) for c in df.columns]
+    # Clean column names while preserving original labels (supports Persian/Unicode headers cleanly)
+    raw_headers = [str(c).strip() or f"col_{idx + 1}" for idx, c in enumerate(df.columns)]
+    safe_cols: list[str] = []
+    display_name_map: dict[str, str] = {}
+    used_cols: set[str] = set()
+    for idx, raw_hdr in enumerate(raw_headers):
+        cand = re.sub(r"_+", "_", sanitize_identifier(raw_hdr)).strip("_")
+        if not cand or not re.search(r"[a-z0-9]", cand):
+            cand = f"col_{idx + 1}"
+        if cand[0].isdigit():
+            cand = f"c_{cand}"
+        base_cand = cand
+        suffix = 2
+        while cand in used_cols:
+            cand = f"{base_cand}_{suffix}"
+            suffix += 1
+        used_cols.add(cand)
+        safe_cols.append(cand)
+        # Preserve original Unicode/Persian label if header had non-ASCII chars, else pretty title
+        has_non_ascii = any(ord(ch) > 127 for ch in raw_hdr)
+        display_name_map[cand] = raw_hdr if has_non_ascii else raw_hdr.replace("_", " ").title()
+
+    df.columns = safe_cols
 
     if column_renames:
-        rename_map = {
-            sanitize_identifier(k): sanitize_identifier(v)
-            for k, v in column_renames.items()
-            if k and v
-        }
-        df = df.rename(columns=rename_map)
+        rename_map = {}
+        for k, v in column_renames.items():
+            if not k or not v:
+                continue
+            sk = re.sub(r"_+", "_", sanitize_identifier(k)).strip("_")
+            sv = re.sub(r"_+", "_", sanitize_identifier(v)).strip("_") or sk
+            if sk in df.columns:
+                rename_map[sk] = sv
+                display_name_map[sv] = v
+        if rename_map:
+            df = df.rename(columns=rename_map)
 
     # Detect duplicate count before dedup
     duplicate_count = int(df.duplicated().sum())
@@ -209,12 +240,13 @@ def parse_file_to_preview(
     columns_meta = []
     for col in df.columns:
         bi_t = infer_bi_type(str(df[col].dtype))
+        disp = display_name_map.get(str(col), str(col).replace("_", " ").title())
         columns_meta.append(
             {
                 "field_name": str(col),
-                "display_name": str(col).replace("_", " ").title(),
+                "display_name": disp,
                 "data_type": bi_t,
-                "semantic_role": infer_semantic_role(str(col), bi_t),
+                "semantic_role": infer_semantic_role(str(col), bi_t, disp),
                 "null_count": null_counts.get(str(col), 0),
             }
         )

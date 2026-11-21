@@ -29,6 +29,15 @@ class AnomalyForecastRequest(BaseModel):
     forecast_periods: int = 3
 
 
+class TextToWidgetRequest(BaseModel):
+    prompt: str
+    dashboard_id: Optional[str] = None
+    page_id: Optional[str] = None
+    dataset_id: Optional[str] = None
+    clarifications: dict = {}
+    create_widget: bool = True
+
+
 @router.get("/recommend/{dataset_id}")
 def recommend_dashboard(dataset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "dataset", dataset_id, "view")
@@ -66,3 +75,23 @@ def natural_language_query(body: NlqRequest, user: User = Depends(get_current_us
 @router.post("/insights")
 def anomalies_and_forecast(body: AnomalyForecastRequest, user: User = Depends(get_current_user)):
     return AiAnalyticsEngine.detect_anomalies_and_forecast(body.values, body.labels, body.forecast_periods)
+
+
+@router.post("/text-to-widget")
+def text_to_widget(
+    body: TextToWidgetRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if body.dataset_id:
+        enforce_permission(db, user, "dataset", body.dataset_id, "view")
+    return AiAnalyticsEngine.plan_or_create_widget_from_text(
+        db=db,
+        user=user,
+        prompt=body.prompt,
+        dashboard_id=body.dashboard_id,
+        page_id=body.page_id,
+        dataset_id=body.dataset_id,
+        clarifications=body.clarifications,
+        create_widget=body.create_widget,
+    )
