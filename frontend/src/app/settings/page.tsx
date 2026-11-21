@@ -7,7 +7,8 @@ import { apiDownload, apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
 export default function SettingsPage() {
-  const { user, themes, activeThemeTokens, applyThemeTokens, refreshThemes, showToast } = useBi();
+  const { user, locale, themes, activeThemeTokens, applyThemeTokens, refreshThemes, showToast } = useBi();
+  const isFa = locale === "fa";
 
   // Custom Theme Builder
   const [tName, setTName] = useState("");
@@ -71,21 +72,28 @@ export default function SettingsPage() {
       <div className="space-y-6">
         <div>
           <h1 className="text-xl font-bold flex items-center gap-2">
-            <Palette className="w-5 h-5" style={{ color: "var(--bi-primary)" }} /> Theme Engine & Security Preferences
+            <Palette className="w-5 h-5" style={{ color: "var(--bi-primary)" }} />{" "}
+            {isFa ? "موتور تم و تنظیمات امنیتی" : "Theme Engine & Security Preferences"}
           </h1>
           <p className="text-xs mt-1" style={{ color: "var(--bi-muted)" }}>
-            Switch across 8 built-in enterprise themes (Minimal, Liquid, Glassmorphism, Dark, Light, Neon, Corporate, Material) or design custom themes.
+            {isFa
+              ? "از بین ۸ تم حرفه‌ای (Minimal، Liquid، Glassmorphism، Dark، Light، Neon، Corporate، Material) انتخاب کنید یا تم اختصاصی بسازید."
+              : "Switch across 8 built-in enterprise themes (Minimal, Liquid, Glassmorphism, Dark, Light, Neon, Corporate, Material) or design custom themes."}
           </p>
         </div>
 
         {/* Built-in + Custom Theme Gallery */}
-        <div className="bi-card p-5 space-y-4">
-          <h2 className="text-sm font-bold">Theme Gallery ({themes.length})</h2>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+        <div className="bi-card p-4 sm:p-5 space-y-4">
+          <h2 className="text-sm font-bold">{isFa ? `گالری تم‌ها (${themes.length})` : `Theme Gallery (${themes.length})`}</h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 text-xs">
             {themes.map((th) => (
               <button
                 key={th.id}
-                onClick={() => { applyThemeTokens(th.tokens, th.mode); showToast(`Previewing ${th.name}`); }}
+                onClick={() => {
+                  applyThemeTokens(th.tokens, th.mode);
+                  if (typeof window !== "undefined") localStorage.setItem("bi_global_theme_id", th.id);
+                  showToast(isFa ? `تم به ${th.name} تغییر یافت` : `Previewing ${th.name}`);
+                }}
                 className="p-3.5 rounded-xl border text-start transition hover:scale-[1.01]"
                 style={{
                   background: th.tokens.card_bg,

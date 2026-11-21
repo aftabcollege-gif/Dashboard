@@ -332,11 +332,17 @@ def get_public_dashboard(embed_token: str, db: Session = Depends(get_db)):
             },
             "data": data,
         })
+    all_themes = db.query(DashboardTheme).all()
     return {
         "id": dash.id,
         "title": dash.title,
         "description": dash.description,
-        "theme": {"name": theme.name, "slug": theme.slug, "mode": theme.mode, "tokens": theme.tokens_json} if theme else None,
+        "theme_id": dash.theme_id,
+        "theme": {"id": theme.id, "name": theme.name, "slug": theme.slug, "mode": theme.mode, "tokens": theme.tokens_json} if theme else None,
+        "themes": [
+            {"id": th.id, "name": th.name, "slug": th.slug, "mode": th.mode, "tokens": th.tokens_json}
+            for th in all_themes
+        ],
         "pages": [{"id": p.id, "title": p.title} for p in pages],
         "widgets": out_widgets,
     }

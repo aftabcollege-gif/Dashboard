@@ -124,7 +124,7 @@ export default function PropertiesPanel({ widget, datasets, pages, onClose, onUp
 
   return (
     <div
-      className="w-80 lg:w-96 shrink-0 bi-card p-4 flex flex-col h-[calc(100vh-140px)] sticky top-4 overflow-hidden"
+      className="w-full lg:w-96 shrink-0 bi-card p-4 flex flex-col max-h-[85vh] lg:h-[calc(100vh-140px)] lg:sticky lg:top-4 overflow-hidden"
     >
       <div className="flex items-center justify-between pb-3 border-b" style={{ borderColor: "var(--bi-border)" }}>
         <div>

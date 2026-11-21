@@ -26,6 +26,7 @@
   --bi-font: Inter, Vazirmatn, sans-serif;
 }
 
+html,
 body {
   font-family: var(--bi-font);
   background: var(--bi-bg);
@@ -33,6 +34,18 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100vh;
+  overflow-x: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html[dir="rtl"] body {
+  font-family: Vazirmatn, Inter, sans-serif;
+}
+
+/* Smooth horizontal touch scrolling for tables/tabs on mobile */
+.overflow-auto,
+.overflow-x-auto {
+  -webkit-overflow-scrolling: touch;
 }
 
 .bi-card {

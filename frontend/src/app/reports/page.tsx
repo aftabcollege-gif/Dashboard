@@ -7,7 +7,8 @@ import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
 export default function ReportsPage() {
-  const { user, showToast } = useBi();
+  const { user, locale, showToast } = useBi();
+  const isFa = locale === "fa";
   const [dashboards, setDashboards] = useState<any[]>([]);
   const [schedules, setSchedules] = useState<any[]>([]);
 
@@ -72,25 +73,37 @@ export default function ReportsPage() {
       <div className="space-y-6">
         <div>
           <h1 className="text-xl font-bold flex items-center gap-2">
-            <FileSpreadsheet className="w-5 h-5" style={{ color: "var(--bi-primary)" }} /> Templates & Scheduled Reports
+            <FileSpreadsheet className="w-5 h-5" style={{ color: "var(--bi-primary)" }} />{" "}
+            {isFa ? "گالری قالب‌ها و گزارش‌های زمان‌بندی‌شده" : "Templates & Scheduled Reports"}
           </h1>
           <p className="text-xs mt-1" style={{ color: "var(--bi-muted)" }}>
-            Clone enterprise dashboard templates in 1 click or configure automated PDF/Excel/CSV report delivery schedules.
+            {isFa
+              ? "قالب‌های داشبورد سازمانی را با یک کلیک کپی کنید یا زمان‌بندی ارسال خودکار گزارش‌های PDF/Excel/CSV را تنظیم نمایید."
+              : "Clone enterprise dashboard templates in 1 click or configure automated PDF/Excel/CSV report delivery schedules."}
           </p>
         </div>
 
         {/* Templates Gallery */}
-        <div className="bi-card p-5 space-y-3">
-          <h2 className="text-sm font-bold flex items-center gap-1.5"><Sparkles className="w-4 h-4 text-violet-500" /> Dashboard Templates Gallery</h2>
+        <div className="bi-card p-4 sm:p-5 space-y-3">
+          <h2 className="text-sm font-bold flex items-center gap-1.5">
+            <Sparkles className="w-4 h-4 text-violet-500" /> {isFa ? "گالری قالب‌های داشبورد" : "Dashboard Templates Gallery"}
+          </h2>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
             {dashboards.map((d) => (
               <div key={d.id} className="p-4 rounded-xl border flex flex-col justify-between gap-3" style={{ borderColor: "var(--bi-border)" }}>
                 <div>
-                  <div className="font-bold text-sm">{d.title}</div>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="font-bold text-sm">{d.title}</div>
+                    {d.is_template && (
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-violet-500/15 text-violet-500 font-semibold shrink-0">
+                        TEMPLATE
+                      </span>
+                    )}
+                  </div>
                   <p className="opacity-75 mt-1">{d.description}</p>
                 </div>
                 <button onClick={() => handleCloneTemplate(d.id)} className="w-full py-2 rounded-lg border font-semibold flex items-center justify-center gap-1.5 hover:bg-blue-500/10" style={{ borderColor: "var(--bi-border)" }}>
-                  <Copy className="w-3.5 h-3.5" /> Clone as New Dashboard
+                  <Copy className="w-3.5 h-3.5" /> {isFa ? "ساخت داشبورد جدید از این قالب" : "Clone as New Dashboard"}
                 </button>
               </div>
             ))}
@@ -99,14 +112,16 @@ export default function ReportsPage() {
 
         {/* Scheduled Reports */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 text-xs">
-          <form onSubmit={handleCreateSchedule} className="bi-card p-5 space-y-3">
-            <h2 className="text-sm font-bold flex items-center gap-1.5"><Plus className="w-4 h-4" /> Schedule Automated Report</h2>
-            <input value={sName} onChange={(e) => setSName(e.target.value)} placeholder="Schedule Name (e.g., Weekly Executive PDF)" className="w-full px-3 py-2 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }} required />
-            <select value={sDashId} onChange={(e) => setSDashId(e.target.value)} className="w-full px-3 py-2 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
+          <form onSubmit={handleCreateSchedule} className="bi-card p-4 sm:p-5 space-y-3">
+            <h2 className="text-sm font-bold flex items-center gap-1.5">
+              <Plus className="w-4 h-4" /> {isFa ? "زمان‌بندی گزارش خودکار" : "Schedule Automated Report"}
+            </h2>
+            <input value={sName} onChange={(e) => setSName(e.target.value)} placeholder={isFa ? "عنوان زمان‌بندی" : "Schedule Name (e.g., Weekly Executive PDF)"} className="w-full px-3 py-2 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }} required />
+            <select value={sDashId} onChange={(e) => setSDashId(e.target.value)} className="w-full px-3 py-2 rounded border" style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}>
               {dashboards.map((d) => <option key={d.id} value={d.id}>{d.title}</option>)}
             </select>
             <div className="grid grid-cols-2 gap-2">
-              <select value={sFmt} onChange={(e) => setSFmt(e.target.value)} className="px-2 py-2 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
+              <select value={sFmt} onChange={(e) => setSFmt(e.target.value)} className="px-2 py-2 rounded border" style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}>
                 <option value="pdf">PDF Document</option>
                 <option value="xlsx">Excel Workbook</option>
                 <option value="csv">CSV Snapshot</option>

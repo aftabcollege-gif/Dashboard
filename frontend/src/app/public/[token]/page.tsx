@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { ArrowUp, Filter, RefreshCw, X } from "lucide-react";
+import { ArrowUp, Filter, Palette, RefreshCw, X } from "lucide-react";
 import WidgetRenderer from "@/components/charts/WidgetRenderer";
 import { apiFetch } from "@/lib/api";
 import { CHART_REGISTRY } from "@/lib/chart-registry";
@@ -19,10 +19,11 @@ interface CrossFilterItem {
 export default function PublicDashboardPage() {
   const params = useParams();
   const token = String(params?.token || "");
-  const { locale, setLocale, applyThemeTokens } = useBi();
+  const { locale, setLocale, applyThemeTokens, showToast } = useBi();
 
   const [data, setData] = useState<any>(null);
   const [err, setErr] = useState("");
+  const [selectedThemeId, setSelectedThemeId] = useState<string>("");
   const [widgetResults, setWidgetResults] = useState<Record<string, any>>({});
   const [crossFilters, setCrossFilters] = useState<CrossFilterItem[]>([]);
   const [drillStates, setDrillStates] = useState<Record<string, { field: string; value: any }[]>>({});
@@ -34,7 +35,15 @@ export default function PublicDashboardPage() {
     apiFetch(`/dashboards/public/${token}`)
       .then((res) => {
         setData(res);
-        if (res.theme?.tokens) {
+        const themesList: any[] = res.themes || [];
+        const savedThemeId =
+          typeof window !== "undefined" ? localStorage.getItem(`bi_public_theme_${token}`) : null;
+        const matchedSaved = savedThemeId ? themesList.find((x: any) => x.id === savedThemeId) : null;
+        if (matchedSaved) {
+          setSelectedThemeId(matchedSaved.id);
+          applyThemeTokens(matchedSaved.tokens, matchedSaved.mode || "light");
+        } else if (res.theme?.tokens) {
+          setSelectedThemeId(res.theme_id || res.theme?.id || "");
           applyThemeTokens(res.theme.tokens, res.theme.mode || "light");
         }
         const initialResults: Record<string, any> = {};
@@ -54,6 +63,18 @@ export default function PublicDashboardPage() {
       })
       .catch((e) => setErr(e.message));
   }, [token]);
+
+  const handlePublicThemeChange = (themeId: string) => {
+    setSelectedThemeId(themeId);
+    const th = (data?.themes || []).find((x: any) => x.id === themeId);
+    if (th?.tokens) {
+      applyThemeTokens(th.tokens, th.mode || "light");
+      if (typeof window !== "undefined") {
+        localStorage.setItem(`bi_public_theme_${token}`, themeId);
+      }
+      showToast(locale === "fa" ? `قالب به ${th.name} تغییر کرد` : `Theme switched to ${th.name}`);
+    }
+  };
 
   const executePublicBatch = useCallback(
     async (nextCross: CrossFilterItem[], nextDrill: Record<string, { field: string; value: any }[]>) => {
@@ -155,61 +176,94 @@ export default function PublicDashboardPage() {
     setCrossFilters([]);
     setDrillStates({});
     setWidgetChartOverrides({});
+    setClickModes({});
     await executePublicBatch([], {});
   };
 
-  if (err) return <div className="p-10 text-center text-red-500 text-sm">{err}</div>;
-  if (!data) return <div className="p-10 text-center text-sm opacity-60">Loading Shared Dashboard...</div>;
+  if (err) return <div className="p-8 text-center text-red-500 text-sm">{err}</div>;
+  if (!data) {
+    return (
+      <div className="p-10 text-center text-sm opacity-60">
+        {locale === "fa" ? "در حال بارگذاری داشبورد..." : "Loading Shared Dashboard..."}
+      </div>
+    );
+  }
 
   const isFa = locale === "fa";
+  const themesList: any[] = data.themes || [];
 
   return (
     <div
       dir={isFa ? "rtl" : "ltr"}
-      className="min-h-screen p-4 md:p-6 space-y-4"
-      style={{ background: "var(--bi-bg)", color: "var(--bi-text)" }}
+      className="min-h-screen p-3 sm:p-4 md:p-6 space-y-3 sm:space-y-4 overflow-x-hidden"
+      style={{
+        background: "var(--bi-bg)",
+        color: "var(--bi-text)",
+        fontFamily: isFa ? "Vazirmatn, Inter, sans-serif" : "var(--bi-font)",
+      }}
     >
       {/* Top Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-xl md:text-2xl font-bold">{data.title}</h1>
-          <p className="text-xs md:text-sm opacity-75">{data.description}</p>
+      <div className="bi-card p-3 sm:p-4 flex flex-col md:flex-row md:items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h1 className="text-base sm:text-xl md:text-2xl font-bold leading-snug">{data.title}</h1>
+            <span className="text-[10px] sm:text-xs px-2.5 py-0.5 rounded-full bg-blue-500/15 text-blue-500 font-semibold shrink-0">
+              {isFa ? "نمای عمومی تعاملی" : "Interactive Public View"}
+            </span>
+          </div>
+          <p className="text-xs sm:text-sm opacity-75 mt-1">{data.description}</p>
         </div>
+
         <div className="flex items-center gap-2 flex-wrap">
           {loadingBatch && (
-            <span className="text-xs px-2.5 py-1 rounded-full bg-blue-500/10 text-blue-500 flex items-center gap-1 font-semibold">
-              <RefreshCw className="w-3 h-3 animate-spin" /> Updating...
+            <span className="text-xs px-2.5 py-1.5 rounded-full bg-blue-500/10 text-blue-500 flex items-center gap-1 font-semibold">
+              <RefreshCw className="w-3 h-3 animate-spin" /> {isFa ? "در حال بروزرسانی..." : "Updating..."}
             </span>
+          )}
+          {themesList.length > 0 && (
+            <label className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-semibold" style={{ background: "var(--bi-surface)", borderColor: "var(--bi-border)" }}>
+              <Palette className="w-3.5 h-3.5 opacity-75 shrink-0" />
+              <select
+                aria-label={isFa ? "انتخاب تم و قالب داشبورد" : "Switch Dashboard Theme / Template"}
+                value={selectedThemeId}
+                onChange={(e) => handlePublicThemeChange(e.target.value)}
+                className="outline-none font-semibold cursor-pointer"
+                style={{ background: "var(--bi-surface)", color: "var(--bi-text)" }}
+              >
+                {themesList.map((th: any) => (
+                  <option key={th.id} value={th.id} style={{ background: "var(--bi-surface)", color: "var(--bi-text)" }}>
+                    {isFa ? `قالب: ${th.name}` : th.name}
+                  </option>
+                ))}
+              </select>
+            </label>
           )}
           <button
             onClick={() => setLocale(isFa ? "en" : "fa")}
             className="text-xs px-3 py-1.5 rounded-lg border font-semibold hover:opacity-80"
-            style={{ background: "var(--bi-card)", borderColor: "var(--bi-border)" }}
+            style={{ background: "var(--bi-surface)", borderColor: "var(--bi-border)", color: "var(--bi-text)" }}
           >
             {isFa ? "English" : "فارسی"}
           </button>
           <Link
             href="/"
-            className="text-xs px-3 py-1.5 rounded-lg font-semibold text-white"
+            className="text-xs px-3 py-1.5 rounded-lg font-semibold text-white text-center"
             style={{ background: "var(--bi-primary)" }}
           >
             {isFa ? "ورود به پنل کامل BI" : "Open Full BI Workspace"}
           </Link>
-          <span className="text-xs px-3 py-1 rounded-full bg-blue-500/15 text-blue-600 font-semibold">
-            {isFa ? "نمای عمومی تعاملی" : "Interactive Public View"}
-          </span>
         </div>
       </div>
 
       {/* Interactive Analytics Guide Strip */}
       <div
-        className="px-3.5 py-2.5 rounded-xl border text-xs flex flex-wrap items-center justify-between gap-2"
+        className="px-3 sm:px-3.5 py-2.5 rounded-xl border text-[11px] sm:text-xs flex flex-wrap items-center justify-between gap-2"
         style={{
           background: "color-mix(in srgb, var(--bi-primary) 7%, var(--bi-card))",
           borderColor: "color-mix(in srgb, var(--bi-primary) 26%, var(--bi-border))",
         }}
       >
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
+        <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-x-5 gap-y-1.5 leading-relaxed">
           {isFa ? (
             <>
               <span>
@@ -245,7 +299,7 @@ export default function PublicDashboardPage() {
           Object.keys(widgetChartOverrides).length > 0) && (
           <button
             onClick={resetAll}
-            className="px-2.5 py-1 rounded-lg bg-red-500/10 text-red-500 font-semibold hover:bg-red-500/20 shrink-0"
+            className="px-2.5 py-1.5 rounded-lg bg-red-500/10 text-red-500 font-semibold hover:bg-red-500/20 shrink-0"
           >
             {isFa ? "بازنشانی همه" : "Reset All"}
           </button>
@@ -254,7 +308,7 @@ export default function PublicDashboardPage() {
 
       {/* Active Cross-Filter Pills */}
       {crossFilters.length > 0 && (
-        <div className="bi-card px-3.5 py-2 flex flex-wrap items-center gap-2 text-xs">
+        <div className="bi-card px-3 sm:px-3.5 py-2 flex flex-wrap items-center gap-2 text-xs">
           <span className="font-semibold opacity-75">
             {isFa ? "فیلتر فعال روی کل داشبورد:" : "Active Dashboard Cross-Filters:"}
           </span>
@@ -279,8 +333,8 @@ export default function PublicDashboardPage() {
         </div>
       )}
 
-      {/* Widget Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-6 lg:grid-cols-12 gap-4">
+      {/* Responsive Widget Grid (2-col mobile KPI + full-width mobile charts, 12-col desktop) */}
+      <div className="grid grid-cols-2 md:grid-cols-6 lg:grid-cols-12 gap-3 sm:gap-4">
         {data.widgets.map((w: any) => {
           const wd = widgetResults[w.id] || w.data || { columns: [], rows: [] };
           const autoType = wd.effective_chart_type || w.chart_type;
@@ -318,28 +372,35 @@ export default function PublicDashboardPage() {
           );
           const lgSpan = Math.min(12, Math.max(3, Number(w.layout?.w || 4)));
           const colClass =
-            lgSpan >= 10
-              ? "md:col-span-6 lg:col-span-12"
+            w.chart_type === "kpi"
+              ? "col-span-1 md:col-span-3 lg:col-span-3"
+              : lgSpan >= 10
+              ? "col-span-2 md:col-span-6 lg:col-span-12"
               : lgSpan >= 7
-              ? "md:col-span-6 lg:col-span-8"
+              ? "col-span-2 md:col-span-6 lg:col-span-8"
               : lgSpan >= 5
-              ? "md:col-span-6 lg:col-span-6"
+              ? "col-span-2 md:col-span-6 lg:col-span-6"
               : lgSpan <= 3
-              ? "md:col-span-3 lg:col-span-3"
-              : "md:col-span-3 lg:col-span-4";
-          const heightClass = w.chart_type === "kpi" ? "h-40" : "h-80";
+              ? "col-span-2 md:col-span-3 lg:col-span-3"
+              : "col-span-2 md:col-span-3 lg:col-span-4";
+          const heightClass =
+            w.chart_type === "kpi"
+              ? "h-36 sm:h-40"
+              : effType === "table" || effType === "pivot_table"
+              ? "h-[340px] sm:h-80"
+              : "h-[300px] sm:h-80";
 
           return (
             <div
               key={w.id}
-              className={`bi-card p-4 flex flex-col ${colClass} ${heightClass} ${
+              className={`bi-card p-3 sm:p-4 flex flex-col overflow-hidden ${colClass} ${heightClass} ${
                 isCrossSource ? "ring-2 ring-emerald-500/70" : ""
               }`}
             >
-              <div className="mb-2 pb-2 border-b flex items-center justify-between gap-2" style={{ borderColor: "var(--bi-border)" }}>
-                <div className="min-w-0">
+              <div className="mb-2 pb-2 border-b flex flex-wrap items-center justify-between gap-1.5 sm:gap-2" style={{ borderColor: "var(--bi-border)" }}>
+                <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5 flex-wrap">
-                    <h3 className="text-xs font-bold truncate">{w.title}</h3>
+                    <h3 className="text-xs font-bold leading-snug line-clamp-1 sm:truncate">{w.title}</h3>
                     {hasDrill && canCrossFilter ? (
                       <button
                         type="button"
@@ -354,12 +415,12 @@ export default function PublicDashboardPage() {
                             ? "bg-emerald-500 text-white"
                             : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/25"
                         }`}
-                        title="Click badge to toggle between Drill-Down and Dashboard Cross-Filter"
+                        title={isFa ? "برای تغییر حالت دریل‌داون / فیلتر کل داشبورد کلیک کنید" : "Click badge to toggle between Drill-Down and Dashboard Cross-Filter"}
                       >
                         {clickMode === "drill"
                           ? "Drill-Down ⇄"
                           : isCrossSource
-                          ? "Filtering Dashboard ⇄"
+                          ? isFa ? "در حال فیلتر ⇄" : "Filtering Dashboard ⇄"
                           : "Cross-Filter ⇄"}
                       </button>
                     ) : hasDrill ? (
@@ -374,7 +435,7 @@ export default function PublicDashboardPage() {
                             : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
                         }`}
                       >
-                        {isCrossSource ? "Filtering Dashboard" : "Cross-Filter"}
+                        {isCrossSource ? (isFa ? "در حال فیلتر" : "Filtering Dashboard") : "Cross-Filter"}
                       </span>
                     ) : null}
                     {isDrilled && (
@@ -400,12 +461,12 @@ export default function PublicDashboardPage() {
                   )}
                 </div>
 
-                <div className="flex items-center gap-1 shrink-0">
+                <div className="flex items-center gap-1 shrink-0 flex-wrap">
                   {isDrilled && (
                     <>
                       <button
                         onClick={() => applyDrillToCrossFilter(w)}
-                        className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold flex items-center gap-1 ${
+                        className={`text-[10px] px-1.5 py-1 sm:py-0.5 rounded border font-semibold flex items-center gap-1 ${
                           isCrossSource
                             ? "bg-emerald-500 text-white border-emerald-500"
                             : "border-emerald-500/40 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10"
@@ -417,8 +478,8 @@ export default function PublicDashboardPage() {
                       </button>
                       <button
                         onClick={() => handleDrillJump(w, (drillStates[w.id] || []).length - 1)}
-                        className="p-1 rounded hover:bg-blue-500/10 text-blue-500"
-                        title="Drill Up"
+                        className="p-1.5 sm:p-1 rounded hover:bg-blue-500/10 text-blue-500"
+                        title={isFa ? "بازگشت به سطح قبل" : "Drill Up"}
                       >
                         <ArrowUp className="w-3.5 h-3.5" />
                       </button>
@@ -429,16 +490,20 @@ export default function PublicDashboardPage() {
                       aria-label={`Convert ${w.title} chart type`}
                       value={effType}
                       onChange={(e) => setWidgetChartOverrides((prev) => ({ ...prev, [w.id]: e.target.value }))}
-                      className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold cursor-pointer ${
+                      className={`text-[10px] px-1.5 py-1 sm:py-0.5 rounded border font-semibold cursor-pointer max-w-[125px] ${
                         isDrilled ? "border-violet-500/60 text-violet-500" : ""
                       }`}
-                      style={{ background: "var(--bi-surface)", borderColor: isDrilled ? undefined : "var(--bi-border)" }}
+                      style={{
+                        background: "var(--bi-surface)",
+                        color: isDrilled ? undefined : "var(--bi-text)",
+                        borderColor: isDrilled ? undefined : "var(--bi-border)",
+                      }}
                       title={isFa ? "تبدیل نوع ویجت" : "Convert widget type (works after drill-down too)"}
                     >
                       {convertOptions.map((ct) => {
                         const meta = CHART_REGISTRY.find((c) => c.id === ct);
                         return (
-                          <option key={ct} value={ct}>
+                          <option key={ct} value={ct} style={{ background: "var(--bi-surface)", color: "var(--bi-text)" }}>
                             {meta ? (isFa ? meta.labelFa : meta.label) : ct}
                           </option>
                         );

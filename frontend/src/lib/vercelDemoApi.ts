@@ -338,7 +338,22 @@ function executeSimpleDemoSql(sqlText: string, username: string | null) {
 }
 
 function findDashboard(id: string) {
-  return demoData.dashboards_detail?.[id] || null;
+  if (demoData.dashboards_detail?.[id]) return demoData.dashboards_detail[id];
+  if (id.startsWith("clone__")) {
+    const parts = id.split("__");
+    const srcId = parts[1];
+    const src = demoData.dashboards_detail?.[srcId];
+    if (src) {
+      return {
+        ...src,
+        id,
+        title: `${src.title} (Template Copy)`,
+        is_template: false,
+        permissions: { ...(src.permissions || {}), view: true, edit: true, add_widget: true, change_theme: true, export: true },
+      };
+    }
+  }
+  return null;
 }
 
 function findWidget(wid: string) {
@@ -430,7 +445,9 @@ export async function handleVercelDemoApi(
           id: detMatch.id,
           title: detMatch.title,
           description: detMatch.description,
+          theme_id: detMatch.theme_id,
           theme: detMatch.theme || pub?.theme || null,
+          themes: demoData.themes || [],
           pages: (detMatch.pages || []).map((p: any) => ({ id: p.id, title: p.title })),
           widgets: (detMatch.widgets || []).map((w: any) => {
             const res = executeWidgetForDemo(w, null, [], [], []);
@@ -449,7 +466,7 @@ export async function handleVercelDemoApi(
         },
       };
     }
-    return { status: 200, body: pub };
+    return { status: 200, body: { ...pub, themes: demoData.themes || [] } };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "public" && segments[2] && segments[3] === "execute-batch") {
     const token = segments[2];
@@ -491,9 +508,41 @@ export async function handleVercelDemoApi(
   if (method === "GET" && path === "/dashboards") {
     return { status: 200, body: demoData.dashboards_list || [] };
   }
+  if (method === "GET" && path === "/dashboards/templates") {
+    const tpls = (demoData.dashboards_list || []).filter((d: any) => d.is_template);
+    return { status: 200, body: tpls };
+  }
+  if (method === "POST" && path === "/dashboards") {
+    const firstId = demoData.dashboards_list?.[0]?.id || "e3026158-f84f-47ca-a775-e5f0ca337d33";
+    const newId = `clone__${firstId}__${Date.now()}`;
+    return { status: 200, body: { id: newId, title: body?.title || "New Dashboard" } };
+  }
   if (method === "GET" && segments[0] === "dashboards" && segments.length === 2) {
     const det = findDashboard(segments[1]);
     return det ? { status: 200, body: det } : { status: 404, body: { detail: "Dashboard not found" } };
+  }
+  if (method === "PUT" && segments[0] === "dashboards" && segments.length === 2) {
+    const det = findDashboard(segments[1]);
+    if (!det) return { status: 404, body: { detail: "Dashboard not found" } };
+    if (body?.theme_id) {
+      const th = (demoData.themes || []).find((x: any) => x.id === body.theme_id);
+      if (th) {
+        det.theme_id = th.id;
+        det.theme = { id: th.id, name: th.name, slug: th.slug, mode: th.mode, tokens: th.tokens };
+        const listEntry = (demoData.dashboards_list || []).find((x: any) => x.id === det.id);
+        if (listEntry) listEntry.theme_id = th.id;
+      }
+    }
+    if (body?.title !== undefined) det.title = body.title;
+    if (body?.description !== undefined) det.description = body.description;
+    if (body?.is_public !== undefined) det.is_public = body.is_public;
+    return { status: 200, body: { status: "updated", theme_id: det.theme_id, theme: det.theme } };
+  }
+  if (method === "POST" && segments[0] === "dashboards" && segments[2] === "clone-template") {
+    const det = findDashboard(segments[1]);
+    if (!det) return { status: 404, body: { detail: "Template not found" } };
+    const srcId = det.id.startsWith("clone__") ? det.id.split("__")[1] : det.id;
+    return { status: 200, body: { id: `clone__${srcId}__${Date.now()}`, title: `${det.title} (Copy)` } };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[2] === "execute-batch") {
     const det = findDashboard(segments[1]);

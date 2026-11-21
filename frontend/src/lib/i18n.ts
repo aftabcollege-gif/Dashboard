@@ -53,6 +53,9 @@ export const TRANSLATIONS: Record<Locale, Record<string, string>> = {
     initialSetupSubtitle: "Create your local Super Administrator account to secure this NexusBI installation.",
     createAdminBtn: "Create Administrator & Launch",
     includeSampleLabel: "Load sample enterprise dashboards & analytical datasets (no demo users or default passwords)",
+    switchTheme: "Theme / Template",
+    switchDashboard: "Switch Dashboard",
+    templatesGallery: "Templates Gallery",
   },
   fa: {
     brand: "نکسوس BI سازمانی",
@@ -106,5 +109,8 @@ export const TRANSLATIONS: Record<Locale, Record<string, string>> = {
     initialSetupSubtitle: "برای ایمن‌سازی نصب نکسوس BI، حساب مدیر ارشد (Super Admin) خود را بسازید.",
     createAdminBtn: "ساخت حساب مدیر و ورود به سامانه",
     includeSampleLabel: "بارگذاری داشبوردها و دیتاست‌های نمونه (بدون ایجاد هیچ کاربر یا رمز پیش‌فرض)",
+    switchTheme: "تم و قالب داشبورد",
+    switchDashboard: "تغییر داشبورد",
+    templatesGallery: "گالری قالب‌ها",
   },
 };

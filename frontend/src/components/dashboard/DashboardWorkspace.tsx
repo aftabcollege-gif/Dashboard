@@ -46,13 +46,24 @@ import {
 const ResponsiveGridLayout = WidthProvider(Responsive);
 
 export default function DashboardWorkspace({ dashboardId }: { dashboardId: string }) {
-  const { locale, t, themes, applyThemeTokens, showToast } = useBi();
+  const { locale, t, authStatus, themes, applyThemeTokens, showToast } = useBi();
 
   const [dash, setDash] = useState<DashboardDetail | null>(null);
+  const [allDashboards, setAllDashboards] = useState<{ id: string; title: string; is_template?: boolean }[]>([]);
   const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
   const [activePageId, setActivePageId] = useState<string>("");
   const [editMode, setEditMode] = useState(false);
   const [selectedWidgetId, setSelectedWidgetId] = useState<string | null>(null);
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(max-width: 767px)");
+    const sync = () => setIsMobile(mq.matches);
+    sync();
+    mq.addEventListener("change", sync);
+    return () => mq.removeEventListener("change", sync);
+  }, []);
 
   // Widget Data Results (Progressive map)
   const [widgetData, setWidgetData] = useState<Record<string, WidgetDataResult>>({});
@@ -104,15 +115,29 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
 
   const loadDashboard = useCallback(async () => {
     try {
-      const [d, dsList, savedState] = await Promise.all([
+      const [d, dsList, savedState, dashList] = await Promise.all([
         apiFetch<DashboardDetail>(`/dashboards/${dashboardId}`),
         apiFetch<DatasetInfo[]>("/datasets").catch(() => []),
         apiFetch<any>(`/dashboards/${dashboardId}/state`).catch(() => null),
+        apiFetch<any[]>("/dashboards").catch(() => []),
       ]);
-      setDash(d);
+      setAllDashboards(dashList || []);
+      let resolvedDash = d;
+      if (typeof window !== "undefined" && authStatus?.environment === "vercel-preview-demo") {
+        const storedThemeId = localStorage.getItem(`bi_demo_theme_${dashboardId}`);
+        const overrideTh = storedThemeId ? themes.find((x) => x.id === storedThemeId) : null;
+        if (overrideTh) {
+          resolvedDash = {
+            ...d,
+            theme_id: overrideTh.id,
+            theme: overrideTh,
+          };
+        }
+      }
+      setDash(resolvedDash);
       setDatasets(dsList);
-      if (d.theme) {
-        applyThemeTokens(d.theme.tokens, d.theme.mode);
+      if (resolvedDash.theme) {
+        applyThemeTokens(resolvedDash.theme.tokens, resolvedDash.theme.mode);
       }
       if (savedState?.active_page_id && d.pages.some((p) => p.id === savedState.active_page_id)) {
         setActivePageId(savedState.active_page_id);
@@ -137,6 +162,17 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   useEffect(() => {
     loadDashboard();
   }, [loadDashboard]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || authStatus?.environment !== "vercel-preview-demo" || !dash || themes.length === 0) return;
+    const storedThemeId = localStorage.getItem(`bi_demo_theme_${dash.id}`);
+    if (!storedThemeId || storedThemeId === dash.theme_id) return;
+    const overrideTh = themes.find((x) => x.id === storedThemeId);
+    if (overrideTh) {
+      applyThemeTokens(overrideTh.tokens, overrideTh.mode);
+      setDash((prev) => (prev ? { ...prev, theme_id: overrideTh.id, theme: overrideTh } : prev));
+    }
+  }, [authStatus?.environment, dash?.id, themes]);
 
   // Build compiled active_filters array for API
   const compiledActiveFilters = useMemo(() => {
@@ -389,14 +425,30 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const handleThemeChange = async (themeId: string) => {
     if (!dash) return;
     const th = themes.find((x) => x.id === themeId);
-    if (th) applyThemeTokens(th.tokens, th.mode);
+    if (th) {
+      applyThemeTokens(th.tokens, th.mode);
+      setDash((prev) =>
+        prev
+          ? {
+              ...prev,
+              theme_id: th.id,
+              theme: th,
+            }
+          : prev
+      );
+    }
+    if (typeof window !== "undefined") {
+      localStorage.setItem(`bi_demo_theme_${dash.id}`, themeId);
+    }
     try {
       await apiFetch(`/dashboards/${dash.id}`, {
         method: "PUT",
         body: JSON.stringify({ theme_id: themeId }),
       });
-      showToast(`Theme switched to ${th?.name || "custom"}`);
-      loadDashboard();
+      showToast(locale === "fa" ? `قالب به ${th?.name || "سفارشی"} تغییر کرد` : `Theme switched to ${th?.name || "custom"}`);
+      if (authStatus?.environment !== "vercel-preview-demo") {
+        loadDashboard();
+      }
     } catch (err: any) {
       showToast(err.message);
     }
@@ -561,39 +613,349 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   };
 
   if (!dash) {
-    return <div className="p-8 text-sm opacity-70">Loading Dashboard Workspace...</div>;
+    return <div className="p-8 text-sm opacity-70">{locale === "fa" ? "در حال بارگذاری داشبورد..." : "Loading Dashboard Workspace..."}</div>;
   }
 
   const selectedWidget = dash.widgets.find((w) => w.id === selectedWidgetId) || null;
   const addDs = datasets.find((d) => d.id === newWDs) || datasets[0];
 
+  const sortedMobileWidgets = [...pageWidgets].sort(
+    (a, b) => (a.layout.y - b.layout.y) || (a.layout.x - b.layout.x)
+  );
+
+  const renderWidgetCard = (w: DashboardWidget, mobileStack = false) => {
+    const wd = widgetData[w.id];
+    const isSelected = selectedWidgetId === w.id;
+    const autoType = wd?.effective_chart_type || w.chart_type;
+    const effType = widgetChartOverrides[w.id] || autoType;
+    const drillCrumbs = wd?.drill?.breadcrumbs || [];
+    const hasDrill = (w.drill_rule?.hierarchy?.length || 0) > 0;
+    const isDrilled = drillCrumbs.length > 1;
+    const clickMode = getWidgetClickMode(w);
+    const isCrossSource = crossFilters.some((cf) => cf.source_widget_id === w.id);
+    const canCrossFilter =
+      w.config.interactions?.cross_filter !== false &&
+      w.chart_type !== "kpi" &&
+      w.chart_type !== "gauge" &&
+      w.chart_type !== "table";
+    const canConvertChart = w.chart_type !== "kpi" && w.chart_type !== "gauge";
+    const convertOptions = Array.from(
+      new Set([
+        effType,
+        autoType,
+        w.chart_type,
+        "bar",
+        "horizontal_bar",
+        "line",
+        "area",
+        "pie",
+        "donut",
+        "stacked_bar",
+        "combo",
+        "waterfall",
+        "funnel",
+        "treemap",
+        "radar",
+        "table",
+      ])
+    );
+    const customStyle = w.config.style || {};
+    const mobileCardClass = mobileStack
+      ? w.chart_type === "kpi"
+        ? "col-span-1 h-36"
+        : effType === "table" || effType === "pivot_table"
+        ? "col-span-2 h-[350px]"
+        : "col-span-2 h-[310px]"
+      : "";
+
+    return (
+      <div
+        key={w.id}
+        onClick={() => editMode && setSelectedWidgetId(w.id)}
+        className={`bi-card flex flex-col overflow-hidden transition-shadow ${mobileCardClass} ${
+          isSelected ? "ring-2 ring-blue-500" : isCrossSource ? "ring-2 ring-emerald-500/70" : ""
+        }`}
+        style={{
+          background: customStyle.background_color || "var(--bi-card)",
+          color: customStyle.text_color || "var(--bi-text)",
+          borderRadius: customStyle.border_radius ? `${customStyle.border_radius}px` : "var(--bi-radius)",
+        }}
+      >
+        {/* Widget Header */}
+        <div
+          className={`px-3 sm:px-3.5 py-2 border-b flex flex-wrap items-center justify-between gap-1.5 sm:gap-2 ${
+            editMode && !mobileStack ? "widget-drag-handle cursor-move" : ""
+          }`}
+          style={{ borderColor: "var(--bi-border)" }}
+        >
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-xs font-bold leading-snug line-clamp-1 sm:truncate">{w.title}</span>
+              {hasDrill && canCrossFilter ? (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const nextMode = clickMode === "drill" ? "cross_filter" : "drill";
+                    setClickModes((prev) => ({ ...prev, [w.id]: nextMode }));
+                    showToast(
+                      nextMode === "drill"
+                        ? `${w.title}: ${locale === "fa" ? "کلیک برای دریل‌داون" : "Click points to Drill-Down"}`
+                        : `${w.title}: ${locale === "fa" ? "کلیک برای فیلتر کل داشبورد" : "Click points to Cross-Filter whole dashboard"}`
+                    );
+                  }}
+                  className={`text-[9px] px-1.5 py-0.5 rounded font-semibold shrink-0 transition ${
+                    clickMode === "drill"
+                      ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25"
+                      : isCrossSource
+                      ? "bg-emerald-500 text-white"
+                      : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/25"
+                  }`}
+                  title={locale === "fa" ? "برای تغییر حالت دریل‌داون / فیلتر کل داشبورد کلیک کنید" : "Click badge to toggle between Drill-Down and Dashboard Cross-Filter"}
+                >
+                  {clickMode === "drill"
+                    ? "Drill-Down ⇄"
+                    : isCrossSource
+                    ? locale === "fa" ? "در حال فیلتر ⇄" : "Filtering Dashboard ⇄"
+                    : "Cross-Filter ⇄"}
+                </button>
+              ) : hasDrill ? (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-semibold shrink-0">
+                  Drill-Down
+                </span>
+              ) : canCrossFilter ? (
+                <span
+                  className={`text-[9px] px-1.5 py-0.5 rounded font-semibold shrink-0 ${
+                    isCrossSource
+                      ? "bg-emerald-500 text-white"
+                      : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                  }`}
+                >
+                  {isCrossSource ? (locale === "fa" ? "در حال فیلتر" : "Filtering Dashboard") : "Cross-Filter"}
+                </span>
+              ) : null}
+              {isDrilled && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-500 font-semibold shrink-0">
+                  {w.chart_type} → {effType}
+                </span>
+              )}
+            </div>
+            {isDrilled && (
+              <div className="flex items-center gap-1 text-[10px] mt-0.5 flex-wrap">
+                {drillCrumbs.map((bc, idx) => (
+                  <React.Fragment key={bc.level}>
+                    {idx > 0 && <span>/</span>}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const nextStack = (drillStates[w.id] || []).slice(0, bc.level);
+                        executeSingleWidget(w, nextStack);
+                      }}
+                      className="hover:underline text-blue-500 font-semibold"
+                    >
+                      {bc.label}
+                    </button>
+                  </React.Fragment>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1 shrink-0 flex-wrap">
+            {wd?.cache_hit && (
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-500 font-semibold">
+                CACHE
+              </span>
+            )}
+            {isDrilled && (
+              <>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    applyDrillToDashboardCrossFilter(w);
+                  }}
+                  className={`text-[10px] px-1.5 py-1 sm:py-0.5 rounded border font-semibold flex items-center gap-1 transition ${
+                    isCrossSource
+                      ? "bg-emerald-500 text-white border-emerald-500"
+                      : "border-emerald-500/40 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10"
+                  }`}
+                  title={locale === "fa" ? "اعمال این دریل‌داون روی کل داشبورد" : "Filter entire dashboard by this drill level"}
+                >
+                  <Filter className="w-2.5 h-2.5" />
+                  <span>{locale === "fa" ? "فیلتر داشبورد" : "Filter All"}</span>
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const nextStack = (drillStates[w.id] || []).slice(0, -1);
+                    executeSingleWidget(w, nextStack);
+                  }}
+                  className="p-1.5 sm:p-1 rounded hover:bg-blue-500/10 text-blue-500"
+                  title={t("drillUp")}
+                >
+                  <ArrowUp className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+            {canConvertChart && (
+              <select
+                aria-label={`Convert ${w.title} chart type`}
+                value={effType}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => {
+                  e.stopPropagation();
+                  const nextChart = e.target.value;
+                  setWidgetChartOverrides((prev) => ({ ...prev, [w.id]: nextChart }));
+                  if (dash.permissions.edit) {
+                    apiFetch(`/dashboards/widgets/${w.id}/switch-chart`, {
+                      method: "POST",
+                      body: JSON.stringify({ target_chart_type: nextChart }),
+                    }).catch(() => {});
+                  }
+                  showToast(locale === "fa" ? `ویجت به ${nextChart} تبدیل شد` : `Widget converted to ${nextChart}`);
+                }}
+                className={`text-[10px] px-1.5 py-1 sm:py-0.5 rounded border font-semibold cursor-pointer max-w-[125px] ${
+                  isDrilled ? "border-violet-500/60 text-violet-500" : ""
+                }`}
+                style={{
+                  background: "var(--bi-surface)",
+                  color: isDrilled ? undefined : "var(--bi-text)",
+                  borderColor: isDrilled ? undefined : "var(--bi-border)",
+                }}
+                title={locale === "fa" ? "تبدیل نوع ویجت (قبل یا بعد از دریل‌داون)" : "Convert widget type (works after drill-down too)"}
+              >
+                {convertOptions.map((ct) => {
+                  const meta = CHART_REGISTRY.find((c) => c.id === ct);
+                  return (
+                    <option key={ct} value={ct} style={{ background: "var(--bi-surface)", color: "var(--bi-text)" }}>
+                      {meta ? (locale === "fa" ? meta.labelFa : meta.label) : ct}
+                    </option>
+                  );
+                })}
+              </select>
+            )}
+            {w.drill_rule?.drill_through_page_id && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setActivePageId(w.drill_rule.drill_through_page_id!);
+                }}
+                className="text-[10px] px-1.5 py-1 sm:py-0.5 rounded border hover:bg-blue-500/10"
+                style={{ borderColor: "var(--bi-border)" }}
+              >
+                {locale === "fa" ? "جزئیات" : "Details →"}
+              </button>
+            )}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                executeSingleWidget(w, drillStates[w.id] || [], false);
+              }}
+              className="p-1.5 sm:p-1 rounded hover:opacity-70"
+              title="Refresh widget"
+            >
+              <RefreshCw className={`w-3 h-3 ${loadingWidgets[w.id] ? "animate-spin" : ""}`} />
+            </button>
+
+            {editMode && (
+              <>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setSelectedWidgetId(w.id); }}
+                  className="p-1.5 sm:p-1 rounded hover:opacity-70"
+                  title="Properties"
+                >
+                  <Settings2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setCopiedWidget(w); showToast("Widget copied"); }}
+                  className="p-1.5 sm:p-1 rounded hover:opacity-70"
+                  title={t("copy")}
+                >
+                  <Copy className="w-3 h-3" />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleDeleteWidget(w.id); }}
+                  className="p-1.5 sm:p-1 rounded text-red-500 hover:bg-red-500/10"
+                  title="Delete"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Widget Body */}
+        <div className="flex-1 p-2.5 sm:p-3 min-h-0">
+          {wd?.error ? (
+            <div className="h-full flex items-center justify-center text-xs text-red-500 text-center p-2">
+              {wd.error}
+            </div>
+          ) : (
+            <WidgetRenderer
+              chartType={effType}
+              columns={wd?.columns || []}
+              rows={wd?.rows || []}
+              styleConfig={customStyle}
+              vizConfig={w.config.visualization}
+              visualSpec={w.query.visual_spec}
+              onPointClick={(field, val) => handleWidgetPointClick(w, field, val)}
+            />
+          )}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div ref={workspaceDomRef} className="space-y-4">
       {/* Top Toolbar */}
-      <div className="bi-card p-3 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <Link href="/dashboards" className="p-1.5 rounded-lg border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
-            <ArrowLeft className="w-4 h-4" />
+      <div className="bi-card p-2.5 sm:p-3 flex flex-col lg:flex-row lg:items-center justify-between gap-2.5 sm:gap-3">
+        <div className="flex items-start sm:items-center gap-2.5 sm:gap-3 min-w-0">
+          <Link href="/dashboards" className="p-2 sm:p-1.5 rounded-lg border hover:opacity-80 shrink-0" style={{ borderColor: "var(--bi-border)" }}>
+            <ArrowLeft className={`w-4 h-4 ${locale === "fa" ? "rotate-180" : ""}`} />
           </Link>
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-base font-bold">{dash.title}</h1>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h1 className="text-sm sm:text-base font-bold truncate">{dash.title}</h1>
               {lastBatchMs !== null && (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-500 font-semibold">
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-500 font-semibold shrink-0">
                   {lastBatchMs} ms
                 </span>
               )}
             </div>
-            <p className="text-xs truncate max-w-md" style={{ color: "var(--bi-muted)" }}>{dash.description}</p>
+            <p className="text-[11px] sm:text-xs line-clamp-1 sm:truncate max-w-md" style={{ color: "var(--bi-muted)" }}>{dash.description}</p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
+          {/* Quick Switch Between Dashboards / Templates */}
+          {allDashboards.length > 1 && (
+            <select
+              aria-label={locale === "fa" ? "انتخاب داشبورد" : "Switch Dashboard"}
+              value={dash.id}
+              onChange={(e) => {
+                if (e.target.value && e.target.value !== dash.id) {
+                  window.location.href = `/dashboards/${e.target.value}`;
+                }
+              }}
+              className="px-2 py-1.5 rounded-lg border text-xs font-medium max-w-[165px] sm:max-w-[200px]"
+              style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+              title={locale === "fa" ? "تغییر داشبورد / نمونه" : "Switch Dashboard / Template"}
+            >
+              {allDashboards.map((dItem) => (
+                <option key={dItem.id} value={dItem.id} style={{ background: "var(--bi-surface)", color: "var(--bi-text)" }}>
+                  {dItem.title}
+                </option>
+              ))}
+            </select>
+          )}
+
           {/* Edit / View Mode Toggle */}
           {dash.permissions.edit && (
             <button
               onClick={() => { setEditMode((m) => !m); if (editMode) setSelectedWidgetId(null); }}
-              className="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition text-white"
+              className="px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition text-white"
               style={{ background: editMode ? "#10b981" : "var(--bi-primary)" }}
             >
               {editMode ? <><Eye className="w-3.5 h-3.5" /> {t("viewMode")}</> : <><Edit3 className="w-3.5 h-3.5" /> {t("editMode")}</>}
@@ -642,8 +1004,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                       : prev
                   );
                 }}
-                className="px-2 py-1.5 rounded-lg border text-xs bg-transparent"
-                style={{ borderColor: "var(--bi-border)" }}
+                className="px-2 py-1.5 rounded-lg border text-xs"
+                style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
                 title="Grid Columns"
               >
                 <option value={12}>12 Cols</option>
@@ -653,17 +1015,20 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             </>
           )}
 
-          {/* Theme Selector */}
-          {dash.permissions.change_theme && (
+          {/* Theme / Visual Template Selector */}
+          {(dash.permissions.change_theme || themes.length > 0) && (
             <select
+              aria-label={locale === "fa" ? "انتخاب تم و قالب ظاهری" : "Dashboard Theme / Template"}
               value={dash.theme_id || ""}
               onChange={(e) => handleThemeChange(e.target.value)}
-              className="px-2.5 py-1.5 rounded-lg border text-xs bg-transparent font-medium"
-              style={{ borderColor: "var(--bi-border)" }}
-              title="Dashboard Theme"
+              className="px-2.5 py-1.5 rounded-lg border text-xs font-medium"
+              style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+              title={locale === "fa" ? "تغییر تم / قالب داشبورد" : "Dashboard Theme / Template"}
             >
               {themes.map((th) => (
-                <option key={th.id} value={th.id}>{th.name}</option>
+                <option key={th.id} value={th.id} style={{ background: "var(--bi-surface)", color: "var(--bi-text)" }}>
+                  {locale === "fa" ? `قالب: ${th.name}` : th.name}
+                </option>
               ))}
             </select>
           )}
@@ -814,314 +1179,58 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       />
 
       {/* Main Split: Grid Canvas + Right Properties Panel */}
-      <div className="flex gap-4 items-start">
-        <div className="flex-1 min-w-0">
-          <ResponsiveGridLayout
-            className="layout"
-            layouts={gridLayouts}
-            breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480 }}
-            cols={{
-              lg: currentPage?.layout_settings?.columns_count || 12,
-              md: currentPage?.layout_settings?.columns_count || 12,
-              sm: 6,
-              xs: 4,
-            }}
-            rowHeight={currentPage?.layout_settings?.row_height || 42}
-            margin={[currentPage?.layout_settings?.gap_px || 16, currentPage?.layout_settings?.gap_px || 16]}
-            isDraggable={editMode}
-            isResizable={editMode}
-            draggableHandle=".widget-drag-handle"
-            onLayoutChange={(layout) => handleLayoutChange(layout)}
-          >
-            {pageWidgets.map((w) => {
-              const wd = widgetData[w.id];
-              const isSelected = selectedWidgetId === w.id;
-              const autoType = wd?.effective_chart_type || w.chart_type;
-              const effType = widgetChartOverrides[w.id] || autoType;
-              const drillCrumbs = wd?.drill?.breadcrumbs || [];
-              const hasDrill = (w.drill_rule?.hierarchy?.length || 0) > 0;
-              const isDrilled = drillCrumbs.length > 1;
-              const clickMode = getWidgetClickMode(w);
-              const isCrossSource = crossFilters.some((cf) => cf.source_widget_id === w.id);
-              const canCrossFilter = w.config.interactions?.cross_filter !== false && w.chart_type !== "kpi" && w.chart_type !== "gauge" && w.chart_type !== "table";
-              const canConvertChart = w.chart_type !== "kpi" && w.chart_type !== "gauge";
-              const convertOptions = Array.from(
-                new Set([
-                  effType,
-                  autoType,
-                  w.chart_type,
-                  "bar",
-                  "horizontal_bar",
-                  "line",
-                  "area",
-                  "pie",
-                  "donut",
-                  "stacked_bar",
-                  "combo",
-                  "waterfall",
-                  "funnel",
-                  "treemap",
-                  "radar",
-                  "table",
-                ])
-              );
-              const customStyle = w.config.style || {};
-
-              return (
-                <div
-                  key={w.id}
-                  onClick={() => editMode && setSelectedWidgetId(w.id)}
-                  className={`bi-card flex flex-col overflow-hidden transition-shadow ${
-                    isSelected ? "ring-2 ring-blue-500" : isCrossSource ? "ring-2 ring-emerald-500/70" : ""
-                  }`}
-                  style={{
-                    background: customStyle.background_color || "var(--bi-card)",
-                    color: customStyle.text_color || "var(--bi-text)",
-                    borderRadius: customStyle.border_radius ? `${customStyle.border_radius}px` : "var(--bi-radius)",
-                  }}
-                >
-                  {/* Widget Header */}
-                  <div
-                    className={`px-3.5 py-2 border-b flex items-center justify-between gap-2 ${
-                      editMode ? "widget-drag-handle cursor-move" : ""
-                    }`}
-                    style={{ borderColor: "var(--bi-border)" }}
-                  >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="text-xs font-bold truncate">{w.title}</span>
-                        {hasDrill && canCrossFilter ? (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const nextMode = clickMode === "drill" ? "cross_filter" : "drill";
-                              setClickModes((prev) => ({ ...prev, [w.id]: nextMode }));
-                              showToast(
-                                nextMode === "drill"
-                                  ? `${w.title}: Click points to Drill-Down`
-                                  : `${w.title}: Click points to Cross-Filter whole dashboard`
-                              );
-                            }}
-                            className={`text-[9px] px-1.5 py-0.5 rounded font-semibold shrink-0 transition ${
-                              clickMode === "drill"
-                                ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25"
-                                : isCrossSource
-                                ? "bg-emerald-500 text-white"
-                                : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/25"
-                            }`}
-                            title="Click badge to toggle between Drill-Down and Dashboard Cross-Filter"
-                          >
-                            {clickMode === "drill"
-                              ? "Drill-Down ⇄"
-                              : isCrossSource
-                              ? "Filtering Dashboard ⇄"
-                              : "Cross-Filter ⇄"}
-                          </button>
-                        ) : hasDrill ? (
-                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 font-semibold shrink-0">
-                            Drill-Down
-                          </span>
-                        ) : canCrossFilter ? (
-                          <span
-                            className={`text-[9px] px-1.5 py-0.5 rounded font-semibold shrink-0 ${
-                              isCrossSource
-                                ? "bg-emerald-500 text-white"
-                                : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
-                            }`}
-                          >
-                            {isCrossSource ? "Filtering Dashboard" : "Cross-Filter"}
-                          </span>
-                        ) : null}
-                        {isDrilled && (
-                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-500 font-semibold shrink-0">
-                            {w.chart_type} → {effType}
-                          </span>
-                        )}
-                      </div>
-                      {isDrilled && (
-                        <div className="flex items-center gap-1 text-[10px] mt-0.5 flex-wrap">
-                          {drillCrumbs.map((bc, idx) => (
-                            <React.Fragment key={bc.level}>
-                              {idx > 0 && <span>/</span>}
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const nextStack = (drillStates[w.id] || []).slice(0, bc.level);
-                                  executeSingleWidget(w, nextStack);
-                                }}
-                                className="hover:underline text-blue-500 font-semibold"
-                              >
-                                {bc.label}
-                              </button>
-                            </React.Fragment>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="flex items-center gap-1 shrink-0">
-                      {wd?.cache_hit && (
-                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-500 font-semibold">
-                          CACHE
-                        </span>
-                      )}
-                      {isDrilled && (
-                        <>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              applyDrillToDashboardCrossFilter(w);
-                            }}
-                            className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold flex items-center gap-1 transition ${
-                              isCrossSource
-                                ? "bg-emerald-500 text-white border-emerald-500"
-                                : "border-emerald-500/40 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10"
-                            }`}
-                            title={locale === "fa" ? "اعمال این دریل‌داون روی کل داشبورد" : "Filter entire dashboard by this drill level"}
-                          >
-                            <Filter className="w-2.5 h-2.5" />
-                            <span>{locale === "fa" ? "فیلتر داشبورد" : "Filter All"}</span>
-                          </button>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const nextStack = (drillStates[w.id] || []).slice(0, -1);
-                              executeSingleWidget(w, nextStack);
-                            }}
-                            className="p-1 rounded hover:bg-blue-500/10 text-blue-500"
-                            title={t("drillUp")}
-                          >
-                            <ArrowUp className="w-3.5 h-3.5" />
-                          </button>
-                        </>
-                      )}
-                      {canConvertChart && (
-                        <select
-                          aria-label={`Convert ${w.title} chart type`}
-                          value={effType}
-                          onClick={(e) => e.stopPropagation()}
-                          onChange={(e) => {
-                            e.stopPropagation();
-                            const nextChart = e.target.value;
-                            setWidgetChartOverrides((prev) => ({ ...prev, [w.id]: nextChart }));
-                            if (dash.permissions.edit) {
-                              apiFetch(`/dashboards/widgets/${w.id}/switch-chart`, {
-                                method: "POST",
-                                body: JSON.stringify({ target_chart_type: nextChart }),
-                              }).catch(() => {});
-                            }
-                            showToast(`Widget converted to ${nextChart}`);
-                          }}
-                          className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold cursor-pointer ${
-                            isDrilled ? "border-violet-500/60 text-violet-500" : ""
-                          }`}
-                          style={{ background: "var(--bi-surface)", borderColor: isDrilled ? undefined : "var(--bi-border)" }}
-                          title={locale === "fa" ? "تبدیل نوع ویجت (قبل یا بعد از دریل‌داون)" : "Convert widget type (works after drill-down too)"}
-                        >
-                          {convertOptions.map((ct) => {
-                            const meta = CHART_REGISTRY.find((c) => c.id === ct);
-                            return (
-                              <option key={ct} value={ct}>
-                                {meta ? (locale === "fa" ? meta.labelFa : meta.label) : ct}
-                              </option>
-                            );
-                          })}
-                        </select>
-                      )}
-                      {w.drill_rule?.drill_through_page_id && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setActivePageId(w.drill_rule.drill_through_page_id!);
-                          }}
-                          className="text-[10px] px-1.5 py-0.5 rounded border hover:bg-blue-500/10"
-                          style={{ borderColor: "var(--bi-border)" }}
-                        >
-                          Details →
-                        </button>
-                      )}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          executeSingleWidget(w, drillStates[w.id] || [], false);
-                        }}
-                        className="p-1 rounded hover:opacity-70"
-                        title="Refresh widget"
-                      >
-                        <RefreshCw className={`w-3 h-3 ${loadingWidgets[w.id] ? "animate-spin" : ""}`} />
-                      </button>
-
-                      {editMode && (
-                        <>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setSelectedWidgetId(w.id); }}
-                            className="p-1 rounded hover:opacity-70"
-                            title="Properties"
-                          >
-                            <Settings2 className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setCopiedWidget(w); showToast("Widget copied"); }}
-                            className="p-1 rounded hover:opacity-70"
-                            title={t("copy")}
-                          >
-                            <Copy className="w-3 h-3" />
-                          </button>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); handleDeleteWidget(w.id); }}
-                            className="p-1 rounded text-red-500 hover:bg-red-500/10"
-                            title="Delete"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Widget Body */}
-                  <div className="flex-1 p-3 min-h-0">
-                    {wd?.error ? (
-                      <div className="h-full flex items-center justify-center text-xs text-red-500 text-center p-2">
-                        {wd.error}
-                      </div>
-                    ) : (
-                      <WidgetRenderer
-                        chartType={effType}
-                        columns={wd?.columns || []}
-                        rows={wd?.rows || []}
-                        styleConfig={customStyle}
-                        vizConfig={w.config.visualization}
-                        visualSpec={w.query.visual_spec}
-                        onPointClick={(field, val) => handleWidgetPointClick(w, field, val)}
-                      />
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </ResponsiveGridLayout>
+      <div className="flex flex-col lg:flex-row gap-4 items-start">
+        <div className="flex-1 min-w-0 w-full">
+          {isMobile ? (
+            <div className="grid grid-cols-2 gap-3">
+              {sortedMobileWidgets.map((w) => renderWidgetCard(w, true))}
+            </div>
+          ) : (
+            <ResponsiveGridLayout
+              className="layout"
+              layouts={gridLayouts}
+              breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480 }}
+              cols={{
+                lg: currentPage?.layout_settings?.columns_count || 12,
+                md: currentPage?.layout_settings?.columns_count || 12,
+                sm: 6,
+                xs: 4,
+              }}
+              rowHeight={currentPage?.layout_settings?.row_height || 42}
+              margin={[currentPage?.layout_settings?.gap_px || 16, currentPage?.layout_settings?.gap_px || 16]}
+              isDraggable={editMode}
+              isResizable={editMode}
+              draggableHandle=".widget-drag-handle"
+              onLayoutChange={(layout) => handleLayoutChange(layout)}
+            >
+              {pageWidgets.map((w) => renderWidgetCard(w, false))}
+            </ResponsiveGridLayout>
+          )}
         </div>
 
         {/* Right Properties Panel (Edit Mode + Selected Widget) */}
         {editMode && selectedWidget && (
-          <PropertiesPanel
-            key={selectedWidget.id}
-            widget={selectedWidget}
-            datasets={datasets}
-            pages={dash.pages}
-            onClose={() => setSelectedWidgetId(null)}
-            onUpdated={loadDashboard}
-            onChartSwitched={(wid, chartType) =>
-              setWidgetChartOverrides((prev) => ({ ...prev, [wid]: chartType }))
-            }
-          />
+          <div className="fixed inset-0 z-50 bg-black/50 p-3 flex items-end sm:items-center justify-center lg:static lg:inset-auto lg:bg-transparent lg:p-0 lg:block shrink-0">
+            <div className="w-full max-w-md max-h-[88vh] overflow-y-auto lg:max-h-none lg:w-auto">
+              <PropertiesPanel
+                key={selectedWidget.id}
+                widget={selectedWidget}
+                datasets={datasets}
+                pages={dash.pages}
+                onClose={() => setSelectedWidgetId(null)}
+                onUpdated={loadDashboard}
+                onChartSwitched={(wid, chartType) =>
+                  setWidgetChartOverrides((prev) => ({ ...prev, [wid]: chartType }))
+                }
+              />
+            </div>
+          </div>
         )}
 
         {/* AI Assistant Drawer */}
         {showAiDrawer && (
-          <div className="w-80 lg:w-96 shrink-0 bi-card p-4 space-y-4 h-[calc(100vh-140px)] overflow-y-auto sticky top-4">
+          <div className="fixed inset-0 z-50 bg-black/50 p-3 flex items-end sm:items-center justify-center lg:static lg:inset-auto lg:bg-transparent lg:p-0 lg:block shrink-0">
+            <div className="w-full max-w-md lg:w-96 shrink-0 bi-card p-4 space-y-4 max-h-[88vh] lg:h-[calc(100vh-140px)] overflow-y-auto lg:sticky lg:top-4">
             <div className="flex items-center justify-between border-b pb-2" style={{ borderColor: "var(--bi-border)" }}>
               <div className="flex items-center gap-2 font-bold text-sm">
                 <Sparkles className="w-4 h-4 text-violet-500" /> AI Analytics Copilot
@@ -1185,6 +1294,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                   )}
                 </div>
               )}
+            </div>
             </div>
           </div>
         )}

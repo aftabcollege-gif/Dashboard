@@ -33,7 +33,7 @@ export default function GlobalFilterBar({
   editMode,
   onFilterAdded,
 }: Props) {
-  const { t, showToast } = useBi();
+  const { locale, t, showToast } = useBi();
   const [optionsMap, setOptionsMap] = useState<Record<string, any[]>>({});
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState("");
@@ -131,8 +131,8 @@ export default function GlobalFilterBar({
   const selectedDataset = datasets.find((d) => d.id === (newDatasetId || datasets[0]?.id));
 
   return (
-    <div className="bi-card p-3 space-y-2">
-      <div className="flex flex-wrap items-center gap-2.5">
+    <div className="bi-card p-2.5 sm:p-3 space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
         <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider opacity-75">
           <Filter className="w-3.5 h-3.5" />
           <span>{t("globalFilters")}</span>
@@ -145,23 +145,24 @@ export default function GlobalFilterBar({
           return (
             <div
               key={f.id}
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs"
-              style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}
+              className="flex items-center justify-between sm:justify-start gap-1.5 px-2.5 py-1.5 sm:py-1 rounded-lg border text-xs flex-1 sm:flex-initial min-w-[140px]"
+              style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)", color: "var(--bi-text)" }}
             >
-              <span className="font-semibold opacity-80">
+              <span className="font-semibold opacity-80 shrink-0">
                 {f.name}
-                {f.scope === "dashboard" ? " (Page)" : ""}:
+                {f.scope === "dashboard" ? (locale === "fa" ? " (صفحه)" : " (Page)") : ""}:
               </span>
-              {f.is_locked && <Lock className="w-3 h-3 text-amber-500" />}
+              {f.is_locked && <Lock className="w-3 h-3 text-amber-500 shrink-0" />}
 
               {f.filter_type === "relative_date" ? (
                 <select
                   disabled={f.is_locked}
                   value={val || ""}
                   onChange={(e) => onChangeValue(f.id, e.target.value)}
-                  className="bg-transparent outline-none font-medium"
+                  style={{ background: "var(--bi-surface)", color: "var(--bi-text)" }}
+                  className="outline-none font-medium min-w-0 flex-1 sm:flex-initial"
                 >
-                  <option value="">All Time</option>
+                  <option value="">{locale === "fa" ? "همه زمان‌ها" : "All Time"}</option>
                   <option value="last_7_days">Last 7 Days</option>
                   <option value="last_30_days">Last 30 Days</option>
                   <option value="last_90_days">Last 90 Days</option>
@@ -212,7 +213,7 @@ export default function GlobalFilterBar({
                   disabled={f.is_locked}
                   value={val || ""}
                   onChange={(e) => onChangeValue(f.id, e.target.value)}
-                  placeholder="Search..."
+                  placeholder={locale === "fa" ? "جستجو..." : "Search..."}
                   className="bg-transparent outline-none w-24"
                 />
               ) : f.filter_type === "top_n" ? (
@@ -240,9 +241,10 @@ export default function GlobalFilterBar({
                       onChangeValue(f.id, f.operator === "in" || f.operator === "not_in" ? [typed] : typed);
                     }
                   }}
-                  className="bg-transparent outline-none font-medium max-w-[140px]"
+                  style={{ background: "var(--bi-surface)", color: "var(--bi-text)" }}
+                  className="outline-none font-medium min-w-0 max-w-[140px]"
                 >
-                  <option value="">All</option>
+                  <option value="">{locale === "fa" ? "همه" : "All"}</option>
                   {opts.map((o) => (
                     <option key={String(o)} value={String(o)}>
                       {String(o)}
@@ -287,7 +289,7 @@ export default function GlobalFilterBar({
       {crossFilters.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 pt-1 border-t" style={{ borderColor: "var(--bi-border)" }}>
           <span className="text-[11px] font-semibold flex items-center gap-1 text-sky-500">
-            <Sparkles className="w-3 h-3" /> Cross-Filtering Active:
+            <Sparkles className="w-3 h-3" /> {locale === "fa" ? "فیلتر متقاطع فعال روی داشبورد:" : "Cross-Filtering Active:"}
           </span>
           {crossFilters.map((cf, i) => (
             <span
@@ -299,7 +301,7 @@ export default function GlobalFilterBar({
             </span>
           ))}
           <button onClick={() => onClearCrossFilter()} className="text-[11px] underline opacity-75">
-            Clear all
+            {locale === "fa" ? "پاک کردن همه" : "Clear all"}
           </button>
         </div>
       )}

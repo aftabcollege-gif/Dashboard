@@ -45,10 +45,20 @@ export default function WidgetRenderer({
   onPointClick,
   chartInstanceRef,
 }: Props) {
-  const { activeThemeTokens, activeThemeMode } = useBi();
+  const { locale, activeThemeTokens, activeThemeMode } = useBi();
   const [tableSearch, setTableSearch] = useState("");
   const [sortCol, setSortCol] = useState<string | null>(null);
   const [sortAsc, setSortAsc] = useState(true);
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(max-width: 639px)");
+    const update = () => setIsMobile(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
 
   const numFmt = styleConfig.number_format || "number";
   const decimals = Number(styleConfig.decimals ?? 0);
@@ -113,13 +123,13 @@ export default function WidgetRenderer({
     const poly = sparkPts.map((p) => `${p.x},${p.y}`).join(" ");
 
     return (
-      <div className="h-full flex flex-col justify-between p-1">
+      <div className="h-full flex flex-col justify-between p-0.5 sm:p-1">
         <div className="flex items-start justify-between gap-2">
-          <div className="text-2xl lg:text-3xl font-bold tracking-tight" style={{ color: textColor }}>
+          <div className="text-lg sm:text-2xl lg:text-3xl font-bold tracking-tight truncate" style={{ color: textColor }}>
             {formatBIValue(numericVal, numFmt, decimals, unit, abbreviate)}
           </div>
           {styleConfig.show_sparkline !== false && (
-            <svg width="120" height="32" className="shrink-0 opacity-90">
+            <svg viewBox="0 0 120 32" className="w-12 sm:w-24 h-6 sm:h-8 shrink-0 opacity-90">
               <polyline
                 fill="none"
                 stroke={statusColor}
@@ -131,22 +141,22 @@ export default function WidgetRenderer({
             </svg>
           )}
         </div>
-        <div className="flex items-center justify-between gap-2 text-xs">
+        <div className="flex flex-wrap items-center justify-between gap-1.5 text-[11px] sm:text-xs">
           {pctChange !== null ? (
             <span
-              className={`inline-flex items-center gap-0.5 font-semibold px-2 py-0.5 rounded-full ${
+              className={`inline-flex items-center gap-0.5 font-semibold px-1.5 sm:px-2 py-0.5 rounded-full ${
                 pctChange >= 0 ? "bg-emerald-500/15 text-emerald-500" : "bg-red-500/15 text-red-500"
               }`}
             >
-              {pctChange >= 0 ? <ArrowUpRight className="w-3.5 h-3.5" /> : <ArrowDownRight className="w-3.5 h-3.5" />}
-              {Math.abs(pctChange).toFixed(1)}% vs prev
+              {pctChange >= 0 ? <ArrowUpRight className="w-3 h-3 sm:w-3.5 sm:h-3.5" /> : <ArrowDownRight className="w-3 h-3 sm:w-3.5 sm:h-3.5" />}
+              {Math.abs(pctChange).toFixed(1)}% {locale === "fa" ? "نسبت به قبل" : "vs prev"}
             </span>
           ) : (
-            <span style={{ color: mutedColor }}>Live KPI</span>
+            <span style={{ color: mutedColor }}>{locale === "fa" ? "شاخص زنده" : "Live KPI"}</span>
           )}
           {targetPct !== null && (
-            <div className="flex items-center gap-2 flex-1 max-w-[160px]">
-              <div className="flex-1 h-2 rounded-full overflow-hidden bg-slate-500/20">
+            <div className="flex items-center gap-1.5 flex-1 min-w-[70px] max-w-[160px]">
+              <div className="flex-1 h-1.5 sm:h-2 rounded-full overflow-hidden bg-slate-500/20">
                 <div className="h-full rounded-full transition-all" style={{ width: `${targetPct}%`, background: statusColor }} />
               </div>
               <span className="font-semibold" style={{ color: statusColor }}>{targetPct}%</span>
@@ -203,18 +213,20 @@ export default function WidgetRenderer({
 
     return (
       <div className="h-full flex flex-col gap-2">
-        <div className="flex items-center gap-2 px-2 py-1 rounded-lg border text-xs" style={{ borderColor: activeThemeTokens.border }}>
-          <Search className="w-3.5 h-3.5 opacity-60" />
+        <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-xs" style={{ borderColor: activeThemeTokens.border }}>
+          <Search className="w-3.5 h-3.5 opacity-60 shrink-0" />
           <input
             value={tableSearch}
             onChange={(e) => setTableSearch(e.target.value)}
-            placeholder="Filter rows..."
-            className="bg-transparent outline-none flex-1 text-xs"
+            placeholder={locale === "fa" ? "جستجو در ردیف‌ها..." : "Filter rows..."}
+            className="bg-transparent outline-none flex-1 min-w-0 text-xs"
           />
-          <span className="text-[11px] opacity-60">{sorted.length} rows</span>
+          <span className="text-[11px] opacity-60 shrink-0">
+            {sorted.length} {locale === "fa" ? "ردیف" : "rows"}
+          </span>
         </div>
         <div className="flex-1 overflow-auto rounded-lg border" style={{ borderColor: activeThemeTokens.border }}>
-          <table className="w-full text-xs text-start border-collapse">
+          <table className="w-full min-w-[460px] text-[11px] sm:text-xs text-start border-collapse">
             <thead className="sticky top-0" style={{ background: activeThemeTokens.surface }}>
               <tr>
                 {columns.map((c) => (
@@ -270,7 +282,7 @@ export default function WidgetRenderer({
 
     return (
       <div className="h-full overflow-auto rounded-lg border" style={{ borderColor: activeThemeTokens.border }}>
-        <table className="w-full text-xs border-collapse">
+        <table className="w-full min-w-[420px] text-[11px] sm:text-xs border-collapse">
           <thead className="sticky top-0" style={{ background: activeThemeTokens.surface }}>
             <tr>
               <th className="px-2.5 py-2 border-b text-start font-bold" style={{ borderColor: activeThemeTokens.border }}>
@@ -281,7 +293,9 @@ export default function WidgetRenderer({
                   {cv}
                 </th>
               ))}
-              <th className="px-2.5 py-2 border-b text-end font-bold" style={{ borderColor: activeThemeTokens.border }}>Total</th>
+              <th className="px-2.5 py-2 border-b text-end font-bold" style={{ borderColor: activeThemeTokens.border }}>
+                {locale === "fa" ? "مجموع" : "Total"}
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -323,8 +337,10 @@ export default function WidgetRenderer({
   // ---------------- 5. ECHARTS VISUALIZATION ENGINE ----------------
   if (!rows || rows.length === 0) {
     return (
-      <div className="h-full flex items-center justify-center text-xs opacity-60">
-        No matching records for current filter / RLS context.
+      <div className="h-full flex items-center justify-center text-xs opacity-60 text-center px-3">
+        {locale === "fa"
+          ? "رکوردی مطابق با فیلتر یا سطح دسترسی فعلی یافت نشد."
+          : "No matching records for current filter / RLS context."}
       </div>
     );
   }
@@ -346,6 +362,8 @@ export default function WidgetRenderer({
       showTooltip={showTooltip}
       dataLabels={dataLabels}
       isDark={activeThemeMode === "dark"}
+      isMobile={isMobile}
+      locale={locale}
       styleConfig={styleConfig}
       numFmt={numFmt}
       decimals={decimals}
@@ -373,6 +391,8 @@ function EChartsCanvas(props: {
   showTooltip: boolean;
   dataLabels: boolean;
   isDark: boolean;
+  isMobile: boolean;
+  locale: string;
   styleConfig: Record<string, any>;
   numFmt: string;
   decimals: number;
@@ -422,8 +442,9 @@ function EChartsCanvas(props: {
     };
   }, [
     props.chartType, props.rows, props.columns, props.xField, props.seriesField,
-    props.yField, props.secField, props.palette, props.textColor, props.lineWidth,
-    props.showLegend, props.showTooltip, props.dataLabels, props.isDark,
+    props.yField, props.secField, props.palette, props.textColor, props.mutedColor,
+    props.lineWidth, props.showLegend, props.showTooltip, props.dataLabels,
+    props.isDark, props.isMobile, props.locale, props.styleConfig,
   ]);
 
   useEffect(() => {
@@ -454,6 +475,8 @@ function buildEChartsOption(ctx: {
   showTooltip: boolean;
   dataLabels: boolean;
   isDark: boolean;
+  isMobile: boolean;
+  locale: string;
   styleConfig: Record<string, any>;
   numFmt: string;
   decimals: number;
@@ -463,24 +486,47 @@ function buildEChartsOption(ctx: {
   const {
     chartType, rows, xField, seriesField, yField, secField, palette,
     textColor, mutedColor, lineWidth, showLegend, showTooltip, dataLabels,
-    styleConfig, numFmt, decimals, unit, abbreviate,
+    isMobile, locale, styleConfig, numFmt, decimals, unit, abbreviate,
   } = ctx;
 
+  const fontFamily = locale === "fa" ? "Vazirmatn, Inter, sans-serif" : "Inter, Vazirmatn, sans-serif";
   const baseTooltip: any = showTooltip
     ? {
         trigger: ["pie", "donut", "funnel", "gauge", "treemap", "sunburst", "sankey", "scatter", "bubble"].includes(chartType)
           ? "item"
           : "axis",
         confine: true,
+        textStyle: { fontFamily, fontSize: isMobile ? 11 : 12 },
       }
     : { show: false };
 
-  const legendOpt: any = showLegend ? { top: 0, textStyle: { color: textColor, fontSize: 11 } } : { show: false };
-  const axisLabel = { color: mutedColor, fontSize: Number(styleConfig.font_size || 11) };
+  const legendOpt: any = showLegend
+    ? { type: "scroll", top: 0, textStyle: { color: textColor, fontSize: isMobile ? 10 : 11, fontFamily } }
+    : { show: false };
+  const cats = Array.from(new Set(rows.map((r) => String(r[xField] ?? ""))));
+  const axisLabel = {
+    color: mutedColor,
+    fontSize: isMobile ? 10 : Number(styleConfig.font_size || 11),
+    fontFamily,
+  };
+  const xAxisLabel = {
+    ...axisLabel,
+    rotate: isMobile && cats.length > 4 ? 26 : 0,
+    hideOverlap: true,
+  };
+  const yAxisLabel = {
+    ...axisLabel,
+    formatter: (v: number) => formatBIValue(v, "number", 0, "", true),
+  };
+  const compactGrid = {
+    left: isMobile ? 6 : 12,
+    right: isMobile ? 8 : 14,
+    top: showLegend ? (isMobile ? 28 : 34) : 14,
+    bottom: isMobile ? 8 : 14,
+    containLabel: true,
+  };
   const splitLine = { lineStyle: { color: "rgba(148, 163, 184, 0.16)" } };
   const labelOpt: any = dataLabels ? { show: true, position: "top", color: textColor, fontSize: 10 } : { show: false };
-
-  const cats = Array.from(new Set(rows.map((r) => String(r[xField] ?? ""))));
 
   // Multi-series helper
   const buildSeriesMap = () => {
@@ -497,16 +543,17 @@ function buildEChartsOption(ctx: {
 
   if (chartType === "bar" || chartType === "histogram") {
     return {
+      textStyle: { fontFamily },
       color: palette,
       tooltip: baseTooltip,
       legend: legendOpt,
-      grid: { left: 48, right: 16, top: showLegend ? 32 : 16, bottom: 32, containLabel: true },
-      xAxis: { type: "category", data: cats, axisLabel },
-      yAxis: { type: "value", axisLabel, splitLine },
+      grid: compactGrid,
+      xAxis: { type: "category", data: cats, axisLabel: xAxisLabel },
+      yAxis: { type: "value", axisLabel: yAxisLabel, splitLine },
       series: [{
         name: yField,
         type: "bar",
-        barMaxWidth: 42,
+        barMaxWidth: isMobile ? 28 : 42,
         itemStyle: { borderRadius: [4, 4, 0, 0] },
         label: labelOpt,
         data: cats.map((c) => rows.filter((r) => String(r[xField]) === c).reduce((a, b) => a + Number(b[yField] ?? 0), 0)),
@@ -516,11 +563,12 @@ function buildEChartsOption(ctx: {
 
   if (chartType === "horizontal_bar") {
     return {
+      textStyle: { fontFamily },
       color: palette,
       tooltip: baseTooltip,
       legend: legendOpt,
-      grid: { left: 20, right: 24, top: 16, bottom: 24, containLabel: true },
-      xAxis: { type: "value", axisLabel, splitLine },
+      grid: compactGrid,
+      xAxis: { type: "value", axisLabel: yAxisLabel, splitLine },
       yAxis: { type: "category", data: cats, axisLabel },
       series: [{
         name: yField,
@@ -540,15 +588,16 @@ function buildEChartsOption(ctx: {
       }
     }
     return {
+      textStyle: { fontFamily },
       color: palette,
       tooltip: baseTooltip,
       legend: legendOpt,
-      grid: { left: 48, right: 16, top: 36, bottom: 28, containLabel: true },
-      xAxis: { type: "category", data: cats, axisLabel },
+      grid: compactGrid,
+      xAxis: { type: "category", data: cats, axisLabel: xAxisLabel },
       yAxis: {
         type: "value",
         max: chartType === "stacked_bar_100" ? 100 : undefined,
-        axisLabel: chartType === "stacked_bar_100" ? { ...axisLabel, formatter: "{value}%" } : axisLabel,
+        axisLabel: chartType === "stacked_bar_100" ? { ...axisLabel, formatter: "{value}%" } : yAxisLabel,
         splitLine,
       },
       series: sNames.map((s) => ({
@@ -568,12 +617,13 @@ function buildEChartsOption(ctx: {
     if (seriesField && chartType === "stacked_area") {
       const { sNames, lookup } = buildSeriesMap();
       return {
+        textStyle: { fontFamily },
         color: palette,
         tooltip: baseTooltip,
         legend: legendOpt,
-        grid: { left: 48, right: 16, top: 36, bottom: 28, containLabel: true },
-        xAxis: { type: "category", data: cats, axisLabel, boundaryGap: false },
-        yAxis: { type: "value", axisLabel, splitLine },
+        grid: compactGrid,
+        xAxis: { type: "category", data: cats, axisLabel: xAxisLabel, boundaryGap: false },
+        yAxis: { type: "value", axisLabel: yAxisLabel, splitLine },
         series: sNames.map((s) => ({
           name: s, type: "line", stack: "total", smooth: true,
           lineStyle: { width: lineWidth }, areaStyle: { opacity: 0.35 },
@@ -582,12 +632,13 @@ function buildEChartsOption(ctx: {
       };
     }
     return {
+      textStyle: { fontFamily },
       color: palette,
       tooltip: baseTooltip,
       legend: legendOpt,
-      grid: { left: 48, right: 16, top: 32, bottom: 28, containLabel: true },
-      xAxis: { type: "category", data: cats, axisLabel, boundaryGap: !isArea },
-      yAxis: { type: "value", axisLabel, splitLine },
+      grid: compactGrid,
+      xAxis: { type: "category", data: cats, axisLabel: xAxisLabel, boundaryGap: !isArea },
+      yAxis: { type: "value", axisLabel: yAxisLabel, splitLine },
       series: [{
         name: yField,
         type: "line",
@@ -602,14 +653,15 @@ function buildEChartsOption(ctx: {
 
   if (chartType === "combo") {
     return {
+      textStyle: { fontFamily },
       color: palette,
       tooltip: baseTooltip,
       legend: legendOpt,
-      grid: { left: 48, right: 48, top: 36, bottom: 28, containLabel: true },
-      xAxis: { type: "category", data: cats, axisLabel },
-      yAxis: [{ type: "value", axisLabel, splitLine }, { type: "value", axisLabel, splitLine: { show: false } }],
+      grid: compactGrid,
+      xAxis: { type: "category", data: cats, axisLabel: xAxisLabel },
+      yAxis: [{ type: "value", axisLabel: yAxisLabel, splitLine }, { type: "value", axisLabel: yAxisLabel, splitLine: { show: false } }],
       series: [
-        { name: yField, type: "bar", barMaxWidth: 32, data: rows.map((r) => Number(r[yField] ?? 0)) },
+        { name: yField, type: "bar", barMaxWidth: isMobile ? 24 : 32, data: rows.map((r) => Number(r[yField] ?? 0)) },
         {
           name: secField || "Trend",
           type: "line",
@@ -624,15 +676,16 @@ function buildEChartsOption(ctx: {
 
   if (chartType === "pie" || chartType === "donut") {
     return {
+      textStyle: { fontFamily },
       color: palette,
       tooltip: baseTooltip,
-      legend: showLegend ? { bottom: 0, textStyle: { color: textColor, fontSize: 11 } } : { show: false },
+      legend: showLegend ? { type: "scroll", bottom: 0, textStyle: { color: textColor, fontSize: isMobile ? 10 : 11, fontFamily } } : { show: false },
       series: [{
         name: yField,
         type: "pie",
-        radius: chartType === "donut" ? ["44%", "72%"] : "70%",
-        center: ["50%", "46%"],
-        label: { show: true, color: textColor, fontSize: 11 },
+        radius: isMobile ? (chartType === "donut" ? ["36%", "60%"] : "60%") : (chartType === "donut" ? ["44%", "72%"] : "70%"),
+        center: ["50%", isMobile ? "42%" : "46%"],
+        label: { show: !isMobile || rows.length <= 4, color: textColor, fontSize: isMobile ? 10 : 11, fontFamily },
         data: rows.map((r) => ({ name: String(r[xField] ?? ""), value: Number(r[yField] ?? 0) })),
       }],
     };

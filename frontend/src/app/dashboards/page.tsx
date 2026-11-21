@@ -8,7 +8,8 @@ import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
 export default function DashboardsListPage() {
-  const { user, showToast } = useBi();
+  const { user, locale, showToast } = useBi();
+  const isFa = locale === "fa";
   const [dashboards, setDashboards] = useState<any[]>([]);
   const [datasets, setDatasets] = useState<any[]>([]);
   const [showCreate, setShowCreate] = useState(false);
@@ -65,27 +66,39 @@ export default function DashboardsListPage() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="text-xl font-bold flex items-center gap-2">
-              <FolderKanban className="w-5 h-5" style={{ color: "var(--bi-primary)" }} /> Dashboards
+              <FolderKanban className="w-5 h-5" style={{ color: "var(--bi-primary)" }} />{" "}
+              {isFa ? "داشبوردها و قالب‌ها" : "Dashboards"}
             </h1>
             <p className="text-xs mt-1" style={{ color: "var(--bi-muted)" }}>
-              Only dashboards permitted by your RBAC & Resource Permission policy appear here.
+              {isFa
+                ? "تنها داشبوردهای مجاز بر اساس سیاست دسترسی RBAC نمایش داده می‌شوند."
+                : "Only dashboards permitted by your RBAC & Resource Permission policy appear here."}
             </p>
           </div>
-          <button
-            onClick={() => setShowCreate((s) => !s)}
-            className="px-4 py-2 rounded-lg text-xs font-semibold text-white flex items-center gap-1.5"
-            style={{ background: "var(--bi-primary)" }}
-          >
-            <Plus className="w-4 h-4" /> New Dashboard
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href="/reports"
+              className="px-3.5 py-2 rounded-lg border text-xs font-semibold flex items-center gap-1.5"
+              style={{ borderColor: "var(--bi-border)", background: "var(--bi-card)" }}
+            >
+              {isFa ? "گالری قالب‌ها" : "Templates Gallery"}
+            </Link>
+            <button
+              onClick={() => setShowCreate((s) => !s)}
+              className="px-4 py-2 rounded-lg text-xs font-semibold text-white flex items-center gap-1.5"
+              style={{ background: "var(--bi-primary)" }}
+            >
+              <Plus className="w-4 h-4" /> {isFa ? "داشبورد جدید" : "New Dashboard"}
+            </button>
+          </div>
         </div>
 
         {showCreate && (
-          <form onSubmit={handleCreate} className="bi-card p-5 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+          <form onSubmit={handleCreate} className="bi-card p-4 sm:p-5 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
             <input
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="Dashboard Title"
+              placeholder={isFa ? "عنوان داشبورد" : "Dashboard Title"}
               className="px-3 py-2 rounded-lg border bg-transparent"
               style={{ borderColor: "var(--bi-border)" }}
               required
@@ -93,34 +106,41 @@ export default function DashboardsListPage() {
             <input
               value={desc}
               onChange={(e) => setDesc(e.target.value)}
-              placeholder="Description"
+              placeholder={isFa ? "توضیحات" : "Description"}
               className="px-3 py-2 rounded-lg border bg-transparent"
               style={{ borderColor: "var(--bi-border)" }}
             />
             <button type="submit" className="px-4 py-2 rounded-lg text-white font-semibold" style={{ background: "var(--bi-primary)" }}>
-              Create & Open Designer
+              {isFa ? "ساخت و ورود به طراح" : "Create & Open Designer"}
             </button>
           </form>
         )}
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
           {dashboards.map((d) => (
-            <div key={d.id} className="bi-card p-5 flex flex-col justify-between gap-4">
+            <div key={d.id} className="bi-card p-4 sm:p-5 flex flex-col justify-between gap-3 sm:gap-4">
               <div>
                 <div className="flex items-start justify-between gap-2">
-                  <Link href={`/dashboards/${d.id}`} className="text-base font-bold hover:underline">
-                    {d.title}
-                  </Link>
-                  <button onClick={() => handleDelete(d.id)} className="text-red-500 p-1 hover:bg-red-500/10 rounded">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Link href={`/dashboards/${d.id}`} className="text-sm sm:text-base font-bold hover:underline">
+                      {d.title}
+                    </Link>
+                    {d.is_template && (
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-violet-500/15 text-violet-500 font-semibold">
+                        TEMPLATE
+                      </span>
+                    )}
+                  </div>
+                  <button onClick={() => handleDelete(d.id)} className="text-red-500 p-1 hover:bg-red-500/10 rounded shrink-0">
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
                 </div>
                 <p className="text-xs mt-1.5" style={{ color: "var(--bi-muted)" }}>{d.description}</p>
               </div>
               <div className="flex items-center justify-between pt-3 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
-                <span style={{ color: "var(--bi-muted)" }}>{d.widget_count} widgets</span>
+                <span style={{ color: "var(--bi-muted)" }}>{d.widget_count} {isFa ? "ویجت" : "widgets"}</span>
                 <Link href={`/dashboards/${d.id}`} className="font-bold flex items-center gap-1" style={{ color: "var(--bi-primary)" }}>
-                  Launch <ArrowRight className="w-3.5 h-3.5" />
+                  {isFa ? "باز کردن" : "Launch"} <ArrowRight className={`w-3.5 h-3.5 ${isFa ? "rotate-180" : ""}`} />
                 </Link>
               </div>
             </div>

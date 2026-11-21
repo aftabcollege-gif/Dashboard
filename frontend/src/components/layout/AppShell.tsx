@@ -270,24 +270,24 @@ function LoginScreen() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4" style={{ background: "var(--bi-bg)" }}>
-      <div className="bi-card w-full max-w-md p-8 space-y-6">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
+    <div className="min-h-screen flex items-center justify-center p-3 sm:p-4" style={{ background: "var(--bi-bg)" }}>
+      <div className="bi-card w-full max-w-md p-5 sm:p-8 space-y-5 sm:space-y-6">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-3 min-w-0">
             <div
-              className="w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold"
+              className="w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold shrink-0"
               style={{ background: "var(--bi-primary)" }}
             >
               <BarChart3 className="w-5 h-5" />
             </div>
-            <div>
-              <h1 className="text-lg font-bold">{t("brand")}</h1>
-              <p className="text-xs" style={{ color: "var(--bi-muted)" }}>{t("tagline")}</p>
+            <div className="min-w-0">
+              <h1 className="text-base sm:text-lg font-bold truncate">{t("brand")}</h1>
+              <p className="text-[11px] sm:text-xs truncate" style={{ color: "var(--bi-muted)" }}>{t("tagline")}</p>
             </div>
           </div>
           <button
             onClick={() => setLocale(locale === "en" ? "fa" : "en")}
-            className="px-2.5 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1"
+            className="px-2.5 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1 shrink-0"
             style={{ borderColor: "var(--bi-border)" }}
           >
             <Languages className="w-3.5 h-3.5" />
@@ -392,21 +392,25 @@ function LoginScreen() {
           <div className="pt-3 border-t text-xs space-y-1.5" style={{ borderColor: "var(--bi-border)", color: "var(--bi-muted)" }}>
             {authStatus?.environment === "vercel-preview-demo" && (
               <div className="px-2.5 py-1.5 rounded-lg bg-blue-500/10 text-blue-600 dark:text-blue-400 text-[11px] font-medium">
-                Preview Demo Mode — serving built-in sample BI data (1,200 sales &amp; 450 expense rows).
+                {locale === "fa"
+                  ? "حالت پیش‌نمایش نمونه — داده‌های آماده انبار داده (۱,۲۰۰ فروش و ۴۵۰ هزینه) فعال است."
+                  : "Preview Demo Mode — serving built-in sample BI data (1,200 sales & 450 expense rows)."}
               </div>
             )}
-            <div className="font-semibold">Quick Demo Accounts (Enterprise Roles):</div>
-            <div className="grid grid-cols-2 gap-1.5">
-              <button type="button" onClick={() => { setAuthMode("local"); setUsername("admin"); setPassword("Admin!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
+            <div className="font-semibold">
+              {locale === "fa" ? "حساب‌های آزمایشی سریع (نقش‌های سازمانی):" : "Quick Demo Accounts (Enterprise Roles):"}
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+              <button type="button" onClick={() => { setAuthMode("local"); setUsername("admin"); setPassword("Admin!2026"); }} className="text-start px-2.5 py-1.5 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
                 admin / Admin!2026 (Super Admin)
               </button>
-              <button type="button" onClick={() => { setAuthMode("local"); setUsername("designer"); setPassword("Designer!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
+              <button type="button" onClick={() => { setAuthMode("local"); setUsername("designer"); setPassword("Designer!2026"); }} className="text-start px-2.5 py-1.5 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
                 designer / Designer!2026
               </button>
-              <button type="button" onClick={() => { setAuthMode("local"); setUsername("north_mgr"); setPassword("Manager!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
+              <button type="button" onClick={() => { setAuthMode("local"); setUsername("north_mgr"); setPassword("Manager!2026"); }} className="text-start px-2.5 py-1.5 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
                 north_mgr (RLS North)
               </button>
-              <button type="button" onClick={() => { setAuthMode("local"); setUsername("south_mgr"); setPassword("Manager!2026"); }} className="text-left px-2 py-1 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
+              <button type="button" onClick={() => { setAuthMode("local"); setUsername("south_mgr"); setPassword("Manager!2026"); }} className="text-start px-2.5 py-1.5 rounded border hover:opacity-80" style={{ borderColor: "var(--bi-border)" }}>
                 south_mgr (RLS South)
               </button>
             </div>
@@ -463,8 +467,12 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
       {/* Sidebar */}
       <aside
-        className={`fixed lg:sticky top-0 h-screen w-64 shrink-0 z-40 bi-surface border-e flex flex-col justify-between transition-transform duration-200 ${
-          sidebarOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"
+        className={`fixed lg:sticky inset-y-0 start-0 h-screen w-64 shrink-0 z-40 bi-surface border-e flex flex-col justify-between transition-transform duration-200 ${
+          sidebarOpen
+            ? "translate-x-0"
+            : locale === "fa"
+            ? "translate-x-full lg:translate-x-0"
+            : "-translate-x-full lg:translate-x-0"
         }`}
         style={{ borderColor: "var(--bi-border)" }}
       >
@@ -540,29 +548,51 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {/* Main Content */}
       <div className="flex-1 min-w-0 flex flex-col">
         <header
-          className="h-14 px-4 lg:hidden flex items-center justify-between border-b bi-surface sticky top-0 z-20"
+          className="h-14 px-3 sm:px-4 lg:hidden flex items-center justify-between gap-2 border-b bi-surface sticky top-0 z-20"
           style={{ borderColor: "var(--bi-border)" }}
         >
-          <button onClick={() => setSidebarOpen(true)} className="p-1.5 rounded-lg border" style={{ borderColor: "var(--bi-border)" }}>
+          <button
+            onClick={() => setSidebarOpen(true)}
+            aria-label={locale === "fa" ? "منو" : "Open menu"}
+            className="p-2 rounded-lg border min-w-[36px] min-h-[36px] flex items-center justify-center"
+            style={{ borderColor: "var(--bi-border)" }}
+          >
             <Menu className="w-4 h-4" />
           </button>
-          <span className="font-bold text-sm">{t("brand")}</span>
-          <button onClick={() => setLocale(locale === "en" ? "fa" : "en")} className="text-xs font-semibold">
-            {locale === "en" ? "FA" : "EN"}
+          <span className="font-bold text-sm truncate">{t("brand")}</span>
+          <button
+            onClick={() => setLocale(locale === "en" ? "fa" : "en")}
+            className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold shrink-0"
+            style={{ borderColor: "var(--bi-border)" }}
+          >
+            {locale === "en" ? "فارسی" : "EN"}
           </button>
         </header>
-        <main className="flex-1 min-w-0 p-4 lg:p-6">
+        <main className="flex-1 min-w-0 p-3 sm:p-4 lg:p-6">
           {authStatus?.environment === "vercel-preview-demo" && (
             <div
-              className="mb-4 px-3 py-2 rounded-lg border text-xs flex flex-wrap items-center justify-between gap-2"
+              className="mb-3 sm:mb-4 px-3 py-2 rounded-lg border text-[11px] sm:text-xs flex flex-wrap items-center justify-between gap-2"
               style={{ borderColor: "var(--bi-border)", background: "rgba(37, 99, 235, 0.08)", color: "var(--bi-text)" }}
             >
-              <span>
-                <strong>Vercel UI Preview (Demo Data):</strong> Interactive sample warehouse loaded (RLS, Drill-Down, Charts &amp; SQL Explorer active).
-              </span>
-              <span className="text-[11px]" style={{ color: "var(--bi-muted)" }}>
-                Connect <code>BACKEND_INTERNAL_URL</code> for persistent Neon/FastAPI storage
-              </span>
+              {locale === "fa" ? (
+                <>
+                  <span>
+                    <strong>پیش‌نمایش ابری (داده نمونه):</strong> انبار داده تعاملی با RLS، دریل‌داون، تبدیل نمودار و SQL فعال است.
+                  </span>
+                  <span className="text-[10px]" style={{ color: "var(--bi-muted)" }}>
+                    برای ذخیره‌سازی دائمی <code>BACKEND_INTERNAL_URL</code> را متصل کنید
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span>
+                    <strong>Vercel UI Preview (Demo Data):</strong> Interactive sample warehouse loaded (RLS, Drill-Down, Charts &amp; SQL Explorer active).
+                  </span>
+                  <span className="text-[11px]" style={{ color: "var(--bi-muted)" }}>
+                    Connect <code>BACKEND_INTERNAL_URL</code> for persistent Neon/FastAPI storage
+                  </span>
+                </>
+              )}
             </div>
           )}
           {children}

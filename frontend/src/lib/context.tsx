@@ -68,6 +68,7 @@ export function BiProvider({ children }: { children: React.ReactNode }) {
     setActiveThemeMode(mode);
     if (typeof document !== "undefined") {
       const r = document.documentElement.style;
+      const isRtl = document.documentElement.dir === "rtl";
       r.setProperty("--bi-primary", tokens.primary);
       r.setProperty("--bi-secondary", tokens.secondary);
       r.setProperty("--bi-bg", tokens.background);
@@ -79,7 +80,10 @@ export function BiProvider({ children }: { children: React.ReactNode }) {
       r.setProperty("--bi-radius", `${tokens.radius}px`);
       r.setProperty("--bi-shadow", tokens.shadow);
       r.setProperty("--bi-blur", `${tokens.blur || 0}px`);
-      r.setProperty("--bi-font", tokens.font_family || "Inter, Vazirmatn, sans-serif");
+      r.setProperty(
+        "--bi-font",
+        isRtl ? "Vazirmatn, Inter, sans-serif" : (tokens.font_family || "Inter, Vazirmatn, sans-serif")
+      );
     }
   };
 
@@ -89,6 +93,10 @@ export function BiProvider({ children }: { children: React.ReactNode }) {
       localStorage.setItem("bi_locale", l);
       document.documentElement.dir = l === "fa" ? "rtl" : "ltr";
       document.documentElement.lang = l;
+      document.documentElement.style.setProperty(
+        "--bi-font",
+        l === "fa" ? "Vazirmatn, Inter, sans-serif" : (activeThemeTokens.font_family || "Inter, Vazirmatn, sans-serif")
+      );
     }
   };
 
@@ -182,7 +190,7 @@ export function BiProvider({ children }: { children: React.ReactNode }) {
       {children}
       {toast && (
         <div
-          className="fixed bottom-5 right-5 z-[100] px-4 py-3 rounded-xl text-sm font-medium shadow-xl border transition-all"
+          className="fixed bottom-4 inset-x-4 sm:inset-x-auto sm:bottom-5 sm:end-5 sm:max-w-sm z-[100] px-4 py-3 rounded-xl text-xs sm:text-sm font-medium shadow-xl border transition-all text-center sm:text-start"
           style={{
             background: "var(--bi-surface)",
             color: "var(--bi-text)",
