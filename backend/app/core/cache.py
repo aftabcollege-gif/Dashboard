@@ -2,8 +2,8 @@ import hashlib
 import json
 import threading
 import time
-from typing import Any, Optional
 from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.performance import CacheMetadata
@@ -12,6 +12,8 @@ try:
     import redis as redis_lib
 except ImportError:
     redis_lib = None
+
+CACHE_KEY_PREFIX = "bi_cache:"
 
 
 class SmartCacheManager:
@@ -55,7 +57,7 @@ class SmartCacheManager:
         widget_id: Optional[str] = None,
     ) -> str:
         parts = [
-            f"org:{organization_id}",
+            f"{CACHE_KEY_PREFIX}org:{organization_id}",
             f"dash:{dashboard_id or '-'}",
             f"w:{widget_id or '-'}",
             f"ds:{dataset_id}",
@@ -150,9 +152,16 @@ class SmartCacheManager:
         removed = 0
         if self._redis is not None:
             try:
-                for k in self._redis.scan_iter(f"*{contains_token}*"):
-                    self._redis.delete(k)
-                    removed += 1
+                batch: list[str] = []
+                for k in self._redis.scan_iter(f"{CACHE_KEY_PREFIX}*{contains_token}*"):
+                    batch.append(k)
+                    if len(batch) >= 200:
+                        self._redis.delete(*batch)
+                        removed += len(batch)
+                        batch.clear()
+                if batch:
+                    self._redis.delete(*batch)
+                    removed += len(batch)
             except Exception:
                 pass
 
@@ -164,6 +173,9 @@ class SmartCacheManager:
             self._invalidations += removed
         return removed
 
+    def invalidate_org(self, organization_id: str) -> int:
+        return self.invalidate_prefix(f"org:{organization_id}|")
+
     def invalidate_dataset(self, dataset_id: str) -> int:
         return self.invalidate_prefix(f"ds:{dataset_id}|")
 
@@ -171,24 +183,41 @@ class SmartCacheManager:
         return self.invalidate_prefix(f"dash:{dashboard_id}|")
 
     def invalidate_all(self) -> int:
+        # Never call Redis FLUSHDB; delete only our namespaced BI keys
+        removed = 0
         if self._redis is not None:
             try:
-                self._redis.flushdb()
+                batch: list[str] = []
+                for k in self._redis.scan_iter(f"{CACHE_KEY_PREFIX}*"):
+                    batch.append(k)
+                    if len(batch) >= 200:
+                        self._redis.delete(*batch)
+                        removed += len(batch)
+                        batch.clear()
+                if batch:
+                    self._redis.delete(*batch)
+                    removed += len(batch)
             except Exception:
                 pass
         with self._lock:
             count = len(self._store)
             self._store.clear()
-            self._invalidations += count
-            return count
+            total = removed + count
+            self._invalidations += total
+            return total
 
-    def stats(self) -> dict:
+    def stats(self, organization_id: Optional[str] = None) -> dict:
         with self._lock:
+            entries = (
+                sum(1 for k in self._store if f"org:{organization_id}|" in k)
+                if organization_id
+                else len(self._store)
+            )
             total = self._hits + self._misses
             hit_ratio = round((self._hits / total) * 100, 2) if total > 0 else 0.0
             return {
                 "backend": "redis+memory" if self._redis else "memory",
-                "entries_count": len(self._store),
+                "entries_count": entries,
                 "hits": self._hits,
                 "misses": self._misses,
                 "hit_ratio_percent": hit_ratio,

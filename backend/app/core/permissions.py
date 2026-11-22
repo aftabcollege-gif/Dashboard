@@ -4,15 +4,16 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 from sqlalchemy.orm import Session
+from app.core.cache import cache_manager
 from app.models.identity import (
-    User,
-    Role,
-    Permission,
-    RolePermission,
-    UserRole,
     GroupMember,
     GroupRole,
+    Permission,
     ResourcePermission,
+    Role,
+    RolePermission,
+    User,
+    UserRole,
 )
 
 # All 12 Hierarchical Scopes (Section 20)
@@ -88,8 +89,10 @@ PERMISSION_CATALOG: list[tuple[str, str, str]] = [
     ("drill_down", "drill_level_3", "Access drill level 3"),
     ("drill_down", "view_raw_records", "Access raw underlying records"),
     ("drill_down", "drill_through_target", "Access drill-through destination pages"),
-    # Dataset
+    # Dataset (with independent schema vs data views)
     ("dataset", "view", "View dataset metadata and preview"),
+    ("dataset", "view_schema", "View dataset schema and profiler"),
+    ("dataset", "view_data", "Preview dataset row data"),
     ("dataset", "edit", "Edit dataset transforms and schema"),
     ("dataset", "add", "Create or import dataset"),
     ("dataset", "delete", "Delete dataset"),
@@ -135,28 +138,52 @@ class PermissionResolver:
     2. Explicit DENY overrides any ALLOW (including role/group/parent allows).
     3. CRUD actions (view, edit, add, delete) and drill_down NEVER imply one another.
     4. Resolution aggregates Direct User + Groups + Roles + Group Roles + Resource Hierarchy.
-    5. Instant invalidation when permission/role/group changes occur.
+    5. Instant invalidation across workers via DB permission_version + Redis epoch key.
     """
 
     def __init__(self):
         self._lock = threading.RLock()
         self._memo: dict[str, PermissionDecision] = {}
 
-    def invalidate_all(self) -> None:
+    def _get_org_epoch(self, organization_id: str) -> str:
+        r = getattr(cache_manager, "_redis", None)
+        if r is not None:
+            try:
+                val = r.get(f"perm_epoch:{organization_id}")
+                if val is not None:
+                    return str(val)
+            except Exception:
+                pass
+        return "0"
+
+    def _bump_org_epoch(self, organization_id: str) -> None:
+        r = getattr(cache_manager, "_redis", None)
+        if r is not None:
+            try:
+                r.incr(f"perm_epoch:{organization_id}")
+            except Exception:
+                pass
+
+    def invalidate_all(self, organization_id: Optional[str] = None) -> None:
         with self._lock:
             self._memo.clear()
+        if organization_id:
+            self._bump_org_epoch(organization_id)
+            cache_manager.invalidate_org(organization_id)
 
     def bump_user_version(self, db: Session, user_id: str) -> None:
         user = db.query(User).filter(User.id == user_id).first()
         if user:
             user.permission_version += 1
-        self.invalidate_all()
+            self.invalidate_all(user.organization_id)
+        else:
+            self.invalidate_all()
 
     def bump_org_versions(self, db: Session, organization_id: str) -> None:
         users = db.query(User).filter(User.organization_id == organization_id).all()
         for u in users:
             u.permission_version += 1
-        self.invalidate_all()
+        self.invalidate_all(organization_id)
 
     def _get_user_context(self, db: Session, user: User) -> dict:
         group_ids = [
@@ -174,24 +201,29 @@ class PermissionResolver:
                 for gr in db.query(GroupRole).filter(GroupRole.group_id.in_(group_ids)).all()
             ]
         all_role_ids = list(set(direct_role_ids + group_role_ids))
-        roles = db.query(Role).filter(Role.id.in_(all_role_ids)).all() if all_role_ids else []
+        roles = (
+            db.query(Role)
+            .filter(Role.id.in_(all_role_ids), Role.organization_id == user.organization_id)
+            .all()
+            if all_role_ids
+            else []
+        )
+        valid_role_ids = [r.id for r in roles]
         is_super_admin = any(r.is_super_admin for r in roles)
 
-        # Role permissions
         role_perms: list[tuple[str, str, str]] = []
-        if all_role_ids:
+        if valid_role_ids:
             rows = (
                 db.query(Permission.resource_type, Permission.action, RolePermission.effect)
                 .join(RolePermission, RolePermission.permission_id == Permission.id)
-                .filter(RolePermission.role_id.in_(all_role_ids))
+                .filter(RolePermission.role_id.in_(valid_role_ids))
                 .all()
             )
             role_perms = [(r[0], r[1], r[2]) for r in rows]
 
-        # Resource permissions for this user, their groups, and their roles
         subjects = [("user", user.id)]
         subjects.extend(("group", gid) for gid in group_ids)
-        subjects.extend(("role", rid) for rid in all_role_ids)
+        subjects.extend(("role", rid) for rid in valid_role_ids)
 
         rps: list[ResourcePermission] = []
         all_rps = (
@@ -206,7 +238,7 @@ class PermissionResolver:
 
         return {
             "group_ids": group_ids,
-            "role_ids": all_role_ids,
+            "role_ids": valid_role_ids,
             "roles": [r.slug for r in roles],
             "is_super_admin": is_super_admin,
             "role_perms": role_perms,
@@ -217,7 +249,9 @@ class PermissionResolver:
         ctx = self._get_user_context(db, user)
         summary = {
             "user_id": user.id,
+            "org_id": user.organization_id,
             "perm_ver": user.permission_version,
+            "epoch": self._get_org_epoch(user.organization_id),
             "roles": sorted(ctx["roles"]),
             "groups": sorted(ctx["group_ids"]),
             "rp": sorted(
@@ -239,8 +273,12 @@ class PermissionResolver:
         if not user.is_active or user.is_locked:
             return PermissionDecision(False, "user_inactive_or_locked", "user_status")
 
+        org_epoch = self._get_org_epoch(user.organization_id)
         parent_key = ",".join(f"{pt}:{pi}" for pt, pi in (parent_chain or []))
-        cache_key = f"{user.id}:{user.permission_version}:{resource_type}:{resource_id}:{action}:{parent_key}"
+        cache_key = (
+            f"{user.organization_id}:{org_epoch}:{user.id}:{user.permission_version}:"
+            f"{resource_type}:{resource_id}:{action}:{parent_key}"
+        )
         with self._lock:
             cached = self._memo.get(cache_key)
             if cached is not None:
@@ -303,22 +341,20 @@ class PermissionResolver:
                 return PermissionDecision(True, "explicit_allow_resource", f"{rp.subject_type}:{rp.subject_id}")
 
         # 6. Inherited ALLOW from parent resource ONLY when inherit_to_children=True AND
-        #    either rule explicitly sets cascade_to_children in conditions_json or matches same resource_type
+        #    rule explicitly lists target resource_type in cascade_types / cascade_targets
         if parent_chain:
             for p_type, p_id in parent_chain:
                 for rp in rps:
                     if rp.effect == "allow" and rp.inherit_to_children:
                         if rp.resource_type == p_type and (rp.resource_id == p_id or rp.resource_id == "*"):
-                            cascade_targets = rp.conditions_json.get("cascade_types", [])
+                            cond = rp.conditions_json or {}
+                            cascade_targets = cond.get("cascade_types") or cond.get("cascade_targets") or []
                             if resource_type in cascade_targets and rp.action == action:
                                 return PermissionDecision(
                                     True, "inherited_allow_parent", f"{p_type}:{p_id}"
                                 )
 
-        # 7. Role-level ALLOW (if user has no scoped override restricting this resource_type+action)
-        # Note: if user/group has explicit resource_permissions ONLY on specific IDs of this
-        # resource_type AND role does NOT grant blanket access, step 5 handles it.
-        # If role grants (resource_type, action) allow, check if user has any explicit scoped isolation flag:
+        # 7. Role-level ALLOW
         for r_type, r_act, effect in role_perms:
             if effect == "allow" and r_type in (resource_type, "*") and r_act in (action, "*"):
                 return PermissionDecision(True, "role_permission_allow", "role_permission")

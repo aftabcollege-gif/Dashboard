@@ -1,13 +1,18 @@
 import io
+import ipaddress
 import json
 import os
 import re
+import socket
 import sqlite3
-import xml.etree.ElementTree as ET
-from typing import Any, Optional
+import zipfile
+from typing import Any, Iterable, Optional
+from urllib.parse import urlparse
+import defusedxml.ElementTree as SafeET
 import httpx
 import pandas as pd
-import sqlparse
+from app.config import settings
+from app.core.sql_guard import validate_readonly_sql_ast
 from app.engines.warehouse import sanitize_identifier
 
 SUPPORTED_DB_TYPES = [
@@ -57,40 +62,95 @@ def infer_semantic_role(col_name: str, bi_type: str, display_name: str = "") -> 
     return "dimension"
 
 
-def validate_readonly_sql(sql: str) -> None:
-    parsed = sqlparse.parse(sql)
-    if not parsed:
-        raise ValueError("Empty SQL query")
-    if len(parsed) > 1:
-        # Allow trailing semicolon only
-        non_empty = [s for s in parsed if s.value.strip().strip(";")]
-        if len(non_empty) > 1:
-            raise ValueError("Multiple SQL statements are prohibited for security")
+def validate_readonly_sql(
+    sql: str,
+    *,
+    allowed_tables: Optional[Iterable[str]] = None,
+    dialect: str = "duckdb",
+    require_table_allowlist: bool = False,
+) -> set[str]:
+    return validate_readonly_sql_ast(
+        sql,
+        allowed_tables=allowed_tables,
+        dialect=dialect,
+        require_table_allowlist=require_table_allowlist,
+    )
 
-    forbidden = {
-        "DROP",
-        "DELETE",
-        "UPDATE",
-        "INSERT",
-        "ALTER",
-        "TRUNCATE",
-        "CREATE",
-        "REPLACE",
-        "ATTACH",
-        "DETACH",
-        "COPY",
-        "EXPORT",
-        "PRAGMA",
-        "GRANT",
-        "REVOKE",
-        "CALL",
-        "EXEC",
+
+def _validate_external_http_url(url: str) -> None:
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only HTTP/HTTPS URLs are allowed")
+    host = parsed.hostname.strip().lower()
+    # Always block link-local cloud metadata endpoints
+    if host in ("169.254.169.254", "metadata.google.internal"):
+        raise ValueError("Access to cloud metadata endpoint is forbidden")
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if ip_obj.is_link_local or ip_obj.is_multicast:
+            raise ValueError("Unsafe IP target is forbidden")
+        if settings.ENVIRONMENT == "production" and (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved):
+            raise ValueError("Private/loopback SSRF targets are forbidden in production")
+    except ValueError as exc:
+        if "forbidden" in str(exc):
+            raise
+        # Hostname: resolve in production to block SSRF to internal metadata/loopback
+        if settings.ENVIRONMENT == "production":
+            try:
+                for info in socket.getaddrinfo(host, None):
+                    addr = ipaddress.ip_address(info[4][0])
+                    if addr.is_link_local or addr.is_private or addr.is_loopback or addr.is_reserved:
+                        raise ValueError("Resolved target IP is forbidden in production")
+            except ValueError:
+                raise
+            except Exception:
+                pass
+
+
+def _guard_xlsx_zip_bomb(file_bytes: bytes) -> None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zf:
+            infos = zf.infolist()
+            if len(infos) > 500:
+                raise ValueError("Excel archive contains excessive entries (possible zip bomb)")
+            total_uncompressed = 0
+            for info in infos:
+                total_uncompressed += int(info.file_size or 0)
+                if total_uncompressed > settings.MAX_ZIP_UNCOMPRESSED_BYTES:
+                    raise ValueError("Excel uncompressed size exceeds safety limit (possible zip bomb)")
+                if info.compress_size > 0 and (info.file_size / info.compress_size) > 120 and info.file_size > 5 * 1024 * 1024:
+                    raise ValueError("Suspicious Excel compression ratio detected (possible zip bomb)")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Invalid or corrupted XLSX file") from exc
+
+
+def compute_dataframe_quality(df: pd.DataFrame) -> dict[str, Any]:
+    """Computes Data Quality metrics (completeness, uniqueness, column consistency, score 0..100)."""
+    total_rows = len(df)
+    total_cols = len(df.columns)
+    if total_rows == 0 or total_cols == 0:
+        return {
+            "dq_score": 100.0 if total_cols > 0 else 0.0,
+            "completeness_pct": 100.0 if total_cols > 0 else 0.0,
+            "uniqueness_pct": 100.0,
+            "duplicate_rows": 0,
+            "total_null_cells": 0,
+            "total_cells": 0,
+        }
+    total_cells = total_rows * total_cols
+    total_nulls = int(df.isna().sum().sum())
+    dup_rows = int(df.duplicated().sum())
+    completeness = max(0.0, (1.0 - (total_nulls / total_cells)) * 100.0)
+    uniqueness = max(0.0, (1.0 - (dup_rows / total_rows)) * 100.0)
+    dq_score = round((0.7 * completeness) + (0.3 * uniqueness), 2)
+    return {
+        "dq_score": dq_score,
+        "completeness_pct": round(completeness, 2),
+        "uniqueness_pct": round(uniqueness, 2),
+        "duplicate_rows": dup_rows,
+        "total_null_cells": total_nulls,
+        "total_cells": total_cells,
     }
-    for stmt in parsed:
-        for tok in stmt.flatten():
-            if tok.ttype in (sqlparse.tokens.Keyword, sqlparse.tokens.Keyword.DDL, sqlparse.tokens.Keyword.DML):
-                if tok.value.upper() in forbidden:
-                    raise ValueError(f"Disallowed SQL keyword in read-only mode: {tok.value.upper()}")
 
 
 def parse_file_to_preview(
@@ -104,13 +164,22 @@ def parse_file_to_preview(
     type_overrides: Optional[dict[str, str]] = None,
     preview_limit: int = 100,
 ) -> dict[str, Any]:
+    if len(file_bytes) > settings.MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"File exceeds maximum allowed size ({settings.MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"
+        )
+
     ext = os.path.splitext(filename.lower())[1]
     sheets: list[str] = []
 
     if ext in (".xlsx", ".xls"):
+        if ext == ".xlsx":
+            _guard_xlsx_zip_bomb(file_bytes)
         engine = "openpyxl" if ext == ".xlsx" else "xlrd"
         xl = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
         sheets = list(xl.sheet_names)
+        if not sheets:
+            raise ValueError("Workbook contains no sheets")
         chosen_sheet = sheet_name if sheet_name in sheets else sheets[0]
         df = pd.read_excel(
             io.BytesIO(file_bytes),
@@ -127,14 +196,16 @@ def parse_file_to_preview(
     elif ext == ".json":
         payload = json.loads(file_bytes.decode("utf-8"))
         if isinstance(payload, dict):
-            # Find first list value if wrapped
             for v in payload.values():
                 if isinstance(v, list):
                     payload = v
                     break
         df = pd.json_normalize(payload)
     elif ext == ".xml":
-        root = ET.fromstring(file_bytes.decode("utf-8"))
+        raw_text = file_bytes.decode("utf-8")
+        if re.search(r"<!\s*(DOCTYPE|ENTITY)", raw_text, re.IGNORECASE):
+            raise ValueError("XML DOCTYPE/ENTITY declarations are forbidden for security")
+        root = SafeET.fromstring(raw_text)
         records = []
         for child in root:
             rec = {}
@@ -148,7 +219,11 @@ def parse_file_to_preview(
     else:
         raise ValueError(f"Unsupported file format: {ext}")
 
-    # Clean column names while preserving original labels (supports Persian/Unicode headers cleanly)
+    if len(df.columns) > settings.MAX_UPLOAD_COLS:
+        raise ValueError(f"Column count ({len(df.columns)}) exceeds limit ({settings.MAX_UPLOAD_COLS})")
+    if len(df) > settings.MAX_UPLOAD_ROWS:
+        raise ValueError(f"Row count ({len(df)}) exceeds limit ({settings.MAX_UPLOAD_ROWS})")
+
     raw_headers = [str(c).strip() or f"col_{idx + 1}" for idx, c in enumerate(df.columns)]
     safe_cols: list[str] = []
     display_name_map: dict[str, str] = {}
@@ -166,7 +241,6 @@ def parse_file_to_preview(
             suffix += 1
         used_cols.add(cand)
         safe_cols.append(cand)
-        # Preserve original Unicode/Persian label if header had non-ASCII chars, else pretty title
         has_non_ascii = any(ord(ch) > 127 for ch in raw_hdr)
         display_name_map[cand] = raw_hdr if has_non_ascii else raw_hdr.replace("_", " ").title()
 
@@ -185,12 +259,10 @@ def parse_file_to_preview(
         if rename_map:
             df = df.rename(columns=rename_map)
 
-    # Detect duplicate count before dedup
     duplicate_count = int(df.duplicated().sum())
     if deduplicate and duplicate_count > 0:
         df = df.drop_duplicates().reset_index(drop=True)
 
-    # Auto-parse Persian/Arabic numerals & comma-formatted numbers and date-like strings
     persian_digits = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
     for col in df.columns:
         if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
@@ -211,7 +283,6 @@ def parse_file_to_preview(
                     if not converted.dropna().empty:
                         df[col] = converted
 
-    # Apply type overrides
     if type_overrides:
         for col, target_type in type_overrides.items():
             scol = sanitize_identifier(col)
@@ -231,7 +302,6 @@ def parse_file_to_preview(
             except Exception:
                 pass
 
-    # Null handling
     null_counts = {str(c): int(df[c].isna().sum()) for c in df.columns}
     if null_strategy == "drop_rows":
         df = df.dropna().reset_index(drop=True)
@@ -247,6 +317,8 @@ def parse_file_to_preview(
                 df[c] = df[c].fillna(df[c].mean() if not df[c].dropna().empty else 0)
             else:
                 df[c] = df[c].fillna("Unknown")
+
+    dq = compute_dataframe_quality(df)
 
     columns_meta = []
     for col in df.columns:
@@ -274,6 +346,7 @@ def parse_file_to_preview(
         "total_rows": len(df),
         "duplicate_count": duplicate_count,
         "null_counts": null_counts,
+        "data_quality": dq,
         "columns": columns_meta,
         "preview_rows": preview_rows,
     }
@@ -283,16 +356,29 @@ class DataConnectorEngine:
     """Real multi-protocol Data Connectivity Engine."""
 
     @staticmethod
+    def _validate_sqlite_path(db_path: Optional[str]) -> str:
+        if not db_path:
+            raise ValueError("SQLite file path is required")
+        resolved = os.path.realpath(db_path)
+        if not os.path.exists(resolved):
+            raise ConnectionError(f"SQLite file not found: {db_path}")
+        if settings.ENVIRONMENT == "production":
+            allowed_roots = [os.path.realpath(settings.UPLOADS_DIR), os.path.realpath(os.path.dirname(settings.SAMPLE_ERP_DB_PATH))]
+            if not any(resolved.startswith(r + os.sep) or resolved == r for r in allowed_roots):
+                raise PermissionError("SQLite path outside permitted data directory in production")
+        return resolved
+
+    @staticmethod
     def test_connection(
         source_type: str, config: dict[str, Any], credentials: dict[str, Any]
     ) -> dict[str, Any]:
         st = source_type.lower()
         try:
             if st == "sqlite":
-                db_path = config.get("file_path") or config.get("database")
-                if not db_path or not os.path.exists(db_path):
-                    return {"ok": False, "error": f"SQLite file not found: {db_path}"}
-                conn = sqlite3.connect(db_path, timeout=5)
+                db_path = DataConnectorEngine._validate_sqlite_path(
+                    config.get("file_path") or config.get("database")
+                )
+                conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
                 conn.execute("SELECT 1").fetchone()
                 conn.close()
                 return {"ok": True, "message": "SQLite connection verified"}
@@ -334,8 +420,6 @@ class DataConnectorEngine:
                 return {"ok": True, "message": "MongoDB connection verified"}
 
             if st in ("mssql", "oracle"):
-                # Verify TCP socket reachability if proprietary ODBC/InstantClient isn't installed
-                import socket
                 host = config.get("host", "")
                 port = int(config.get("port", 1433 if st == "mssql" else 1521))
                 with socket.create_connection((host, port), timeout=4):
@@ -345,6 +429,7 @@ class DataConnectorEngine:
                 url = config.get("url") or config.get("base_url")
                 if not url:
                     return {"ok": False, "error": "URL is required"}
+                _validate_external_http_url(url)
                 headers = dict(config.get("headers", {}))
                 if credentials.get("bearer_token"):
                     headers["Authorization"] = f"Bearer {credentials['bearer_token']}"
@@ -372,9 +457,9 @@ class DataConnectorEngine:
     ) -> list[dict[str, Any]]:
         st = source_type.lower()
         if st == "sqlite":
-            db_path = config.get("file_path") or config.get("database")
-            if not db_path or not os.path.exists(db_path):
-                raise ConnectionError(f"SQLite source unreachable: {db_path}")
+            db_path = DataConnectorEngine._validate_sqlite_path(
+                config.get("file_path") or config.get("database")
+            )
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
             try:
                 objs = conn.execute(
@@ -382,6 +467,7 @@ class DataConnectorEngine:
                 ).fetchall()
                 result = []
                 for name, obj_type in objs:
+                    safe_name = sanitize_identifier(name)
                     cols_raw = conn.execute(f'PRAGMA table_info("{name}")').fetchall()
                     cols = [
                         {
@@ -392,7 +478,7 @@ class DataConnectorEngine:
                         }
                         for c in cols_raw
                     ]
-                    result.append({"table_name": name, "object_type": obj_type, "columns": cols})
+                    result.append({"table_name": name, "safe_name": safe_name, "object_type": obj_type, "columns": cols})
                 return result
             finally:
                 conn.close()
@@ -445,6 +531,8 @@ class DataConnectorEngine:
                 cur.execute("SHOW FULL TABLES")
                 res = []
                 for tname, ttype in cur.fetchall():
+                    if not re.match(r"^[A-Za-z0-9_]+$", str(tname)):
+                        continue
                     cur.execute(f"DESCRIBE `{tname}`")
                     cols = [
                         {
@@ -470,20 +558,23 @@ class DataConnectorEngine:
         query: Optional[str] = None,
         table_name: Optional[str] = None,
         read_only: bool = True,
+        query_params: Optional[list[Any]] = None,
     ) -> pd.DataFrame:
         st = source_type.lower()
-        sql = query or (f'SELECT * FROM "{table_name}"' if table_name else None)
+        safe_table = sanitize_identifier(table_name) if table_name else None
+        sql = query or (f'SELECT * FROM "{safe_table}"' if safe_table else None)
         if read_only and sql:
-            validate_readonly_sql(sql)
+            dialect = "sqlite" if st == "sqlite" else "postgres" if st == "postgresql" else "mysql" if st in ("mysql", "mariadb") else "duckdb"
+            validate_readonly_sql(sql, dialect=dialect)
 
         if st == "sqlite":
-            db_path = config.get("file_path") or config.get("database")
-            if not db_path or not os.path.exists(db_path):
-                raise ConnectionError(f"Operational SQLite source offline or missing: {db_path}")
+            db_path = DataConnectorEngine._validate_sqlite_path(
+                config.get("file_path") or config.get("database")
+            )
             uri_mode = f"file:{db_path}?mode=ro" if read_only else f"file:{db_path}"
             conn = sqlite3.connect(uri_mode, uri=True, timeout=5)
             try:
-                return pd.read_sql_query(sql, conn)
+                return pd.read_sql_query(sql, conn, params=query_params)
             finally:
                 conn.close()
 
@@ -498,7 +589,7 @@ class DataConnectorEngine:
                 connect_timeout=5,
             )
             try:
-                return pd.read_sql_query(sql, conn)
+                return pd.read_sql_query(sql, conn, params=query_params)
             finally:
                 conn.close()
 
@@ -513,7 +604,7 @@ class DataConnectorEngine:
                 connect_timeout=5,
             )
             try:
-                return pd.read_sql_query(sql, conn)
+                return pd.read_sql_query(sql, conn, params=query_params)
             finally:
                 conn.close()
 
@@ -531,6 +622,9 @@ class DataConnectorEngine:
 
         if st in ("rest_api", "graphql"):
             url = config.get("url")
+            if not url:
+                raise ValueError("URL is required")
+            _validate_external_http_url(url)
             headers = dict(config.get("headers", {}))
             if credentials.get("bearer_token"):
                 headers["Authorization"] = f"Bearer {credentials['bearer_token']}"

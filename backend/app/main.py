@@ -3,7 +3,7 @@ import secrets
 import signal
 import threading
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from app.api import (
     ai,
@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
     # Seed enterprise roles, themes & (in dev/demo mode) demo accounts + dashboards
     with db_session_scope() as db:
         seed_database(db)
-    # Start background ETL scheduler
+    # Start background ETL scheduler (single-leader guarded)
     start_scheduler()
     try:
         yield
@@ -52,11 +52,41 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.get_cors_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token", "X-Setup-Token", "X-Desktop-Control-Token"],
 )
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path or ""
+
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+
+    # Allow embedding only for public embed routes; block clickjacking everywhere else
+    if f"{settings.API_PREFIX}/dashboards/public/" in path:
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    else:
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    if proto == "https" or request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
+    if any(
+        path.startswith(f"{settings.API_PREFIX}/{seg}")
+        for seg in ("auth", "rbac", "queries", "data-sources", "monitoring")
+    ):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+        response.headers["Pragma"] = "no-cache"
+
+    return response
 
 
 @app.get("/health")

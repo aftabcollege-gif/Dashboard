@@ -11,6 +11,7 @@ import {
 import { parseSpreadsheetBuffer } from "@/lib/excelParser";
 
 const TOKEN_KEY = "bi_access_token";
+const CSRF_COOKIE_NAME = "bi_csrf_token";
 
 export function getStoredToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -23,12 +24,47 @@ export function setStoredToken(token: string | null) {
   else localStorage.removeItem(TOKEN_KEY);
 }
 
+export function getCsrfCookie(): string | null {
+  if (typeof document === "undefined") return null;
+  const escaped = CSRF_COOKIE_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
     super(message);
     this.status = status;
   }
+}
+
+let refreshPromise: Promise<boolean> | null = null;
+
+async function attemptCookieRefresh(): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  if (isDemoPreviewMode()) return false;
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async () => {
+    try {
+      const headers: Record<string, string> = {};
+      const csrf = getCsrfCookie();
+      if (csrf) headers["X-CSRF-Token"] = csrf;
+      const res = await fetch("/api/v1/auth/refresh", {
+        method: "POST",
+        credentials: "include",
+        headers,
+      });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
 }
 
 async function handleClientDemoFileUpload(path: string, fd: FormData): Promise<any> {
@@ -159,19 +195,27 @@ export async function apiFetch<T = any>(
     }
   }
 
-  const token = getStoredToken();
-  const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string> || {}),
+  const buildHeaders = () => {
+    const headers: Record<string, string> = {
+      ...(options.headers as Record<string, string> || {}),
+    };
+    const token = inDemo ? getStoredToken() : null;
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+      const csrf = getCsrfCookie();
+      if (csrf && !headers["X-CSRF-Token"]) {
+        headers["X-CSRF-Token"] = csrf;
+      }
+    }
+    if (!(options.body instanceof FormData) && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+    return headers;
   };
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
 
   let effectiveBody = options.body;
-  if (!(effectiveBody instanceof FormData) && !headers["Content-Type"]) {
-    headers["Content-Type"] = "application/json";
-  }
-
   // Automatically include uploaded Excel datasets and custom dashboards in Preview Demo API calls
   if (
     inDemo &&
@@ -188,7 +232,6 @@ export async function apiFetch<T = any>(
       const uploaded = getDemoUploadedDatasets();
       const customDashes = getDemoCreatedDashboards();
       if (uploaded.length > 0 && !parsedBody.demo_uploaded_datasets) {
-        // Send only target dataset for fast query/filter calls; send all for AI endpoints
         if (path.startsWith("/ai/")) {
           parsedBody.demo_uploaded_datasets = uploaded;
         } else if (parsedBody.dataset_id) {
@@ -210,11 +253,27 @@ export async function apiFetch<T = any>(
     }
   }
 
-  const res = await fetch(`/api/v1${path}`, {
-    ...options,
-    body: effectiveBody,
-    headers,
-  });
+  const doFetch = () =>
+    fetch(`/api/v1${path}`, {
+      ...options,
+      credentials: "include",
+      body: effectiveBody,
+      headers: buildHeaders(),
+    });
+
+  let res = await doFetch();
+
+  const skipRefreshPaths = ["/auth/login", "/auth/refresh", "/auth/bootstrap-admin", "/auth/status"];
+  if (
+    res.status === 401 &&
+    !inDemo &&
+    !skipRefreshPaths.some((p) => path.startsWith(p))
+  ) {
+    const refreshed = await attemptCookieRefresh();
+    if (refreshed) {
+      res = await doFetch();
+    }
+  }
 
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
@@ -242,10 +301,20 @@ export async function apiFetch<T = any>(
 }
 
 export async function apiDownload(path: string, filename: string) {
-  const token = getStoredToken();
-  const res = await fetch(`/api/v1${path}`, {
+  const inDemo = typeof window !== "undefined" && isDemoPreviewMode();
+  const token = inDemo ? getStoredToken() : null;
+  let res = await fetch(`/api/v1${path}`, {
+    credentials: "include",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
+  if (res.status === 401 && !inDemo) {
+    const refreshed = await attemptCookieRefresh();
+    if (refreshed) {
+      res = await fetch(`/api/v1${path}`, {
+        credentials: "include",
+      });
+    }
+  }
   if (!res.ok) {
     throw new ApiError(res.status, `Download failed (${res.status})`);
   }

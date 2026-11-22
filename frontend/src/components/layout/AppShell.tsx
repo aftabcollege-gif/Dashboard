@@ -22,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 import { apiFetch, setStoredToken } from "@/lib/api";
+import { isDemoPreviewMode } from "@/lib/demoStore";
 import { useBi } from "@/lib/context";
 
 function InitialSetupScreen() {
@@ -72,7 +73,11 @@ function InitialSetupScreen() {
           setup_token: setupToken || undefined,
         }),
       });
-      setStoredToken(res.access_token);
+      if (isDemoPreviewMode()) {
+        setStoredToken(res.access_token);
+      } else {
+        setStoredToken(null);
+      }
       if (typeof window !== "undefined" && window.location.search.includes("setup_token")) {
         window.history.replaceState({}, "", window.location.pathname);
       }
@@ -260,7 +265,11 @@ function LoginScreen() {
         showToast("Enter your 6-digit MFA code");
         return;
       }
-      setStoredToken(res.access_token);
+      if (isDemoPreviewMode()) {
+        setStoredToken(res.access_token);
+      } else {
+        setStoredToken(null);
+      }
       await refreshUser();
     } catch (err: any) {
       setError(err.message || "Authentication failed");

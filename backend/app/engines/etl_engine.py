@@ -1,15 +1,16 @@
 import hashlib
 import json
+import re
 import threading
 import time
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Optional
-import pandas as pd
 import psutil
 from sqlalchemy.orm import Session
 from app.core.cache import cache_manager
 from app.core.security import decrypt_secret
+from app.core.sql_guard import validate_readonly_sql_ast
 from app.engines.connectors import DataConnectorEngine, infer_bi_type, infer_semantic_role
 from app.engines.data_engine import DataProfiler
 from app.engines.warehouse import sanitize_identifier, warehouse
@@ -45,6 +46,7 @@ def refresh_materialized_views_for_dataset(db: Session, dataset: Dataset) -> Non
     mvs = db.query(MaterializedViewMetadata).filter(MaterializedViewMetadata.dataset_id == dataset.id).all()
     for mv in mvs:
         try:
+            validate_readonly_sql_ast(mv.definition_sql, require_table_allowlist=False)
             cnt = warehouse.create_materialized_summary(mv.view_name, mv.definition_sql)
             mv.row_count = cnt
             mv.last_refreshed_at = datetime.now(timezone.utc)
@@ -61,6 +63,8 @@ def run_etl_pipeline(
     """
     Executes an ETL Pipeline with:
     - Per-pipeline mutex lock preventing duplicate concurrent runs
+    - Organization ownership enforcement on source & target dataset
+    - AST-validated base query & sanitized incremental cursor literal
     - Exponential backoff retry policy
     - Intelligent incremental / CDC hash extraction
     - Atomic warehouse load (failed extraction NEVER overwrites existing valid dataset)
@@ -93,9 +97,9 @@ def run_etl_pipeline(
     db.commit()
 
     retry_policy = pipeline.retry_policy_json or {}
-    max_retries = int(retry_policy.get("max_retries", 2))
-    backoff = float(retry_policy.get("initial_backoff_sec", 0.5))
-    multiplier = float(retry_policy.get("backoff_multiplier", 2.0))
+    max_retries = min(int(retry_policy.get("max_retries", 2)), 5)
+    backoff = min(float(retry_policy.get("initial_backoff_sec", 0.5)), 5.0)
+    multiplier = min(float(retry_policy.get("backoff_multiplier", 2.0)), 4.0)
 
     last_exc: Optional[Exception] = None
     run_record: Optional[EtlJobRun] = None
@@ -118,11 +122,25 @@ def run_etl_pipeline(
             try:
                 logs.append(f"[{started_at.isoformat()}] Attempt {attempt}: Starting ETL '{pipeline.name}' ({pipeline.extract_mode})")
 
-                # 1. EXTRACT
-                source = db.query(DataSource).filter(DataSource.id == pipeline.data_source_id).first()
-                dataset = db.query(Dataset).filter(Dataset.id == pipeline.target_dataset_id).first()
+                # 1. EXTRACT (verify same organization for source, pipeline, and dataset)
+                source = (
+                    db.query(DataSource)
+                    .filter(
+                        DataSource.id == pipeline.data_source_id,
+                        DataSource.organization_id == pipeline.organization_id,
+                    )
+                    .first()
+                )
+                dataset = (
+                    db.query(Dataset)
+                    .filter(
+                        Dataset.id == pipeline.target_dataset_id,
+                        Dataset.organization_id == pipeline.organization_id,
+                    )
+                    .first()
+                )
                 if not source or not dataset:
-                    raise ValueError("Pipeline requires valid data_source_id and target_dataset_id")
+                    raise ValueError("Pipeline requires valid organization-owned data_source_id and target_dataset_id")
 
                 cred_row = (
                     db.query(DataSourceCredential)
@@ -139,21 +157,29 @@ def run_etl_pipeline(
                     db.add(checkpoint)
                     db.commit()
 
-                base_query = pipeline.source_query or f'SELECT * FROM "{source.config_json.get("default_table", "erp_orders")}"'
+                default_tbl = sanitize_identifier(str(source.config_json.get("default_table", "erp_orders")))
+                base_query = pipeline.source_query or f'SELECT * FROM "{default_tbl}"'
+                clean_base = base_query.strip().rstrip(";")
+                validate_readonly_sql_ast(clean_base, require_table_allowlist=False)
 
                 # Build incremental filter when cursor exists and warehouse table already populated
                 inc_col = pipeline.incremental_column
-                exec_query = base_query
+                exec_query = clean_base
                 if (
                     pipeline.extract_mode == "incremental"
                     and inc_col
                     and checkpoint.last_cursor_value
                     and warehouse.table_exists(dataset.warehouse_table)
                 ):
-                    clean_base = base_query.strip().rstrip(";")
-                    cursor_val = checkpoint.last_cursor_value.replace("'", "''")
-                    exec_query = f'SELECT * FROM ({clean_base}) AS _src WHERE "{inc_col}" > \'{cursor_val}\''
-                    logs.append(f"Incremental filter active: {inc_col} > {checkpoint.last_cursor_value}")
+                    clean_inc = sanitize_identifier(inc_col)
+                    cursor_raw = str(checkpoint.last_cursor_value).replace("\x00", "")
+                    if re.fullmatch(r"-?\d+(\.\d+)?", cursor_raw):
+                        cursor_literal = cursor_raw
+                    else:
+                        cursor_escaped = cursor_raw.replace("'", "''")
+                        cursor_literal = f"'{cursor_escaped}'"
+                    exec_query = f'SELECT * FROM ({clean_base}) AS _src WHERE "{clean_inc}" > {cursor_literal}'
+                    logs.append(f"Incremental filter active: {clean_inc} > {cursor_raw}")
 
                 raw_df = DataConnectorEngine.extract_dataframe(
                     source.source_type,
@@ -194,7 +220,6 @@ def run_etl_pipeline(
                     logs.append("No new/changed rows detected since last checkpoint.")
                 else:
                     if pipeline.extract_mode == "cdc_hash" and pk_col and pk_col in transformed_df.columns and warehouse.table_exists(dataset.warehouse_table):
-                        # Detect only changed or new rows by SHA-256 content hash
                         changed_indices = []
                         new_hashes = dict(prev_hashes)
                         records = transformed_df.to_dict(orient="records")
@@ -226,7 +251,6 @@ def run_etl_pipeline(
                     else:
                         load_stats = warehouse.load_dataframe(dataset.warehouse_table, transformed_df, mode="replace")
                         rows_inserted = load_stats["inserted"]
-                        # Populate hashes for future CDC runs if PK exists
                         if pk_col and pk_col in transformed_df.columns:
                             checkpoint.row_hashes_json = {
                                 str(rec[pk_col]): _row_hash(rec)
@@ -250,7 +274,6 @@ def run_etl_pipeline(
                 dataset.last_refreshed_at = datetime.now(timezone.utc)
                 dataset.freshness_status = "fresh"
 
-                # Sync DatasetFields if newly created or missing
                 existing_fields = {
                     f.field_name
                     for f in db.query(DatasetField).filter(DatasetField.dataset_id == dataset.id).all()
@@ -269,7 +292,6 @@ def run_etl_pipeline(
                             )
                         )
 
-                # Record Data Lineage
                 existing_lin = (
                     db.query(DataLineage)
                     .filter(
@@ -291,7 +313,6 @@ def run_etl_pipeline(
                         )
                     )
 
-                # Refresh Pre-Aggregated Materialized Views & Invalidate Smart Cache
                 refresh_materialized_views_for_dataset(db, dataset)
                 inv_count = cache_manager.invalidate_dataset(dataset.id)
                 logs.append(f"Refreshed dataset v{dataset.data_version} ({total_rows} rows); invalidated {inv_count} cache entries")
@@ -355,7 +376,6 @@ def run_etl_pipeline(
                         traceback=traceback.format_exc(),
                     )
                 )
-                # Update source health if connection error
                 src = db.query(DataSource).filter(DataSource.id == pipeline.data_source_id).first()
                 if src:
                     src.health_status = "offline"

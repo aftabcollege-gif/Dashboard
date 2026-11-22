@@ -1137,25 +1137,37 @@ class AiAnalyticsEngine:
 
         created_widget = None
         if create_widget and dashboard_id:
-            enforce_permission(db, user, "dashboard", dashboard_id, "add_widget")
+            from app.core.cache import cache_manager
+            from app.core.tenant import get_dashboard_for_org
+
+            dash_obj = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+            enforce_permission(db, user, "dashboard", dash_obj.id, "add_widget")
             target_page_id = page_id
             if not target_page_id:
                 p0 = (
                     db.query(DashboardPage)
-                    .filter(DashboardPage.dashboard_id == dashboard_id)
+                    .filter(DashboardPage.dashboard_id == dash_obj.id)
                     .order_by(DashboardPage.page_order.asc())
                     .first()
                 )
                 target_page_id = p0.id if p0 else None
             if target_page_id:
+                page_obj = (
+                    db.query(DashboardPage)
+                    .filter(DashboardPage.id == target_page_id, DashboardPage.dashboard_id == dash_obj.id)
+                    .first()
+                )
+                if not page_obj:
+                    target_page_id = None
+            if target_page_id:
                 existing_widgets = db.query(Widget).filter(
-                    Widget.dashboard_id == dashboard_id, Widget.page_id == target_page_id
+                    Widget.dashboard_id == dash_obj.id, Widget.page_id == target_page_id
                 ).all()
                 next_y = max((w.layout_y + w.layout_h for w in existing_widgets), default=0)
                 lay_w = 12 if eff_chart == "bpmn" else (4 if eff_chart in ("kpi", "gauge") else 6)
                 lay_h = 10 if eff_chart == "bpmn" else (3 if eff_chart in ("kpi", "gauge") else 7)
                 w = Widget(
-                    dashboard_id=dashboard_id,
+                    dashboard_id=dash_obj.id,
                     page_id=target_page_id,
                     title=extracted_title,
                     description=f"AI Text-to-Widget ({chosen_ds.name})",
@@ -1189,16 +1201,17 @@ class AiAnalyticsEngine:
                     DataLineage.source_type == "dataset",
                     DataLineage.source_id == chosen_ds.id,
                     DataLineage.target_type == "dashboard",
-                    DataLineage.target_id == dashboard_id,
+                    DataLineage.target_id == dash_obj.id,
                 ).first():
                     db.add(
                         DataLineage(
                             source_type="dataset",
                             source_id=chosen_ds.id,
                             target_type="dashboard",
-                            target_id=dashboard_id,
+                            target_id=dash_obj.id,
                         )
                     )
+                cache_manager.invalidate_dashboard(dash_obj.id)
                 db.commit()
                 created_widget = {
                     "id": w.id,
@@ -1287,7 +1300,11 @@ class AiAnalyticsEngine:
 
     @staticmethod
     def _resolve_theme_from_text(db: Session, org_id: str, text_low: str) -> Optional[DashboardTheme]:
-        themes = db.query(DashboardTheme).filter(DashboardTheme.organization_id == org_id).all()
+        themes = (
+            db.query(DashboardTheme)
+            .filter((DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == org_id))
+            .all()
+        )
         if not themes:
             return None
         for th in themes:
@@ -1608,7 +1625,11 @@ class AiAnalyticsEngine:
 
         # Resolve theme
         chosen_theme: Optional[DashboardTheme] = None
-        themes = db.query(DashboardTheme).filter(DashboardTheme.organization_id == user.organization_id).all()
+        themes = (
+            db.query(DashboardTheme)
+            .filter((DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == user.organization_id))
+            .all()
+        )
         if clarifications.get("theme_id"):
             if clarifications["theme_id"] == "__default__":
                 chosen_theme = themes[0] if themes else None
@@ -1832,7 +1853,14 @@ class AiAnalyticsEngine:
             # 1) Theme change
             resolved_theme = None
             if clarifications.get("theme_id"):
-                resolved_theme = db.query(DashboardTheme).filter(DashboardTheme.id == clarifications["theme_id"]).first()
+                resolved_theme = (
+                    db.query(DashboardTheme)
+                    .filter(
+                        DashboardTheme.id == clarifications["theme_id"],
+                        (DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == user.organization_id),
+                    )
+                    .first()
+                )
             if not resolved_theme:
                 resolved_theme = AiAnalyticsEngine._resolve_theme_from_text(db, user.organization_id, combined_low)
 
@@ -1950,10 +1978,13 @@ class AiAnalyticsEngine:
 
         is_delete = edit_action == "delete" or any(k in combined_low for k in ("حذف", "پاک کن", "بردار", "delete", "remove"))
         if is_delete:
+            from app.core.cache import cache_manager
+
             enforce_permission(db, user, "dashboard", target_dash.id, "delete_widget")
             w_title = target_widget.title
             w_id = target_widget.id
             db.delete(target_widget)
+            cache_manager.invalidate_dashboard(target_dash.id)
             db.commit()
             return {
                 "status": "widget_deleted",
@@ -2051,6 +2082,8 @@ class AiAnalyticsEngine:
         if wq:
             wq.visual_spec_json = visual_spec
 
+        from app.core.cache import cache_manager
+        cache_manager.invalidate_dashboard(target_dash.id)
         db.commit()
 
         preview_data = None

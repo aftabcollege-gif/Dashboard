@@ -5,10 +5,23 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.api.deps import enforce_permission, get_client_ip, get_current_user
+from app.config import settings
 from app.core.audit import record_audit
 from app.core.cache import cache_manager
 from app.core.permissions import permission_resolver
+from app.core.rate_limit import rate_limiter
 from app.core.rls_cls import apply_cls_and_masking, build_data_security_context
+from app.core.sql_guard import validate_readonly_sql_ast
+from app.core.tenant import (
+    get_dashboard_for_org,
+    get_dataset_for_org,
+    get_default_workspace_for_org,
+    get_page_for_org,
+    get_theme_for_org,
+    get_widget_for_org,
+    get_workspace_for_org,
+    list_org_allowed_dataset_tables,
+)
 from app.database import get_db
 from app.engines.drill_engine import resolve_drill_state
 from app.engines.query_engine import build_visual_query_sql, execute_dataset_sql
@@ -27,6 +40,7 @@ from app.models.dashboard import (
     WidgetDrillRule,
     WidgetFilter,
     WidgetQuery,
+    Workspace,
 )
 from app.models.data import DataLineage, Dataset, DatasetField
 from app.models.identity import User
@@ -61,6 +75,7 @@ class DashboardUpdate(BaseModel):
     is_public: Optional[bool] = None
     refresh_interval_sec: Optional[int] = None
     settings_json: Optional[dict[str, Any]] = None
+    expected_updated_at: Optional[str] = None
 
 
 class PageCreate(BaseModel):
@@ -75,6 +90,7 @@ class LayoutSaveRequest(BaseModel):
     gap_px: int = 16
     grid_enabled: bool = True
     items: list[dict[str, Any]]  # [{i, x, y, w, h}]
+    expected_updated_at: Optional[str] = None
 
 
 class WidgetCreate(BaseModel):
@@ -163,6 +179,32 @@ class StateSaveRequest(BaseModel):
     widget_overrides: dict[str, Any] = {}
 
 
+def _is_explicit_deny(
+    db: Session,
+    user: User,
+    resource_type: str,
+    resource_id: str,
+    action: str,
+    parent_chain: Optional[list[tuple[str, str]]] = None,
+) -> bool:
+    dec = permission_resolver.resolve(db, user, resource_type, resource_id, action, parent_chain=parent_chain)
+    return (not dec.allowed) and dec.reason.startswith("explicit_deny")
+
+
+def _check_optimistic_concurrency(dash: Dashboard, expected_updated_at: Optional[str]) -> None:
+    if not expected_updated_at or not dash.updated_at:
+        return
+    actual = dash.updated_at.isoformat()
+    # Normalize naive vs tz-aware ISO strings by stripping trailing Z/+00:00 if needed for comparison
+    norm_exp = expected_updated_at.replace("Z", "+00:00")
+    norm_act = actual.replace("Z", "+00:00")
+    if norm_exp != norm_act and norm_exp[:19] != norm_act[:19]:
+        raise HTTPException(
+            status_code=409,
+            detail="Dashboard was modified by another session. Refresh to get the latest layout and changes.",
+        )
+
+
 def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, Any]:
     pages = (
         db.query(DashboardPage)
@@ -174,7 +216,6 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
     dash_filters = db.query(DashboardFilter).filter(DashboardFilter.dashboard_id == dash.id).all()
     theme = db.query(DashboardTheme).filter(DashboardTheme.id == dash.theme_id).first() if dash.theme_id else None
 
-    # Filter widgets by explicit per-widget VIEW permission! (Test B isolation!)
     visible_widgets = []
     for w in widgets_all:
         parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
@@ -188,8 +229,17 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
         ds = db.query(Dataset).filter(Dataset.id == w.dataset_id).first() if w.dataset_id else None
 
         can_edit_w = permission_resolver.resolve(db, user, "widget", w.id, "edit", parent_chain).allowed
-        can_del_w = permission_resolver.resolve(db, user, "widget", w.id, "delete", parent_chain).allowed
-        can_drill_w = permission_resolver.resolve(db, user, "drill_down", w.id, "drill_down", parent_chain + [("widget", w.id)]).allowed
+        can_del_w = (
+            permission_resolver.resolve(db, user, "widget", w.id, "delete", parent_chain).allowed
+            and not _is_explicit_deny(db, user, "dashboard", dash.id, "delete_widget")
+        )
+        can_drill_w = permission_resolver.resolve(
+            db, user, "drill_down", w.id, "drill_down", parent_chain + [("widget", w.id)]
+        ).allowed
+        can_chart_w = can_edit_w or permission_resolver.resolve(db, user, "widget", w.id, "change_chart_type", parent_chain).allowed
+        can_style_w = can_edit_w or permission_resolver.resolve(db, user, "widget", w.id, "change_style", parent_chain).allowed
+        can_filter_w = can_edit_w or permission_resolver.resolve(db, user, "widget", w.id, "change_filter", parent_chain).allowed
+        can_export_w = permission_resolver.resolve(db, user, "widget", w.id, "export", parent_chain).allowed
 
         visible_widgets.append({
             "id": w.id,
@@ -230,7 +280,16 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
                 }
                 for wf in wfs
             ],
-            "permissions": {"view": True, "edit": can_edit_w, "delete": can_del_w, "drill_down": can_drill_w},
+            "permissions": {
+                "view": True,
+                "edit": can_edit_w,
+                "delete": can_del_w,
+                "drill_down": can_drill_w,
+                "change_chart_type": can_chart_w,
+                "change_style": can_style_w,
+                "change_filter": can_filter_w,
+                "export": can_export_w,
+            },
         })
 
     layouts_by_page = {}
@@ -280,18 +339,35 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
             "edit": permission_resolver.resolve(db, user, "dashboard", dash.id, "edit").allowed,
             "delete": permission_resolver.resolve(db, user, "dashboard", dash.id, "delete").allowed,
             "add_widget": permission_resolver.resolve(db, user, "dashboard", dash.id, "add_widget").allowed,
+            "delete_widget": permission_resolver.resolve(db, user, "dashboard", dash.id, "delete_widget").allowed,
+            "add_page": permission_resolver.resolve(db, user, "dashboard", dash.id, "add_page").allowed,
+            "delete_page": permission_resolver.resolve(db, user, "dashboard", dash.id, "delete_page").allowed,
+            "change_layout": permission_resolver.resolve(db, user, "dashboard", dash.id, "change_layout").allowed,
             "change_theme": permission_resolver.resolve(db, user, "dashboard", dash.id, "change_theme").allowed,
+            "manage_filters": permission_resolver.resolve(db, user, "dashboard", dash.id, "manage_filters").allowed,
             "export": permission_resolver.resolve(db, user, "dashboard", dash.id, "export").allowed,
+            "share": permission_resolver.resolve(db, user, "dashboard", dash.id, "share").allowed,
         },
         "updated_at": dash.updated_at,
     }
 
 
 @router.get("/public/{embed_token}")
-def get_public_dashboard(embed_token: str, db: Session = Depends(get_db)):
-    dash = db.query(Dashboard).filter(Dashboard.embed_token == embed_token, Dashboard.is_public == True).first()
-    if not dash:
+def get_public_dashboard(embed_token: str, request: Request, db: Session = Depends(get_db)):
+    ip = get_client_ip(request)
+    rate_limiter.check(f"public_dash:{ip}", limit=settings.RATE_LIMIT_PUBLIC_PER_MIN, window_seconds=60)
+
+    row = (
+        db.query(Dashboard, Workspace.organization_id)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(Dashboard.embed_token == embed_token, Dashboard.is_public == True)
+        .first()
+    )
+    if not row:
         raise HTTPException(status_code=404, detail="Shared dashboard not found or not public")
+    dash, dash_org_id = row
+    org_tables = set(list_org_allowed_dataset_tables(db, dash_org_id).keys())
+
     pages = db.query(DashboardPage).filter(DashboardPage.dashboard_id == dash.id).order_by(DashboardPage.page_order.asc()).all()
     widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
     theme = db.query(DashboardTheme).filter(DashboardTheme.id == dash.theme_id).first() if dash.theme_id else None
@@ -300,11 +376,18 @@ def get_public_dashboard(embed_token: str, db: Session = Depends(get_db)):
         wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
         cfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
         wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
-        ds = db.query(Dataset).filter(Dataset.id == w.dataset_id).first() if w.dataset_id else None
+        ds = (
+            db.query(Dataset)
+            .filter(Dataset.id == w.dataset_id, Dataset.organization_id == dash_org_id)
+            .first()
+            if w.dataset_id
+            else None
+        )
         data = {"columns": [], "rows": []}
         if ds and wq:
             try:
                 if wq.query_mode == "sql" and wq.sql_text:
+                    validate_readonly_sql_ast(wq.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
                     data = warehouse.execute_query(wq.sql_text)
                 else:
                     sql, params, _ = build_visual_query_sql(
@@ -334,14 +417,19 @@ def get_public_dashboard(embed_token: str, db: Session = Depends(get_db)):
             },
             "data": data,
         })
-    all_themes = db.query(DashboardTheme).all()
+    all_themes = (
+        db.query(DashboardTheme)
+        .filter((DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == dash_org_id))
+        .all()
+    )
     return {
         "id": dash.id,
         "title": dash.title,
         "description": dash.description,
-        "theme_id": dash.theme_id,
-        "theme": {"id": theme.id, "name": theme.name, "slug": theme.slug, "mode": theme.mode, "tokens": theme.tokens_json} if theme else None,
-        "themes": [
+        "theme": {
+            "id": theme.id, "name": theme.name, "slug": theme.slug, "mode": theme.mode, "tokens": theme.tokens_json
+        } if theme else None,
+        "available_themes": [
             {"id": th.id, "name": th.name, "slug": th.slug, "mode": th.mode, "tokens": th.tokens_json}
             for th in all_themes
         ],
@@ -354,11 +442,22 @@ def get_public_dashboard(embed_token: str, db: Session = Depends(get_db)):
 def execute_public_dashboard_batch(
     embed_token: str,
     body: BatchExecuteRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ):
-    dash = db.query(Dashboard).filter(Dashboard.embed_token == embed_token, Dashboard.is_public == True).first()
-    if not dash:
+    ip = get_client_ip(request)
+    rate_limiter.check(f"public_batch:{ip}", limit=settings.RATE_LIMIT_PUBLIC_PER_MIN, window_seconds=60)
+
+    row = (
+        db.query(Dashboard, Workspace.organization_id)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(Dashboard.embed_token == embed_token, Dashboard.is_public == True)
+        .first()
+    )
+    if not row:
         raise HTTPException(status_code=404, detail="Shared dashboard not found or not public")
+    dash, dash_org_id = row
+    org_tables = set(list_org_allowed_dataset_tables(db, dash_org_id).keys())
 
     t0 = time.perf_counter()
     widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
@@ -367,7 +466,14 @@ def execute_public_dashboard_batch(
     for w in widgets:
         wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
         wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
-        ds = db.query(Dataset).filter(Dataset.id == (wq.dataset_id if wq and wq.dataset_id else w.dataset_id)).first()
+        target_ds_id = wq.dataset_id if wq and wq.dataset_id else w.dataset_id
+        ds = (
+            db.query(Dataset)
+            .filter(Dataset.id == target_ds_id, Dataset.organization_id == dash_org_id)
+            .first()
+            if target_ds_id
+            else None
+        )
         hierarchy = (wdr.hierarchy_json if wdr else []) or []
         level_rules = (wdr.level_rules_json if wdr else []) or []
         d_stack = body.drill_states.get(w.id, [])
@@ -404,6 +510,7 @@ def execute_public_dashboard_batch(
         if ds and wq:
             try:
                 if wq.query_mode == "sql" and wq.sql_text:
+                    validate_readonly_sql_ast(wq.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
                     data = warehouse.execute_query(wq.sql_text)
                 else:
                     sql, params, _ = build_visual_query_sql(
@@ -411,8 +518,8 @@ def execute_public_dashboard_batch(
                         override_dimension=eff_dim, raw_mode=(eff_chart == "bpmn"),
                     )
                     data = warehouse.execute_query(sql, params)
-            except Exception as exc:
-                data = {"columns": [], "rows": [], "error": str(exc)}
+            except Exception:
+                data = {"columns": [], "rows": [], "error": "Widget query could not be executed"}
 
         results[w.id] = {
             "widget_id": w.id,
@@ -435,20 +542,33 @@ def execute_public_dashboard_batch(
 
 @router.get("/workspaces")
 def list_workspaces(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    from app.models.dashboard import Workspace
     rows = db.query(Workspace).filter(Workspace.organization_id == user.organization_id).all()
     return [{"id": w.id, "name": w.name, "description": w.description} for w in rows]
 
 
 @router.get("/templates")
 def list_templates(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = db.query(Dashboard).filter(Dashboard.is_template == True).all()
-    return [{"id": d.id, "title": d.title, "description": d.description, "theme_id": d.theme_id} for d in rows]
+    rows = (
+        db.query(Dashboard)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(Workspace.organization_id == user.organization_id, Dashboard.is_template == True)
+        .all()
+    )
+    visible = []
+    for d in rows:
+        if d.is_public or permission_resolver.resolve(db, user, "dashboard", d.id, "view").allowed:
+            visible.append({"id": d.id, "title": d.title, "description": d.description, "theme_id": d.theme_id})
+    return visible
 
 
 @router.get("")
 def list_dashboards(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    all_dash = db.query(Dashboard).all()
+    all_dash = (
+        db.query(Dashboard)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(Workspace.organization_id == user.organization_id)
+        .all()
+    )
     visible = []
     for d in all_dash:
         if d.is_public or permission_resolver.resolve(db, user, "dashboard", d.id, "view").allowed:
@@ -468,14 +588,18 @@ def create_dashboard(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    from app.models.dashboard import Workspace
     enforce_permission(db, user, "dashboard", "*", "add", ip_address=get_client_ip(request))
-    ws_id = body.workspace_id
-    if not ws_id:
-        ws = db.query(Workspace).filter(Workspace.organization_id == user.organization_id).first()
-        ws_id = ws.id
+    if body.workspace_id:
+        ws = get_workspace_for_org(db, body.workspace_id, user.organization_id)
+    else:
+        ws = get_default_workspace_for_org(db, user.organization_id)
+        if not ws:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+    if body.theme_id:
+        get_theme_for_org(db, body.theme_id, user.organization_id)
+
     d = Dashboard(
-        workspace_id=ws_id,
+        workspace_id=ws.id,
         title=body.title,
         description=body.description,
         theme_id=body.theme_id,
@@ -501,9 +625,7 @@ def create_dashboard(
 def get_dashboard(
     dashboard_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    dash = db.query(Dashboard).filter(Dashboard.id == dashboard_id).first()
-    if not dash:
-        raise HTTPException(status_code=404, detail="Dashboard not found")
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
     if not dash.is_public:
         enforce_permission(db, user, "dashboard", dash.id, "view", ip_address=get_client_ip(request))
     record_audit(
@@ -521,40 +643,47 @@ def update_dashboard(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    dash = db.query(Dashboard).filter(Dashboard.id == dashboard_id).first()
-    if not dash:
-        raise HTTPException(status_code=404, detail="Dashboard not found")
-    if body.theme_id is not None:
-        # Either edit or change_theme
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    _check_optimistic_concurrency(dash, body.expected_updated_at)
+
+    if body.theme_id is not None and any(
+        v is not None for v in (body.title, body.description, body.is_public, body.refresh_interval_sec, body.settings_json)
+    ):
+        enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
+        get_theme_for_org(db, body.theme_id, user.organization_id)
+        dash.theme_id = body.theme_id
+    elif body.theme_id is not None:
         if not permission_resolver.resolve(db, user, "dashboard", dash.id, "change_theme").allowed:
             enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
+        get_theme_for_org(db, body.theme_id, user.organization_id)
         dash.theme_id = body.theme_id
     else:
         enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
 
+    if body.is_public is not None:
+        enforce_permission(db, user, "dashboard", dash.id, "share", ip_address=get_client_ip(request))
+        dash.is_public = body.is_public
     if body.title is not None:
         dash.title = body.title
     if body.description is not None:
         dash.description = body.description
-    if body.is_public is not None:
-        dash.is_public = body.is_public
     if body.refresh_interval_sec is not None:
         dash.refresh_interval_sec = body.refresh_interval_sec
     if body.settings_json is not None:
         dash.settings_json = body.settings_json
     db.commit()
-    return {"status": "updated"}
+    db.refresh(dash)
+    return {"status": "updated", "updated_at": dash.updated_at}
 
 
 @router.delete("/{dashboard_id}")
 def delete_dashboard(
     dashboard_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dashboard", dashboard_id, "delete", ip_address=get_client_ip(request))
-    dash = db.query(Dashboard).filter(Dashboard.id == dashboard_id).first()
-    if not dash:
-        raise HTTPException(status_code=404, detail="Dashboard not found")
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "delete", ip_address=get_client_ip(request))
     db.delete(dash)
+    cache_manager.invalidate_dashboard(dash.id)
     db.commit()
     return {"status": "deleted"}
 
@@ -563,9 +692,11 @@ def delete_dashboard(
 def add_dashboard_page(
     dashboard_id: str, body: PageCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dashboard", dashboard_id, "add_page")
-    order = db.query(DashboardPage).filter(DashboardPage.dashboard_id == dashboard_id).count()
-    p = DashboardPage(dashboard_id=dashboard_id, title=body.title, page_order=order, is_drill_through=body.is_drill_through)
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    if not permission_resolver.resolve(db, user, "dashboard", dash.id, "add_page").allowed:
+        enforce_permission(db, user, "dashboard", dash.id, "edit")
+    order = db.query(DashboardPage).filter(DashboardPage.dashboard_id == dash.id).count()
+    p = DashboardPage(dashboard_id=dash.id, title=body.title, page_order=order, is_drill_through=body.is_drill_through)
     db.add(p)
     db.flush()
     db.add(DashboardLayout(page_id=p.id, columns_count=12, layout_json=[]))
@@ -577,10 +708,17 @@ def add_dashboard_page(
 def save_dashboard_layout(
     dashboard_id: str, body: LayoutSaveRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dashboard", dashboard_id, "change_layout")
-    lay = db.query(DashboardLayout).filter(DashboardLayout.page_id == body.page_id).first()
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    _check_optimistic_concurrency(dash, body.expected_updated_at)
+    if not permission_resolver.resolve(db, user, "dashboard", dash.id, "change_layout").allowed:
+        enforce_permission(db, user, "dashboard", dash.id, "edit")
+    page, page_dash = get_page_for_org(db, body.page_id, user.organization_id)
+    if page_dash.id != dash.id:
+        raise HTTPException(status_code=400, detail="Page does not belong to dashboard")
+
+    lay = db.query(DashboardLayout).filter(DashboardLayout.page_id == page.id).first()
     if not lay:
-        lay = DashboardLayout(page_id=body.page_id)
+        lay = DashboardLayout(page_id=page.id)
         db.add(lay)
     lay.columns_count = body.columns_count
     lay.row_height = body.row_height
@@ -589,14 +727,15 @@ def save_dashboard_layout(
     lay.layout_json = body.items
     for item in body.items:
         wid = item.get("i")
-        w = db.query(Widget).filter(Widget.id == wid, Widget.dashboard_id == dashboard_id).first()
+        w = db.query(Widget).filter(Widget.id == wid, Widget.dashboard_id == dash.id).first()
         if w:
             w.layout_x = int(item.get("x", w.layout_x))
             w.layout_y = int(item.get("y", w.layout_y))
             w.layout_w = int(item.get("w", w.layout_w))
             w.layout_h = int(item.get("h", w.layout_h))
     db.commit()
-    return {"status": "layout_saved"}
+    db.refresh(dash)
+    return {"status": "layout_saved", "updated_at": dash.updated_at}
 
 
 # ---------------- WIDGET CRUD + DUPLICATE + CHART SWITCHER ----------------
@@ -604,11 +743,29 @@ def save_dashboard_layout(
 def create_widget(
     dashboard_id: str, body: WidgetCreate, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dashboard", dashboard_id, "add_widget", ip_address=get_client_ip(request))
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    ip = get_client_ip(request)
+    if not permission_resolver.resolve(db, user, "dashboard", dash.id, "add_widget").allowed:
+        enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=ip)
+    if _is_explicit_deny(db, user, "widget", "*", "add", [("dashboard", dash.id)]):
+        enforce_permission(db, user, "widget", "*", "add", [("dashboard", dash.id)], ip_address=ip)
+
+    page, page_dash = get_page_for_org(db, body.page_id, user.organization_id)
+    if page_dash.id != dash.id:
+        raise HTTPException(status_code=400, detail="Page does not belong to dashboard")
+    if body.dataset_id:
+        get_dataset_for_org(db, body.dataset_id, user.organization_id)
     if body.chart_type not in ALL_30_CHART_TYPES:
         raise HTTPException(status_code=400, detail=f"Unsupported chart_type: {body.chart_type}")
+    if body.query_mode == "sql" and body.sql_text:
+        org_tables = set(list_org_allowed_dataset_tables(db, user.organization_id).keys())
+        try:
+            validate_readonly_sql_ast(body.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid widget SQL: {exc}")
+
     w = Widget(
-        dashboard_id=dashboard_id, page_id=body.page_id, title=body.title,
+        dashboard_id=dash.id, page_id=page.id, title=body.title,
         description=body.description, chart_type=body.chart_type, dataset_id=body.dataset_id,
         layout_x=body.layout_x, layout_y=body.layout_y, layout_w=body.layout_w, layout_h=body.layout_h,
     )
@@ -630,9 +787,9 @@ def create_widget(
     if body.dataset_id:
         if not db.query(DataLineage).filter(
             DataLineage.source_type == "dataset", DataLineage.source_id == body.dataset_id,
-            DataLineage.target_type == "dashboard", DataLineage.target_id == dashboard_id,
+            DataLineage.target_type == "dashboard", DataLineage.target_id == dash.id,
         ).first():
-            db.add(DataLineage(source_type="dataset", source_id=body.dataset_id, target_type="dashboard", target_id=dashboard_id))
+            db.add(DataLineage(source_type="dataset", source_id=body.dataset_id, target_type="dashboard", target_id=dash.id))
     db.commit()
     return {"id": w.id, "title": w.title}
 
@@ -641,11 +798,18 @@ def create_widget(
 def update_widget(
     widget_id: str, body: WidgetUpdate, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    w = db.query(Widget).filter(Widget.id == widget_id).first()
-    if not w:
-        raise HTTPException(status_code=404, detail="Widget not found")
-    parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
+    w, dash = get_widget_for_org(db, widget_id, user.organization_id)
+    parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
     enforce_permission(db, user, "widget", w.id, "edit", parent_chain=parent_chain, ip_address=get_client_ip(request))
+
+    if body.dataset_id is not None:
+        get_dataset_for_org(db, body.dataset_id, user.organization_id)
+    if body.sql_text is not None:
+        org_tables = set(list_org_allowed_dataset_tables(db, user.organization_id).keys())
+        try:
+            validate_readonly_sql_ast(body.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid widget SQL: {exc}")
 
     if body.title is not None:
         w.title = body.title
@@ -692,7 +856,7 @@ def update_widget(
         if body.drill_through_page_id is not None:
             wdr.drill_through_page_id = body.drill_through_page_id
 
-    cache_manager.invalidate_dashboard(w.dashboard_id)
+    cache_manager.invalidate_dashboard(dash.id)
     db.commit()
     return {"status": "updated"}
 
@@ -701,25 +865,25 @@ def update_widget(
 def delete_widget(
     widget_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    w = db.query(Widget).filter(Widget.id == widget_id).first()
-    if not w:
-        raise HTTPException(status_code=404, detail="Widget not found")
-    parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
-    enforce_permission(db, user, "widget", w.id, "delete", parent_chain=parent_chain, ip_address=get_client_ip(request))
+    w, dash = get_widget_for_org(db, widget_id, user.organization_id)
+    ip = get_client_ip(request)
+    parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
+    if _is_explicit_deny(db, user, "dashboard", dash.id, "delete_widget"):
+        enforce_permission(db, user, "dashboard", dash.id, "delete_widget", ip_address=ip)
+    enforce_permission(db, user, "widget", w.id, "delete", parent_chain=parent_chain, ip_address=ip)
     db.delete(w)
-    cache_manager.invalidate_dashboard(w.dashboard_id)
+    cache_manager.invalidate_dashboard(dash.id)
     db.commit()
     return {"status": "deleted"}
 
 
 @router.post("/widgets/{widget_id}/duplicate")
 def duplicate_widget(widget_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    w = db.query(Widget).filter(Widget.id == widget_id).first()
-    if not w:
-        raise HTTPException(status_code=404, detail="Widget not found")
-    enforce_permission(db, user, "dashboard", w.dashboard_id, "add_widget")
+    w, dash = get_widget_for_org(db, widget_id, user.organization_id)
+    if not permission_resolver.resolve(db, user, "dashboard", dash.id, "add_widget").allowed:
+        enforce_permission(db, user, "dashboard", dash.id, "edit")
     nw = Widget(
-        dashboard_id=w.dashboard_id, page_id=w.page_id, title=f"{w.title} (Copy)",
+        dashboard_id=dash.id, page_id=w.page_id, title=f"{w.title} (Copy)",
         description=w.description, chart_type=w.chart_type, dataset_id=w.dataset_id,
         layout_x=(w.layout_x + 1) % 8, layout_y=w.layout_y + w.layout_h,
         layout_w=w.layout_w, layout_h=w.layout_h,
@@ -745,16 +909,8 @@ def duplicate_widget(widget_id: str, user: User = Depends(get_current_user), db:
 def switch_widget_chart_type(
     widget_id: str, body: SwitchChartRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    """
-    Runtime Chart Type Switching (Section 5):
-    Preserves dataset, color/style settings, active widget filters, and intelligently maps X/Y/series fields.
-    Returns explicit diagnostic message if target chart structure is incompatible.
-    """
-    w = db.query(Widget).filter(Widget.id == widget_id).first()
-    if not w:
-        raise HTTPException(status_code=404, detail="Widget not found")
-    parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
-    # Allow if user has change_chart_type OR edit
+    w, dash = get_widget_for_org(db, widget_id, user.organization_id)
+    parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
     if not permission_resolver.resolve(db, user, "widget", w.id, "change_chart_type", parent_chain).allowed:
         enforce_permission(db, user, "widget", w.id, "edit", parent_chain)
 
@@ -770,7 +926,6 @@ def switch_widget_chart_type(
 
     warnings: list[str] = []
 
-    # Smart field mapping when switching chart families
     if target in ("kpi", "gauge", "progress"):
         if not spec.get("y_field"):
             if num_fields:
@@ -782,9 +937,7 @@ def switch_widget_chart_type(
         if target in ("kpi", "gauge"):
             spec.pop("x_field", None)
     else:
-        # Needs at least an x_field for categorical/time charts
         if not spec.get("x_field") and spec.get("columns"):
-            # Switching from raw Table -> Bar/Line
             cols = spec["columns"]
             spec["x_field"] = next((c for c in cols if c in dim_fields), cols[0] if cols else None)
             spec["y_field"] = next((c for c in cols if c in num_fields), num_fields[0] if num_fields else "*")
@@ -834,7 +987,7 @@ def switch_widget_chart_type(
         if wq.query_mode == "visual" and spec.get("aggregation") == "RAW" and target != "table":
             spec["aggregation"] = "SUM"
             wq.visual_spec_json = spec
-    cache_manager.invalidate_dashboard(w.dashboard_id)
+    cache_manager.invalidate_dashboard(dash.id)
     db.commit()
 
     return {
@@ -851,9 +1004,18 @@ def switch_widget_chart_type(
 def add_dashboard_filter(
     dashboard_id: str, body: FilterCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dashboard", dashboard_id, "manage_filters")
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    if not permission_resolver.resolve(db, user, "dashboard", dash.id, "manage_filters").allowed:
+        enforce_permission(db, user, "dashboard", dash.id, "edit")
+    if body.dataset_id:
+        get_dataset_for_org(db, body.dataset_id, user.organization_id)
+    if body.page_id:
+        p, pdash = get_page_for_org(db, body.page_id, user.organization_id)
+        if pdash.id != dash.id:
+            raise HTTPException(status_code=400, detail="Page does not belong to dashboard")
+
     df = DashboardFilter(
-        dashboard_id=dashboard_id,
+        dashboard_id=dash.id,
         page_id=body.page_id,
         scope=body.scope,
         name=body.name,
@@ -874,10 +1036,18 @@ def add_dashboard_filter(
 
 @router.delete("/filters/{filter_id}")
 def delete_dashboard_filter(filter_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    df = db.query(DashboardFilter).filter(DashboardFilter.id == filter_id).first()
-    if not df:
+    row = (
+        db.query(DashboardFilter, Dashboard)
+        .join(Dashboard, Dashboard.id == DashboardFilter.dashboard_id)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(DashboardFilter.id == filter_id, Workspace.organization_id == user.organization_id)
+        .first()
+    )
+    if not row:
         raise HTTPException(status_code=404, detail="Filter not found")
-    enforce_permission(db, user, "dashboard", df.dashboard_id, "manage_filters")
+    df, dash = row
+    if not permission_resolver.resolve(db, user, "dashboard", dash.id, "manage_filters").allowed:
+        enforce_permission(db, user, "dashboard", dash.id, "edit")
     db.delete(df)
     db.commit()
     return {"status": "deleted"}
@@ -887,37 +1057,43 @@ def delete_dashboard_filter(filter_id: str, user: User = Depends(get_current_use
 def add_widget_filter(
     widget_id: str, body: WidgetFilterCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    w = db.query(Widget).filter(Widget.id == widget_id).first()
-    if not w:
-        raise HTTPException(status_code=404, detail="Widget not found")
-    parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
+    w, dash = get_widget_for_org(db, widget_id, user.organization_id)
+    parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
     if not permission_resolver.resolve(db, user, "widget", w.id, "change_filter", parent_chain).allowed:
         enforce_permission(db, user, "widget", w.id, "edit", parent_chain)
     wf = WidgetFilter(
-        widget_id=widget_id, field_name=body.field_name, filter_type=body.filter_type,
+        widget_id=w.id, field_name=body.field_name, filter_type=body.filter_type,
         operator=body.operator, value_json={"value": body.value}, is_active=True,
     )
     db.add(wf)
-    cache_manager.invalidate_dashboard(w.dashboard_id)
+    cache_manager.invalidate_dashboard(dash.id)
     db.commit()
     return {"id": wf.id}
 
 
 @router.delete("/widget-filters/{wf_id}")
 def delete_widget_filter(wf_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    wf = db.query(WidgetFilter).filter(WidgetFilter.id == wf_id).first()
-    if not wf:
+    row = (
+        db.query(WidgetFilter, Widget, Dashboard)
+        .join(Widget, Widget.id == WidgetFilter.widget_id)
+        .join(Dashboard, Dashboard.id == Widget.dashboard_id)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(WidgetFilter.id == wf_id, Workspace.organization_id == user.organization_id)
+        .first()
+    )
+    if not row:
         raise HTTPException(status_code=404, detail="Widget filter not found")
-    w = db.query(Widget).filter(Widget.id == wf.widget_id).first()
-    if w:
-        enforce_permission(db, user, "widget", w.id, "edit", [("dashboard", w.dashboard_id)])
-        cache_manager.invalidate_dashboard(w.dashboard_id)
+    wf, w, dash = row
+    parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
+    if not permission_resolver.resolve(db, user, "widget", w.id, "change_filter", parent_chain).allowed:
+        enforce_permission(db, user, "widget", w.id, "edit", parent_chain)
+    cache_manager.invalidate_dashboard(dash.id)
     db.delete(wf)
     db.commit()
     return {"status": "deleted"}
 
 
-# ---------------- WIDGET DATA EXECUTION (WITH CACHE, RLS, CLS, FILTERS, DRILL DOWN) ----------------
+# ---------------- WIDGET DATA EXECUTION ----------------
 def _execute_single_widget(
     db: Session,
     user: User,
@@ -933,9 +1109,15 @@ def _execute_single_widget(
 
     wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
     wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
-    ds = db.query(Dataset).filter(Dataset.id == (wq.dataset_id if wq and wq.dataset_id else w.dataset_id)).first()
+    target_ds_id = wq.dataset_id if wq and wq.dataset_id else w.dataset_id
+    ds = (
+        db.query(Dataset)
+        .filter(Dataset.id == target_ds_id, Dataset.organization_id == user.organization_id)
+        .first()
+        if target_ds_id
+        else None
+    )
 
-    # 1. Resolve Drill Down (and verify Drill RBAC strictly!)
     try:
         drill_info = resolve_drill_state(db, user, w, wdr, drill_stack)
     except PermissionError as exc:
@@ -953,7 +1135,6 @@ def _execute_single_widget(
             details={"level": drill_info["level"], "stack": drill_stack}
         )
 
-    # 2. Scope applicable filters (Global + Dashboard/Page + Excluded/Included Widgets + Widget Filters + Cross Filters + Drill Filters)
     dash_filters_db = db.query(DashboardFilter).filter(DashboardFilter.dashboard_id == w.dashboard_id).all()
     df_meta = {df.id: df for df in dash_filters_db}
 
@@ -962,7 +1143,6 @@ def _execute_single_widget(
         fid = af.get("filter_id")
         meta = df_meta.get(fid) if fid else None
         if meta:
-            # Check page scope if dashboard filter
             if meta.scope == "dashboard" and meta.page_id and meta.page_id != w.page_id:
                 continue
             if meta.excluded_widget_ids and w.id in meta.excluded_widget_ids:
@@ -971,17 +1151,14 @@ def _execute_single_widget(
                 continue
         effective_filters.append(af)
 
-    # Cross filters (exclude the originating widget itself so it doesn't filter itself out unless configured)
     for cf in cross_filters:
         if cf.get("source_widget_id") != w.id:
             effective_filters.append(cf)
 
-    # Widget-isolated filters
     for wf in db.query(WidgetFilter).filter(WidgetFilter.widget_id == w.id, WidgetFilter.is_active == True).all():
         val = wf.value_json.get("value") if isinstance(wf.value_json, dict) and "value" in wf.value_json else wf.value_json
         effective_filters.append({"field_name": wf.field_name, "operator": wf.operator, "value": val, "is_active": True})
 
-    # Drill-down context filters
     effective_filters.extend(drill_info["drill_filters"])
 
     t0 = time.perf_counter()
@@ -991,6 +1168,7 @@ def _execute_single_widget(
             named_params=wq.parameters_json or {},
             filters=effective_filters,
             dashboard_id=w.dashboard_id, widget_id=w.id, use_cache=use_cache,
+            enforce_dataset_rbac=False,
         )
     elif ds:
         sec_ctx = build_data_security_context(db, user, ds.id)
@@ -1074,9 +1252,7 @@ def get_widget_data(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    w = db.query(Widget).filter(Widget.id == widget_id).first()
-    if not w:
-        raise HTTPException(status_code=404, detail="Widget not found")
+    w, _ = get_widget_for_org(db, widget_id, user.organization_id)
     return _execute_single_widget(
         db, user, w, body.active_filters, body.cross_filters, body.drill_stack,
         body.use_cache, ip_address=get_client_ip(request)
@@ -1091,9 +1267,7 @@ def execute_dashboard_batch(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    dash = db.query(Dashboard).filter(Dashboard.id == dashboard_id).first()
-    if not dash:
-        raise HTTPException(status_code=404, detail="Dashboard not found")
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
     if not dash.is_public:
         enforce_permission(db, user, "dashboard", dash.id, "view", ip_address=get_client_ip(request))
 
@@ -1133,11 +1307,14 @@ def execute_dashboard_batch(
     return {"dashboard_id": dash.id, "load_ms": total_ms, "cache_hits": hits, "cache_misses": misses, "widgets": results}
 
 
-# ---------------- DASHBOARD STATE ENGINE (Resume exact filter/drill/page state) ----------------
+# ---------------- DASHBOARD STATE ENGINE ----------------
 @router.get("/{dashboard_id}/state")
 def get_dashboard_state(dashboard_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    if not dash.is_public:
+        enforce_permission(db, user, "dashboard", dash.id, "view")
     st = db.query(DashboardState).filter(
-        DashboardState.dashboard_id == dashboard_id, DashboardState.user_id == user.id
+        DashboardState.dashboard_id == dash.id, DashboardState.user_id == user.id
     ).first()
     if not st:
         return {"active_page_id": None, "filter_state": {}, "drill_state": {}, "widget_overrides": {}}
@@ -1153,11 +1330,14 @@ def get_dashboard_state(dashboard_id: str, user: User = Depends(get_current_user
 def save_dashboard_state(
     dashboard_id: str, body: StateSaveRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    if not dash.is_public:
+        enforce_permission(db, user, "dashboard", dash.id, "view")
     st = db.query(DashboardState).filter(
-        DashboardState.dashboard_id == dashboard_id, DashboardState.user_id == user.id
+        DashboardState.dashboard_id == dash.id, DashboardState.user_id == user.id
     ).first()
     if not st:
-        st = DashboardState(dashboard_id=dashboard_id, user_id=user.id)
+        st = DashboardState(dashboard_id=dash.id, user_id=user.id)
         db.add(st)
     st.active_page_id = body.active_page_id
     st.filter_state_json = body.filter_state
@@ -1170,8 +1350,9 @@ def save_dashboard_state(
 # ---------------- VERSIONING, COMMENTS, TEMPLATES & SHARING ----------------
 @router.get("/{dashboard_id}/versions")
 def list_versions(dashboard_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "dashboard", dashboard_id, "view")
-    vers = db.query(DashboardVersion).filter(DashboardVersion.dashboard_id == dashboard_id).order_by(DashboardVersion.version_number.desc()).all()
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "view")
+    vers = db.query(DashboardVersion).filter(DashboardVersion.dashboard_id == dash.id).order_by(DashboardVersion.version_number.desc()).all()
     return [{"id": v.id, "version_number": v.version_number, "label": v.label, "created_at": v.created_at} for v in vers]
 
 
@@ -1179,15 +1360,13 @@ def list_versions(dashboard_id: str, user: User = Depends(get_current_user), db:
 def create_version(
     dashboard_id: str, body: dict[str, str], user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dashboard", dashboard_id, "edit")
-    dash = db.query(Dashboard).filter(Dashboard.id == dashboard_id).first()
-    if not dash:
-        raise HTTPException(status_code=404, detail="Dashboard not found")
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "edit")
     snap = _serialize_dashboard(db, dash, user)
-    latest = db.query(DashboardVersion).filter(DashboardVersion.dashboard_id == dashboard_id).order_by(DashboardVersion.version_number.desc()).first()
+    latest = db.query(DashboardVersion).filter(DashboardVersion.dashboard_id == dash.id).order_by(DashboardVersion.version_number.desc()).first()
     next_num = (latest.version_number + 1) if latest else 1
     v = DashboardVersion(
-        dashboard_id=dashboard_id, version_number=next_num,
+        dashboard_id=dash.id, version_number=next_num,
         label=body.get("label", f"Snapshot v{next_num}"), snapshot_json=snap, created_by=user.id,
     )
     db.add(v)
@@ -1195,10 +1374,54 @@ def create_version(
     return {"id": v.id, "version_number": v.version_number, "label": v.label}
 
 
+@router.post("/{dashboard_id}/versions/{version_id}/restore")
+def restore_version(
+    dashboard_id: str, version_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "edit")
+    ver = (
+        db.query(DashboardVersion)
+        .filter(DashboardVersion.id == version_id, DashboardVersion.dashboard_id == dash.id)
+        .first()
+    )
+    if not ver:
+        raise HTTPException(status_code=404, detail="Version snapshot not found")
+    snap = ver.snapshot_json or {}
+    if snap.get("title"):
+        dash.title = snap["title"]
+    if snap.get("description") is not None:
+        dash.description = snap["description"]
+    if snap.get("theme_id"):
+        dash.theme_id = snap["theme_id"]
+
+    # Restore widget layouts and configs present in snapshot
+    snap_widgets = {w["id"]: w for w in (snap.get("widgets") or []) if w.get("id")}
+    for w in db.query(Widget).filter(Widget.dashboard_id == dash.id).all():
+        sw = snap_widgets.get(w.id)
+        if not sw:
+            continue
+        w.title = sw.get("title", w.title)
+        w.chart_type = sw.get("chart_type", w.chart_type)
+        lay = sw.get("layout") or {}
+        w.layout_x = int(lay.get("x", w.layout_x))
+        w.layout_y = int(lay.get("y", w.layout_y))
+        w.layout_w = int(lay.get("w", w.layout_w))
+        w.layout_h = int(lay.get("h", w.layout_h))
+        cfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
+        if cfg and sw.get("config"):
+            cfg.style_json = sw["config"].get("style", cfg.style_json)
+            cfg.visualization_json = sw["config"].get("visualization", cfg.visualization_json)
+    cache_manager.invalidate_dashboard(dash.id)
+    db.commit()
+    return {"status": "restored", "version_number": ver.version_number}
+
+
 @router.get("/{dashboard_id}/comments")
 def list_comments(dashboard_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "dashboard", dashboard_id, "view")
-    rows = db.query(DashboardComment).filter(DashboardComment.dashboard_id == dashboard_id).order_by(DashboardComment.created_at.desc()).all()
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "view")
+    rows = db.query(DashboardComment).filter(DashboardComment.dashboard_id == dash.id).order_by(DashboardComment.created_at.desc()).all()
     return [{"id": c.id, "widget_id": c.widget_id, "author_name": c.author_name, "content": c.content, "created_at": c.created_at} for c in rows]
 
 
@@ -1206,9 +1429,10 @@ def list_comments(dashboard_id: str, user: User = Depends(get_current_user), db:
 def add_comment(
     dashboard_id: str, body: dict[str, Optional[str]], user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dashboard", dashboard_id, "view")
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "view")
     c = DashboardComment(
-        dashboard_id=dashboard_id, widget_id=body.get("widget_id"),
+        dashboard_id=dash.id, widget_id=body.get("widget_id"),
         user_id=user.id, author_name=user.profile.full_name if user.profile else user.username,
         content=body.get("content", ""),
     )
@@ -1219,10 +1443,8 @@ def add_comment(
 
 @router.post("/{dashboard_id}/share")
 def generate_share_link(dashboard_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "dashboard", dashboard_id, "share")
-    dash = db.query(Dashboard).filter(Dashboard.id == dashboard_id).first()
-    if not dash:
-        raise HTTPException(status_code=404, detail="Dashboard not found")
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "share")
     if not dash.embed_token:
         dash.embed_token = secrets.token_urlsafe(24)
     dash.is_public = True
@@ -1233,9 +1455,9 @@ def generate_share_link(dashboard_id: str, user: User = Depends(get_current_user
 @router.post("/{dashboard_id}/clone-template")
 def clone_from_template(dashboard_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "dashboard", "*", "add")
-    src = db.query(Dashboard).filter(Dashboard.id == dashboard_id).first()
-    if not src:
-        raise HTTPException(status_code=404, detail="Template not found")
+    src = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    if not src.is_template and not src.is_public:
+        enforce_permission(db, user, "dashboard", src.id, "view")
     nd = Dashboard(
         workspace_id=src.workspace_id, title=f"{src.title} (Workspace Copy)",
         description=src.description, theme_id=src.theme_id, is_template=False, created_by=user.id,

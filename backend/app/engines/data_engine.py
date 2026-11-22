@@ -1,7 +1,8 @@
 import re
 from typing import Any, Optional
 import pandas as pd
-from app.engines.warehouse import warehouse, sanitize_identifier
+from app.core.sql_guard import safe_eval_dataframe_formula, validate_formula_ast
+from app.engines.warehouse import sanitize_identifier, warehouse
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -22,9 +23,7 @@ class FormulaCompiler:
         partition_col: Optional[str] = None,
     ) -> str:
         raw = expr.strip()
-        upper = raw.upper()
 
-        # Normalize "COUNT DISTINCT(col)" -> "COUNT_DISTINCT(col)"
         normalized = re.sub(r"\bCOUNT\s+DISTINCT\s*\(", "COUNT_DISTINCT(", raw, flags=re.IGNORECASE)
 
         def _extract_arg(fn: str) -> Optional[str]:
@@ -88,39 +87,44 @@ class FormulaCompiler:
             )
 
         # Arithmetic combination of SUM/AVG/COUNT calls or direct column arithmetic e.g. SUM(revenue) - SUM(cost)
-        # Validate only safe SQL tokens appear
-        if re.search(r"[;]|(--)|(/\*)|(\bDROP\b|\bDELETE\b|\bUPDATE\b|\bINSERT\b)", upper):
-            raise ValueError(f"Unsafe formula expression: {raw}")
-
-        # Replace COUNT_DISTINCT(x) inside compound formulas
         compiled = re.sub(
             r"COUNT_DISTINCT\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
             r'COUNT(DISTINCT "\1")',
             normalized,
             flags=re.IGNORECASE,
         )
-        # Quote column identifiers inside standard aggregates
         compiled = re.sub(
             r"\b(SUM|AVG|COUNT|MIN|MAX|MEDIAN)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
             lambda m: f'{m.group(1).upper()}("{m.group(2)}")',
             compiled,
             flags=re.IGNORECASE,
         )
+        validate_formula_ast(compiled)
         return compiled
 
 
 class DataProfiler:
-    """Profiles Warehouse datasets and recommends joins, KPIs, and schema insights."""
+    """Profiles Warehouse datasets while respecting RLS/CLS security context."""
 
     @staticmethod
-    def profile_table(table_name: str) -> dict[str, Any]:
+    def profile_table(
+        table_name: str,
+        rls_clauses: Optional[list[str]] = None,
+        rls_params: Optional[list[Any]] = None,
+        hidden_columns: Optional[set[str]] = None,
+    ) -> dict[str, Any]:
         cols_info = warehouse.describe_table(table_name)
-        count_res = warehouse.execute_query(f'SELECT COUNT(*) AS cnt FROM "{table_name}"')
+        where_sql = f"WHERE {' AND '.join(rls_clauses)}" if rls_clauses else ""
+        params = list(rls_params or [])
+        count_res = warehouse.execute_query(f'SELECT COUNT(*) AS cnt FROM "{table_name}" {where_sql}', params)
         row_count = int(count_res["rows"][0]["cnt"]) if count_res["rows"] else 0
 
+        hidden = hidden_columns or set()
         field_stats: list[dict[str, Any]] = []
         for c in cols_info:
             cname = c["column_name"]
+            if cname in hidden:
+                continue
             ctype = c["column_type"].lower()
             is_num = any(k in ctype for k in ("int", "double", "float", "decimal", "hugeint", "bigint"))
             if is_num:
@@ -132,7 +136,7 @@ class DataProfiler:
                         MAX("{cname}") AS max_val,
                         AVG("{cname}") AS avg_val,
                         MEDIAN("{cname}") AS median_val
-                    FROM "{table_name}"
+                    FROM "{table_name}" {where_sql}
                 '''
             else:
                 q = f'''
@@ -143,9 +147,9 @@ class DataProfiler:
                         CAST(MAX("{cname}") AS VARCHAR) AS max_val,
                         NULL AS avg_val,
                         NULL AS median_val
-                    FROM "{table_name}"
+                    FROM "{table_name}" {where_sql}
                 '''
-            stat = warehouse.execute_query(q)["rows"][0]
+            stat = warehouse.execute_query(q, params)["rows"][0]
             field_stats.append(
                 {
                     "field_name": cname,
@@ -166,7 +170,7 @@ class DataProfiler:
         for step in steps:
             if not step.get("is_enabled", True):
                 continue
-            ttype = step.get("transform_type")
+            ttype = step.get("transform_type") or step.get("step_type")
             cfg = step.get("config_json", {})
             if ttype == "rename" and cfg.get("from") in out.columns and cfg.get("to"):
                 out = out.rename(columns={cfg["from"]: sanitize_identifier(cfg["to"])})
@@ -188,11 +192,9 @@ class DataProfiler:
                 elif op == "not_null":
                     out = out[out[col].notna()]
             elif ttype == "calculated" and cfg.get("target_column") and cfg.get("formula"):
-                # Safe arithmetic expressions over columns like "revenue - cost"
                 tcol = sanitize_identifier(cfg["target_column"])
-                formula = str(cfg["formula"])
-                if re.match(r"^[A-Za-z0-9_+\-*/().\s]+$", formula):
-                    out[tcol] = out.eval(formula)
+                formula = str(cfg["formula"]).strip()
+                out[tcol] = safe_eval_dataframe_formula(out, formula)
             elif ttype == "cast" and cfg.get("column") in out.columns:
                 col = cfg["column"]
                 to_t = cfg.get("target_type", "string")

@@ -4,6 +4,12 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.api.deps import enforce_permission, get_client_ip, get_current_user
 from app.core.audit import record_audit
+from app.core.sql_guard import validate_readonly_sql_ast
+from app.core.tenant import (
+    get_data_source_for_org,
+    get_dataset_for_org,
+    get_pipeline_for_org,
+)
 from app.database import get_db
 from app.engines.etl_engine import run_etl_pipeline
 from app.engines.scheduler import get_scheduler_status, sync_scheduler_jobs
@@ -13,7 +19,6 @@ from app.models.etl import (
     EtlCheckpoint,
     EtlError,
     EtlJobRun,
-    EtlMetric,
     EtlPipeline,
     EtlPipelineStep,
     EtlSchedule,
@@ -54,13 +59,50 @@ def etl_monitoring_dashboard(user: User = Depends(get_current_user), db: Session
     sources = db.query(DataSource).filter(DataSource.organization_id == user.organization_id).all()
     datasets = db.query(Dataset).filter(Dataset.organization_id == user.organization_id).all()
     pipelines = db.query(EtlPipeline).filter(EtlPipeline.organization_id == user.organization_id).all()
-    runs = db.query(EtlJobRun).order_by(EtlJobRun.started_at.desc()).limit(30).all()
-    errors = db.query(EtlError).order_by(EtlError.created_at.desc()).limit(20).all()
-    mvs = db.query(MaterializedViewMetadata).all()
 
-    succeeded = db.query(EtlJobRun).filter(EtlJobRun.status == "succeeded").count()
-    failed = db.query(EtlJobRun).filter(EtlJobRun.status == "failed").count()
-    running = db.query(EtlPipeline).filter(EtlPipeline.is_running == True).count()
+    org_pipeline_ids = [p.id for p in pipelines]
+    org_dataset_ids = [d.id for d in datasets]
+
+    if org_pipeline_ids:
+        runs = (
+            db.query(EtlJobRun)
+            .filter(EtlJobRun.pipeline_id.in_(org_pipeline_ids))
+            .order_by(EtlJobRun.started_at.desc())
+            .limit(30)
+            .all()
+        )
+        errors = (
+            db.query(EtlError)
+            .filter(EtlError.pipeline_id.in_(org_pipeline_ids))
+            .order_by(EtlError.created_at.desc())
+            .limit(20)
+            .all()
+        )
+        succeeded = (
+            db.query(EtlJobRun)
+            .filter(EtlJobRun.pipeline_id.in_(org_pipeline_ids), EtlJobRun.status == "succeeded")
+            .count()
+        )
+        failed = (
+            db.query(EtlJobRun)
+            .filter(EtlJobRun.pipeline_id.in_(org_pipeline_ids), EtlJobRun.status == "failed")
+            .count()
+        )
+    else:
+        runs, errors, succeeded, failed = [], [], 0, 0
+
+    mvs = (
+        db.query(MaterializedViewMetadata)
+        .filter(MaterializedViewMetadata.dataset_id.in_(org_dataset_ids))
+        .all()
+        if org_dataset_ids
+        else []
+    )
+    running = (
+        db.query(EtlPipeline)
+        .filter(EtlPipeline.organization_id == user.organization_id, EtlPipeline.is_running == True)
+        .count()
+    )
 
     pl_list = []
     for pl in pipelines:
@@ -148,12 +190,20 @@ def create_pipeline(
     body: PipelineCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     enforce_permission(db, user, "dataset", "*", "edit")
+    src = get_data_source_for_org(db, body.data_source_id, user.organization_id)
+    ds = get_dataset_for_org(db, body.target_dataset_id, user.organization_id)
+    if body.source_query and body.source_query.strip():
+        try:
+            validate_readonly_sql_ast(body.source_query, require_table_allowlist=False)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid source_query: {exc}")
+
     pl = EtlPipeline(
         organization_id=user.organization_id,
         name=body.name,
         description=body.description,
-        data_source_id=body.data_source_id,
-        target_dataset_id=body.target_dataset_id,
+        data_source_id=src.id,
+        target_dataset_id=ds.id,
         extract_mode=body.extract_mode,
         incremental_column=body.incremental_column,
         primary_key_column=body.primary_key_column,
@@ -185,12 +235,13 @@ def trigger_pipeline(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    enforce_permission(db, user, "dataset", "*", "refresh", ip_address=get_client_ip(request))
+    pl = get_pipeline_for_org(db, pipeline_id, user.organization_id)
+    enforce_permission(db, user, "dataset", pl.target_dataset_id, "refresh", ip_address=get_client_ip(request))
     try:
-        res = run_etl_pipeline(db, pipeline_id, trigger_type="manual")
+        res = run_etl_pipeline(db, pl.id, trigger_type="manual")
         record_audit(
             db, user.organization_id, "etl_pipeline_run", "etl_pipeline",
-            resource_id=pipeline_id, user_id=user.id, username=user.username,
+            resource_id=pl.id, user_id=user.id, username=user.username,
             ip_address=get_client_ip(request), details={"status": res.get("status")}
         )
         return res
@@ -202,10 +253,13 @@ def trigger_pipeline(
 def update_pipeline_schedule(
     pipeline_id: str, body: ScheduleUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dataset", "*", "edit")
-    sched = db.query(EtlSchedule).filter(EtlSchedule.pipeline_id == pipeline_id).first()
+    pl = get_pipeline_for_org(db, pipeline_id, user.organization_id)
+    enforce_permission(db, user, "dataset", pl.target_dataset_id, "edit")
+    if body.depends_on_pipeline_id:
+        get_pipeline_for_org(db, body.depends_on_pipeline_id, user.organization_id)
+    sched = db.query(EtlSchedule).filter(EtlSchedule.pipeline_id == pl.id).first()
     if not sched:
-        sched = EtlSchedule(pipeline_id=pipeline_id)
+        sched = EtlSchedule(pipeline_id=pl.id)
         db.add(sched)
     sched.schedule_type = body.schedule_type
     sched.interval_minutes = body.interval_minutes

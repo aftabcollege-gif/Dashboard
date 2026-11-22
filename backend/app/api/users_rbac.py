@@ -4,13 +4,22 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.api.deps import enforce_permission, get_client_ip, get_current_user
+from app.config import settings
 from app.core.audit import record_audit
 from app.core.cache import cache_manager
 from app.core.permissions import permission_resolver
-from app.core.security import encrypt_secret, hash_password
+from app.core.security import encrypt_secret, hash_password, validate_password_strength
+from app.core.tenant import (
+    get_dashboard_for_org,
+    get_dataset_for_org,
+    get_group_for_org,
+    get_role_for_org,
+    get_user_for_org,
+    get_widget_for_org,
+)
 from app.database import get_db
 from app.engines.ad_ldap import ActiveDirectoryEngine, get_mock_directory
-from app.models.dashboard import Dashboard, Widget
+from app.models.dashboard import Dashboard, Widget, Workspace
 from app.models.identity import (
     AccessPolicy,
     DirectoryConnection,
@@ -25,6 +34,7 @@ from app.models.identity import (
     User,
     UserProfile,
     UserRole,
+    UserSession,
 )
 
 router = APIRouter(prefix="/rbac", tags=["Users, RBAC, AD & Security Policies"])
@@ -127,6 +137,42 @@ class MockAdMutateUser(BaseModel):
     create_if_missing: bool = False
 
 
+def _actor_is_super_admin(db: Session, user: User) -> bool:
+    return (
+        db.query(Role)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .filter(UserRole.user_id == user.id, Role.is_super_admin == True)
+        .first()
+        is not None
+    )
+
+
+def _validate_org_roles(db: Session, actor: User, role_ids: list[str]) -> list[Role]:
+    is_super = _actor_is_super_admin(db, actor)
+    out: list[Role] = []
+    for rid in role_ids:
+        r = get_role_for_org(db, rid, actor.organization_id)
+        if r.is_super_admin and not is_super:
+            raise HTTPException(status_code=403, detail="Only a super_admin can assign a super_admin role")
+        out.append(r)
+    return out
+
+
+def _validate_org_groups(db: Session, actor: User, group_ids: list[str]) -> list[Group]:
+    return [get_group_for_org(db, gid, actor.organization_id) for gid in group_ids]
+
+
+def _revoke_user_sessions(db: Session, user_id: str) -> None:
+    db.query(UserSession).filter(UserSession.user_id == user_id, UserSession.is_revoked == False).update(
+        {"is_revoked": True}
+    )
+
+
+def _invalidate_org_caches(db: Session, org_id: str) -> None:
+    permission_resolver.bump_org_versions(db, org_id)
+    cache_manager.invalidate_org(org_id)
+
+
 # ---------------- USERS ----------------
 @router.get("/users")
 def list_users(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -160,8 +206,13 @@ def create_user(
     body: UserCreate, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     enforce_permission(db, user, "admin", "*", "add", ip_address=get_client_ip(request))
+    validate_password_strength(body.password)
+
     if db.query(User).filter((User.username == body.username) | (User.email == body.email)).first():
         raise HTTPException(status_code=400, detail="Username or email already exists")
+
+    valid_roles = _validate_org_roles(db, user, body.role_ids)
+    valid_groups = _validate_org_groups(db, user, body.group_ids)
 
     u = User(
         organization_id=user.organization_id,
@@ -183,18 +234,18 @@ def create_user(
             job_title=body.job_title,
         )
     )
-    for rid in body.role_ids:
-        db.add(UserRole(user_id=u.id, role_id=rid))
-    for gid in body.group_ids:
-        db.add(GroupMember(group_id=gid, user_id=u.id))
+    for r in valid_roles:
+        db.add(UserRole(user_id=u.id, role_id=r.id))
+    for g in valid_groups:
+        db.add(GroupMember(group_id=g.id, user_id=u.id))
 
     record_audit(
         db, user.organization_id, "user_created", "user", resource_id=u.id,
         user_id=user.id, username=user.username, ip_address=get_client_ip(request),
-        after_state={"username": u.username, "roles": body.role_ids}
+        after_state={"username": u.username, "roles": [r.id for r in valid_roles]}
     )
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
-    permission_resolver.invalidate_all()
     return {"id": u.id, "username": u.username}
 
 
@@ -207,9 +258,14 @@ def update_user(
     db: Session = Depends(get_db),
 ):
     enforce_permission(db, user, "admin", "*", "edit", ip_address=get_client_ip(request))
-    target = db.query(User).filter(User.id == target_user_id, User.organization_id == user.organization_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
+    target = get_user_for_org(db, target_user_id, user.organization_id)
+    if _actor_is_super_admin(db, target) and not _actor_is_super_admin(db, user):
+        raise HTTPException(status_code=403, detail="Only a super_admin can modify a super_admin user")
+    if target.id == user.id and body.is_active is False:
+        raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
+
+    valid_roles = _validate_org_roles(db, user, body.role_ids) if body.role_ids is not None else None
+    valid_groups = _validate_org_groups(db, user, body.group_ids) if body.group_ids is not None else None
 
     before = {"is_active": target.is_active, "is_locked": target.is_locked, "email": target.email}
     if body.email is not None:
@@ -224,7 +280,12 @@ def update_user(
     if body.expires_at is not None:
         target.expires_at = body.expires_at
     if body.reset_password and target.auth_source == "local":
+        validate_password_strength(body.reset_password)
         target.password_hash = hash_password(body.reset_password)
+        _revoke_user_sessions(db, target.id)
+    if target.is_active is False or target.is_locked is True:
+        _revoke_user_sessions(db, target.id)
+
     if target.profile:
         if body.full_name is not None:
             target.profile.full_name = body.full_name
@@ -237,14 +298,14 @@ def update_user(
         if body.job_title is not None:
             target.profile.job_title = body.job_title
 
-    if body.role_ids is not None:
+    if valid_roles is not None:
         db.query(UserRole).filter(UserRole.user_id == target.id).delete()
-        for rid in body.role_ids:
-            db.add(UserRole(user_id=target.id, role_id=rid))
-    if body.group_ids is not None:
+        for r in valid_roles:
+            db.add(UserRole(user_id=target.id, role_id=r.id))
+    if valid_groups is not None:
         db.query(GroupMember).filter(GroupMember.user_id == target.id).delete()
-        for gid in body.group_ids:
-            db.add(GroupMember(group_id=gid, user_id=target.id))
+        for g in valid_groups:
+            db.add(GroupMember(group_id=g.id, user_id=target.id))
 
     target.permission_version += 1
     record_audit(
@@ -252,9 +313,8 @@ def update_user(
         user_id=user.id, username=user.username, ip_address=get_client_ip(request),
         before_state=before, after_state={"is_active": target.is_active, "is_locked": target.is_locked}
     )
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
-    permission_resolver.invalidate_all()
-    cache_manager.invalidate_all()
     return {"status": "updated"}
 
 
@@ -265,16 +325,17 @@ def delete_user(
     enforce_permission(db, user, "admin", "*", "delete", ip_address=get_client_ip(request))
     if target_user_id == user.id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
-    target = db.query(User).filter(User.id == target_user_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
+    target = get_user_for_org(db, target_user_id, user.organization_id)
+    if _actor_is_super_admin(db, target) and not _actor_is_super_admin(db, user):
+        raise HTTPException(status_code=403, detail="Only a super_admin can delete a super_admin user")
+    _revoke_user_sessions(db, target.id)
     db.delete(target)
     record_audit(
         db, user.organization_id, "user_deleted", "user", resource_id=target_user_id,
         user_id=user.id, username=user.username, ip_address=get_client_ip(request)
     )
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
-    permission_resolver.invalidate_all()
     return {"status": "deleted"}
 
 
@@ -297,12 +358,17 @@ def list_roles(user: User = Depends(get_current_user), db: Session = Depends(get
 @router.post("/roles")
 def create_role(body: RoleCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "add")
+    if body.slug.strip().lower() == "super_admin":
+        raise HTTPException(status_code=403, detail="Cannot create a super_admin role")
+    if db.query(Role).filter(Role.organization_id == user.organization_id, Role.slug == body.slug).first():
+        raise HTTPException(status_code=400, detail="Role slug already exists in organization")
     r = Role(organization_id=user.organization_id, name=body.name, slug=body.slug, description=body.description)
     db.add(r)
     db.flush()
     for pid in body.permission_ids:
-        db.add(RolePermission(role_id=r.id, permission_id=pid, effect="allow"))
-    permission_resolver.bump_org_versions(db, user.organization_id)
+        if db.query(Permission).filter(Permission.id == pid).first():
+            db.add(RolePermission(role_id=r.id, permission_id=pid, effect="allow"))
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"id": r.id, "name": r.name}
 
@@ -310,31 +376,32 @@ def create_role(body: RoleCreate, user: User = Depends(get_current_user), db: Se
 @router.put("/roles/{role_id}")
 def update_role(role_id: str, body: RoleCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "edit")
-    r = db.query(Role).filter(Role.id == role_id).first()
-    if not r:
-        raise HTTPException(status_code=404, detail="Role not found")
+    r = get_role_for_org(db, role_id, user.organization_id)
+    if r.is_super_admin and not _actor_is_super_admin(db, user):
+        raise HTTPException(status_code=403, detail="Only a super_admin can edit a super_admin role")
     r.name = body.name
     r.description = body.description
     db.query(RolePermission).filter(RolePermission.role_id == r.id).delete()
     for pid in body.permission_ids:
-        db.add(RolePermission(role_id=r.id, permission_id=pid, effect="allow"))
-    permission_resolver.bump_org_versions(db, user.organization_id)
+        if db.query(Permission).filter(Permission.id == pid).first():
+            db.add(RolePermission(role_id=r.id, permission_id=pid, effect="allow"))
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
-    cache_manager.invalidate_all()
     return {"status": "updated"}
 
 
 @router.post("/roles/{role_id}/clone")
 def clone_role(role_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "add")
-    src = db.query(Role).filter(Role.id == role_id).first()
-    if not src:
-        raise HTTPException(status_code=404, detail="Role not found")
+    src = get_role_for_org(db, role_id, user.organization_id)
+    if src.is_super_admin and not _actor_is_super_admin(db, user):
+        raise HTTPException(status_code=403, detail="Only a super_admin can clone a super_admin role")
     nr = Role(
         organization_id=user.organization_id,
         name=f"{src.name} (Copy)",
         slug=f"{src.slug}_copy_{int(datetime.now().timestamp())}",
         description=src.description,
+        is_super_admin=False,
     )
     db.add(nr)
     db.flush()
@@ -359,14 +426,16 @@ def list_groups(user: User = Depends(get_current_user), db: Session = Depends(ge
 @router.post("/groups")
 def create_group(body: GroupCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "add")
+    valid_roles = _validate_org_roles(db, user, body.role_ids)
+    valid_users = [get_user_for_org(db, uid, user.organization_id) for uid in body.member_user_ids]
     g = Group(organization_id=user.organization_id, name=body.name, description=body.description, source="local")
     db.add(g)
     db.flush()
-    for rid in body.role_ids:
-        db.add(GroupRole(group_id=g.id, role_id=rid))
-    for uid in body.member_user_ids:
-        db.add(GroupMember(group_id=g.id, user_id=uid))
-    permission_resolver.bump_org_versions(db, user.organization_id)
+    for r in valid_roles:
+        db.add(GroupRole(group_id=g.id, role_id=r.id))
+    for u in valid_users:
+        db.add(GroupMember(group_id=g.id, user_id=u.id))
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"id": g.id, "name": g.name}
 
@@ -374,20 +443,19 @@ def create_group(body: GroupCreate, user: User = Depends(get_current_user), db: 
 @router.put("/groups/{group_id}")
 def update_group(group_id: str, body: GroupCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "edit")
-    g = db.query(Group).filter(Group.id == group_id).first()
-    if not g:
-        raise HTTPException(status_code=404, detail="Group not found")
+    g = get_group_for_org(db, group_id, user.organization_id)
+    valid_roles = _validate_org_roles(db, user, body.role_ids)
+    valid_users = [get_user_for_org(db, uid, user.organization_id) for uid in body.member_user_ids]
     g.name = body.name
     g.description = body.description
     db.query(GroupRole).filter(GroupRole.group_id == g.id).delete()
     db.query(GroupMember).filter(GroupMember.group_id == g.id).delete()
-    for rid in body.role_ids:
-        db.add(GroupRole(group_id=g.id, role_id=rid))
-    for uid in body.member_user_ids:
-        db.add(GroupMember(group_id=g.id, user_id=uid))
-    permission_resolver.bump_org_versions(db, user.organization_id)
+    for r in valid_roles:
+        db.add(GroupRole(group_id=g.id, role_id=r.id))
+    for u in valid_users:
+        db.add(GroupMember(group_id=g.id, user_id=u.id))
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
-    cache_manager.invalidate_all()
     return {"status": "updated"}
 
 
@@ -400,8 +468,18 @@ def get_permission_matrix(user: User = Depends(get_current_user), db: Session = 
         .filter(ResourcePermission.organization_id == user.organization_id)
         .all()
     )
-    dashboards = db.query(Dashboard).all()
-    widgets = db.query(Widget).all()
+    dashboards = (
+        db.query(Dashboard)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(Workspace.organization_id == user.organization_id)
+        .all()
+    )
+    dash_ids = [d.id for d in dashboards]
+    widgets = (
+        db.query(Widget).filter(Widget.dashboard_id.in_(dash_ids)).all()
+        if dash_ids
+        else []
+    )
     return {
         "rules": [
             {
@@ -421,6 +499,19 @@ def get_permission_matrix(user: User = Depends(get_current_user), db: Session = 
     }
 
 
+def _validate_matrix_subject(db: Session, actor: User, subject_type: str, subject_id: str) -> None:
+    if subject_type == "user":
+        get_user_for_org(db, subject_id, actor.organization_id)
+    elif subject_type == "group":
+        get_group_for_org(db, subject_id, actor.organization_id)
+    elif subject_type == "role":
+        r = get_role_for_org(db, subject_id, actor.organization_id)
+        if r.is_super_admin and not _actor_is_super_admin(db, actor):
+            raise HTTPException(status_code=403, detail="Only a super_admin can edit super_admin rules")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid subject_type")
+
+
 @router.put("/permissions/matrix/set")
 def set_matrix_permission(
     body: MatrixPermissionSet,
@@ -429,6 +520,15 @@ def set_matrix_permission(
     db: Session = Depends(get_db),
 ):
     enforce_permission(db, user, "admin", "*", "edit", ip_address=get_client_ip(request))
+    _validate_matrix_subject(db, user, body.subject_type, body.subject_id)
+    if body.resource_id != "*":
+        if body.resource_type == "dashboard":
+            get_dashboard_for_org(db, body.resource_id, user.organization_id)
+        elif body.resource_type in ("widget", "drill_down"):
+            get_widget_for_org(db, body.resource_id, user.organization_id)
+        elif body.resource_type == "dataset":
+            get_dataset_for_org(db, body.resource_id, user.organization_id)
+
     existing = (
         db.query(ResourcePermission)
         .filter(
@@ -469,8 +569,7 @@ def set_matrix_permission(
             )
         after = {"effect": body.effect}
 
-    permission_resolver.bump_org_versions(db, user.organization_id)
-    cache_manager.invalidate_all()
+    _invalidate_org_caches(db, user.organization_id)
     record_audit(
         db, user.organization_id, "permission_changed", body.resource_type,
         resource_id=body.resource_id, user_id=user.id, username=user.username,
@@ -486,6 +585,9 @@ def copy_matrix_permissions(
     body: MatrixBulkCopy, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     enforce_permission(db, user, "admin", "*", "edit")
+    _validate_matrix_subject(db, user, body.from_subject_type, body.from_subject_id)
+    _validate_matrix_subject(db, user, body.to_subject_type, body.to_subject_id)
+
     src_rules = (
         db.query(ResourcePermission)
         .filter(
@@ -500,6 +602,7 @@ def copy_matrix_permissions(
         dup = (
             db.query(ResourcePermission)
             .filter(
+                ResourcePermission.organization_id == user.organization_id,
                 ResourcePermission.subject_type == body.to_subject_type,
                 ResourcePermission.subject_id == body.to_subject_id,
                 ResourcePermission.resource_type == sr.resource_type,
@@ -525,8 +628,7 @@ def copy_matrix_permissions(
                 )
             )
         copied += 1
-    permission_resolver.bump_org_versions(db, user.organization_id)
-    cache_manager.invalidate_all()
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"copied": copied}
 
@@ -536,9 +638,7 @@ def get_effective_permissions(
     target_user_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     enforce_permission(db, user, "admin", "*", "view")
-    target = db.query(User).filter(User.id == target_user_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
+    target = get_user_for_org(db, target_user_id, user.organization_id)
     return permission_resolver.get_effective_permissions_summary(db, target)
 
 
@@ -562,6 +662,10 @@ def create_access_policy(
     body: AccessPolicyCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     enforce_permission(db, user, "admin", "*", "add")
+    if body.dataset_id:
+        get_dataset_for_org(db, body.dataset_id, user.organization_id)
+    if body.target_type != "all" and body.target_id:
+        _validate_matrix_subject(db, user, body.target_type, body.target_id)
     pol = AccessPolicy(
         organization_id=user.organization_id,
         name=body.name,
@@ -574,20 +678,24 @@ def create_access_policy(
         is_active=body.is_active,
     )
     db.add(pol)
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
-    cache_manager.invalidate_all()
     return {"id": pol.id, "name": pol.name}
 
 
 @router.delete("/policies/{policy_id}")
 def delete_access_policy(policy_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "delete")
-    pol = db.query(AccessPolicy).filter(AccessPolicy.id == policy_id).first()
+    pol = (
+        db.query(AccessPolicy)
+        .filter(AccessPolicy.id == policy_id, AccessPolicy.organization_id == user.organization_id)
+        .first()
+    )
     if not pol:
         raise HTTPException(status_code=404, detail="Policy not found")
     db.delete(pol)
+    _invalidate_org_caches(db, user.organization_id)
     db.commit()
-    cache_manager.invalidate_all()
     return {"status": "deleted"}
 
 
@@ -596,7 +704,16 @@ def delete_access_policy(policy_id: str, user: User = Depends(get_current_user),
 def list_ad_connections(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "view")
     rows = db.query(DirectoryConnection).filter(DirectoryConnection.organization_id == user.organization_id).all()
-    jobs = db.query(DirectorySyncJob).order_by(DirectorySyncJob.started_at.desc()).limit(20).all()
+    conn_ids = [c.id for c in rows]
+    jobs = (
+        db.query(DirectorySyncJob)
+        .filter(DirectorySyncJob.directory_connection_id.in_(conn_ids))
+        .order_by(DirectorySyncJob.started_at.desc())
+        .limit(20)
+        .all()
+        if conn_ids
+        else []
+    )
     return {
         "connections": [
             {
@@ -644,7 +761,11 @@ def create_ad_connection(body: DirectoryCreate, user: User = Depends(get_current
 @router.post("/ad/connections/{conn_id}/test")
 def test_ad_connection(conn_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "view")
-    dc = db.query(DirectoryConnection).filter(DirectoryConnection.id == conn_id).first()
+    dc = (
+        db.query(DirectoryConnection)
+        .filter(DirectoryConnection.id == conn_id, DirectoryConnection.organization_id == user.organization_id)
+        .first()
+    )
     if not dc:
         raise HTTPException(status_code=404, detail="AD connection not found")
     return ActiveDirectoryEngine.test_connection(dc)
@@ -655,7 +776,11 @@ def search_ad_directory(
     conn_id: str, q: str = "", user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     enforce_permission(db, user, "admin", "*", "view")
-    dc = db.query(DirectoryConnection).filter(DirectoryConnection.id == conn_id).first()
+    dc = (
+        db.query(DirectoryConnection)
+        .filter(DirectoryConnection.id == conn_id, DirectoryConnection.organization_id == user.organization_id)
+        .first()
+    )
     if not dc:
         raise HTTPException(status_code=404, detail="AD connection not found")
     return ActiveDirectoryEngine.search_directory(dc, q)
@@ -666,15 +791,21 @@ def sync_ad_directory(
     conn_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     enforce_permission(db, user, "admin", "*", "edit", ip_address=get_client_ip(request))
-    dc = db.query(DirectoryConnection).filter(DirectoryConnection.id == conn_id).first()
+    dc = (
+        db.query(DirectoryConnection)
+        .filter(DirectoryConnection.id == conn_id, DirectoryConnection.organization_id == user.organization_id)
+        .first()
+    )
     if not dc:
         raise HTTPException(status_code=404, detail="AD connection not found")
     res = ActiveDirectoryEngine.sync_directory(db, dc, sync_type="manual")
+    _invalidate_org_caches(db, user.organization_id)
     record_audit(
         db, user.organization_id, "ad_group_sync", "directory_connection",
         resource_id=dc.id, user_id=user.id, username=user.username,
         ip_address=get_client_ip(request), details=res
     )
+    db.commit()
     return res
 
 
@@ -682,7 +813,9 @@ def sync_ad_directory(
 def mutate_mock_ad_user(
     body: MockAdMutateUser, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    """Allows admin & automated tests to simulate AD user changes/disablement in the embedded AD provider."""
+    """Allows admin & automated tests to simulate AD user changes/disablement in dev/test only."""
+    if settings.ENVIRONMENT not in ("development", "test"):
+        raise HTTPException(status_code=404, detail="Endpoint not found")
     enforce_permission(db, user, "admin", "*", "edit")
     ad_dir = get_mock_directory(body.domain_name)
     for u in ad_dir["users"]:

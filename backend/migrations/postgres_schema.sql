@@ -59,6 +59,20 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id              VARCHAR(64) PRIMARY KEY,
+    user_id         VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    jti             VARCHAR(128) NOT NULL UNIQUE,
+    ip_address      VARCHAR(64),
+    user_agent      VARCHAR(300),
+    is_revoked      BOOLEAN NOT NULL DEFAULT FALSE,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id, is_revoked);
+
 CREATE TABLE IF NOT EXISTS identity_providers (
     id              VARCHAR(64) PRIMARY KEY,
     organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -416,6 +430,32 @@ CREATE TABLE IF NOT EXISTS dashboard_versions (
     UNIQUE (dashboard_id, version_number)
 );
 
+CREATE TABLE IF NOT EXISTS dashboard_comments (
+    id              VARCHAR(64) PRIMARY KEY,
+    dashboard_id    VARCHAR(64) NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+    widget_id       VARCHAR(64),
+    user_id         VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    author_name     VARCHAR(150) NOT NULL,
+    content         TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dashboard_comments_dash ON dashboard_comments(dashboard_id, created_at);
+
+CREATE TABLE IF NOT EXISTS dashboard_states (
+    id                      VARCHAR(64) PRIMARY KEY,
+    dashboard_id            VARCHAR(64) NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+    user_id                 VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    active_page_id          VARCHAR(64),
+    filter_state_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    drill_state_json        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    widget_overrides_json   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (dashboard_id, user_id)
+);
+
 -- =============================================================================
 -- 3. DATA MANAGEMENT & SEMANTIC LAYER
 -- =============================================================================
@@ -491,6 +531,21 @@ CREATE TABLE IF NOT EXISTS dataset_relationships (
     cardinality     VARCHAR(24) NOT NULL DEFAULT 'many_to_one',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS semantic_metrics (
+    id              VARCHAR(64) PRIMARY KEY,
+    organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    dataset_id      VARCHAR(64) NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    name            VARCHAR(160) NOT NULL,
+    slug            VARCHAR(120) NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    formula         TEXT NOT NULL,
+    format_type     VARCHAR(32) NOT NULL DEFAULT 'number',
+    unit            VARCHAR(32) NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (organization_id, slug)
 );
 
 CREATE TABLE IF NOT EXISTS queries (
@@ -658,6 +713,21 @@ CREATE TABLE IF NOT EXISTS etl_metrics (
     throughput_rows_sec DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scheduled_reports (
+    id              VARCHAR(64) PRIMARY KEY,
+    organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    dashboard_id    VARCHAR(64) NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+    name            VARCHAR(180) NOT NULL,
+    format          VARCHAR(16) NOT NULL DEFAULT 'pdf', -- pdf|xlsx|csv
+    cron_expression VARCHAR(120) NOT NULL DEFAULT '0 8 * * 1',
+    recipients_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    is_enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+    last_sent_at    TIMESTAMPTZ,
+    last_file_path  TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- =============================================================================

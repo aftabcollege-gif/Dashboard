@@ -1,6 +1,7 @@
 import re
 from datetime import date, timedelta
 from typing import Any, Optional
+from app.core.sql_guard import validate_filter_expression_ast
 from app.engines.warehouse import warehouse
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -13,10 +14,6 @@ def compile_filters_to_sql(
     """
     Advanced Filtering Engine Compiler (Section 7).
     Compiles Global, Dashboard, Widget, and Cross filters into parameterized DuckDB SQL.
-    Returns:
-      where_clauses: list[str]
-      params: list[Any]
-      top_n: Optional[dict] (for Top N / Bottom N / Ranking)
     """
     where_clauses: list[str] = []
     params: list[Any] = []
@@ -42,7 +39,6 @@ def compile_filters_to_sql(
 
         col_sql = f'"{field}"'
 
-        # Null checks don't require value
         if op == "is_null":
             where_clauses.append(f"{col_sql} IS NULL")
             continue
@@ -50,7 +46,6 @@ def compile_filters_to_sql(
             where_clauses.append(f"{col_sql} IS NOT NULL")
             continue
 
-        # Skip unset/empty filters cleanly
         if val is None or val == "" or (isinstance(val, list) and len(val) == 0):
             continue
 
@@ -96,7 +91,6 @@ def compile_filters_to_sql(
                 where_clauses.append(f"{col_sql} <= ?")
                 params.append(high)
         elif op == "relative_date":
-            # e.g. last_7_days, last_30_days, last_90_days, last_365_days, ytd, mtd
             today = date.today()
             mode = str(val).lower()
             start_d: Optional[date] = None
@@ -134,10 +128,8 @@ def compile_filters_to_sql(
                 "field": order_metric or field,
             }
         elif op == "custom_expression":
-            expr = str(val).strip()
-            # Strict validation: allow safe column comparisons without DDL/DML/subqueries
-            if not re.search(r"[;]|(--)|(/\*)|(\bDROP\b|\bDELETE\b|\bUPDATE\b|\bINSERT\b|\bUNION\b)", expr.upper()):
-                where_clauses.append(f"({expr})")
+            expr = validate_filter_expression_ast(str(val), allowed_columns=available_columns)
+            where_clauses.append(f"({expr})")
 
     return {"where_clauses": where_clauses, "params": params, "top_n": top_n_spec}
 
@@ -154,7 +146,13 @@ def get_cascading_filter_options(
     if not IDENT_RE.match(warehouse_table) or not IDENT_RE.match(field_name):
         raise ValueError("Invalid table or field identifier")
 
-    compiled = compile_filters_to_sql(parent_filters)
+    bounded_limit = max(1, min(int(limit), 1000))
+    cols_meta = warehouse.describe_table(warehouse_table)
+    avail = {c["column_name"] for c in cols_meta}
+    if field_name not in avail:
+        raise ValueError("Field not found in dataset")
+
+    compiled = compile_filters_to_sql(parent_filters, available_columns=avail)
     where_parts = list(rls_clauses) + list(compiled["where_clauses"])
     params = list(rls_params) + list(compiled["params"])
 
@@ -165,7 +163,7 @@ def get_cascading_filter_options(
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     sql = (
         f'SELECT DISTINCT "{field_name}" AS val FROM "{warehouse_table}" '
-        f"{where_sql} ORDER BY 1 ASC LIMIT {int(limit)}"
+        f"{where_sql} ORDER BY 1 ASC LIMIT {bounded_limit}"
     )
-    res = warehouse.execute_query(sql, params, limit=limit)
+    res = warehouse.execute_query(sql, params, limit=bounded_limit)
     return [r["val"] for r in res["rows"] if r["val"] is not None]
