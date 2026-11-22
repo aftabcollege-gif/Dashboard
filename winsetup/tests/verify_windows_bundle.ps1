@@ -46,6 +46,22 @@ Write-Host "=== 2. Launching bundled backend + frontend gateway with stripped PA
 $origPath = $env:PATH
 $backendProc = $null
 $gatewayProc = $null
+$beOut = Join-Path $TestDataRoot "backend_out.log"
+$beErr = Join-Path $TestDataRoot "backend_err.log"
+$gwOut = Join-Path $TestDataRoot "gateway_out.log"
+$gwErr = Join-Path $TestDataRoot "gateway_err.log"
+
+$savedEnvVars = @{}
+$tempEnvNames = @(
+    "ENVIRONMENT", "BI_DATA_DIR", "BI_SEED_DEMO_USERS", "BI_REQUIRE_GENERATED_SECRETS",
+    "BI_JWT_SECRET", "BI_CRED_KEY", "BI_INITIAL_SETUP_TOKEN", "BI_DESKTOP_CONTROL_TOKEN",
+    "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE",
+    "NODE_ENV", "HOSTNAME", "PORT", "NEXT_INTERNAL_PORT", "BACKEND_INTERNAL_URL",
+    "STANDALONE_DIR", "GATEWAY_CONTROL_TOKEN"
+)
+foreach ($k in $tempEnvNames) {
+    $savedEnvVars[$k] = [Environment]::GetEnvironmentVariable($k, "Process")
+}
 
 try {
     New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
@@ -82,6 +98,7 @@ try {
     $badPsi.EnvironmentVariables["PYTHONNOUSERSITE"] = "1"
     $badPsi.EnvironmentVariables["PYTHONDONTWRITEBYTECODE"] = "1"
     $badProc = [System.Diagnostics.Process]::Start($badPsi)
+    $badErr = $badProc.StandardError.ReadToEnd()
     $badProc.WaitForExit()
     if ($badProc.ExitCode -eq 0) {
         throw "Security check failed: backend allowed startup without generated secrets!"
@@ -112,40 +129,35 @@ try {
     }
     Write-Host "[ok] Bundled Alembic migration completed cleanly."
 
-    # Start real bundled backend
-    $pyPsi = New-Object System.Diagnostics.ProcessStartInfo
-    $pyPsi.FileName = $pyExe
-    $pyPsi.Arguments = "-m uvicorn app.main:app --host 127.0.0.1 --port $backendPort"
-    $pyPsi.WorkingDirectory = (Join-Path $InstallDir "backend")
-    $pyPsi.UseShellExecute = $false
-    $pyPsi.CreateNoWindow = $true
-    $pyPsi.EnvironmentVariables["ENVIRONMENT"] = "production"
-    $pyPsi.EnvironmentVariables["BI_DATA_DIR"] = $DataDir
-    $pyPsi.EnvironmentVariables["BI_SEED_DEMO_USERS"] = "0"
-    $pyPsi.EnvironmentVariables["BI_REQUIRE_GENERATED_SECRETS"] = "1"
-    $pyPsi.EnvironmentVariables["BI_JWT_SECRET"] = $jwtSecret
-    $pyPsi.EnvironmentVariables["BI_CRED_KEY"] = $credKey
-    $pyPsi.EnvironmentVariables["BI_INITIAL_SETUP_TOKEN"] = $setupTok
-    $pyPsi.EnvironmentVariables["BI_DESKTOP_CONTROL_TOKEN"] = $ctrlTok
-    $pyPsi.EnvironmentVariables["PYTHONNOUSERSITE"] = "1"
-    $pyPsi.EnvironmentVariables["PYTHONDONTWRITEBYTECODE"] = "1"
-    $backendProc = [System.Diagnostics.Process]::Start($pyPsi)
+    # Start real bundled backend + gateway with file-redirected logs (no pipe deadlock)
+    $env:ENVIRONMENT = "production"
+    $env:BI_DATA_DIR = $DataDir
+    $env:BI_SEED_DEMO_USERS = "0"
+    $env:BI_REQUIRE_GENERATED_SECRETS = "1"
+    $env:BI_JWT_SECRET = $jwtSecret
+    $env:BI_CRED_KEY = $credKey
+    $env:BI_INITIAL_SETUP_TOKEN = $setupTok
+    $env:BI_DESKTOP_CONTROL_TOKEN = $ctrlTok
+    $env:PYTHONNOUSERSITE = "1"
+    $env:PYTHONDONTWRITEBYTECODE = "1"
+    $backendProc = Start-Process -FilePath $pyExe `
+        -ArgumentList @("-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "$backendPort") `
+        -WorkingDirectory (Join-Path $InstallDir "backend") `
+        -RedirectStandardOutput $beOut -RedirectStandardError $beErr `
+        -NoNewWindow -PassThru
 
-    # Start real bundled Node.js gateway + Next.js standalone
-    $nodePsi = New-Object System.Diagnostics.ProcessStartInfo
-    $nodePsi.FileName = $nodeExe
-    $nodePsi.Arguments = "`"$gatewayJs`""
-    $nodePsi.WorkingDirectory = $standaloneDir
-    $nodePsi.UseShellExecute = $false
-    $nodePsi.CreateNoWindow = $true
-    $nodePsi.EnvironmentVariables["NODE_ENV"] = "production"
-    $nodePsi.EnvironmentVariables["HOSTNAME"] = "127.0.0.1"
-    $nodePsi.EnvironmentVariables["PORT"] = "$uiPort"
-    $nodePsi.EnvironmentVariables["NEXT_INTERNAL_PORT"] = "$nextPort"
-    $nodePsi.EnvironmentVariables["BACKEND_INTERNAL_URL"] = "http://127.0.0.1:$backendPort"
-    $nodePsi.EnvironmentVariables["STANDALONE_DIR"] = $standaloneDir
-    $nodePsi.EnvironmentVariables["GATEWAY_CONTROL_TOKEN"] = $ctrlTok
-    $gatewayProc = [System.Diagnostics.Process]::Start($nodePsi)
+    $env:NODE_ENV = "production"
+    $env:HOSTNAME = "127.0.0.1"
+    $env:PORT = "$uiPort"
+    $env:NEXT_INTERNAL_PORT = "$nextPort"
+    $env:BACKEND_INTERNAL_URL = "http://127.0.0.1:$backendPort"
+    $env:STANDALONE_DIR = $standaloneDir
+    $env:GATEWAY_CONTROL_TOKEN = $ctrlTok
+    $gatewayProc = Start-Process -FilePath $nodeExe `
+        -ArgumentList @("`"$gatewayJs`"") `
+        -WorkingDirectory $standaloneDir `
+        -RedirectStandardOutput $gwOut -RedirectStandardError $gwErr `
+        -NoNewWindow -PassThru
 
     $baseUrl = "http://127.0.0.1:$uiPort"
     $healthy = $false
@@ -226,27 +238,43 @@ try {
     Invoke-RestMethod -Uri "$baseUrl/__gateway/shutdown" -Method POST -Headers @{ "X-Gateway-Token" = $ctrlTok } | Out-Null
     Invoke-RestMethod -Uri "http://127.0.0.1:$backendPort/_internal/shutdown" -Method POST -Headers @{ "X-Desktop-Control-Token" = $ctrlTok } | Out-Null
     Start-Sleep -Seconds 2
+    if ($gatewayProc -and -not $gatewayProc.HasExited) { & taskkill /PID $gatewayProc.Id /T /F 2>$null | Out-Null }
+    if ($backendProc -and -not $backendProc.HasExited) { & taskkill /PID $backendProc.Id /T /F 2>$null | Out-Null }
+
+    if (-not (Test-Path (Join-Path $DataDir "app_metadata.db"))) { throw "SQLite DB missing in BI_DATA_DIR" }
+    if (-not (Test-Path (Join-Path $DataDir "warehouse.duckdb"))) { throw "DuckDB warehouse missing in BI_DATA_DIR" }
+    if (@(Get-ChildItem -Path (Join-Path $DataDir "uploads") -File -Recurse).Count -lt 1) { throw "Uploaded CSV missing in BI_DATA_DIR\uploads" }
+
+    Write-Host "=== 4. Running silent uninstall and verifying user data is preserved ==="
+    $unins = Join-Path $InstallDir "unins000.exe"
+    $uProc = Start-Process -FilePath $unins -ArgumentList "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES" -Wait -PassThru
+    if ($uProc.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uProc.ExitCode)" }
+
+    if (Test-Path (Join-Path $InstallDir "NexusBI.exe")) {
+        throw "Uninstall did not remove NexusBI.exe from $InstallDir"
+    }
+    if (-not (Test-Path (Join-Path $DataDir "app_metadata.db")) -or -not (Test-Path (Join-Path $DataDir "warehouse.duckdb"))) {
+        throw "Uninstall accidentally deleted preserved user databases!"
+    }
+}
+catch {
+    $errLine = $_.InvocationInfo.ScriptLineNumber
+    $errMsg = $_.Exception.Message
+    $beTail = if (Test-Path $beErr) { ((Get-Content $beErr -Tail 25 -ErrorAction SilentlyContinue) -join " | ") } else { "" }
+    $beOutTail = if (Test-Path $beOut) { ((Get-Content $beOut -Tail 15 -ErrorAction SilentlyContinue) -join " | ") } else { "" }
+    $gwTail = if (Test-Path $gwErr) { ((Get-Content $gwErr -Tail 20 -ErrorAction SilentlyContinue) -join " | ") } else { "" }
+    $summary = ("verify_windows_bundle failed at line {0}: {1} || beErr: {2} || beOut: {3} || gwErr: {4}" -f $errLine, $errMsg, $beTail, $beOutTail, $gwTail) -replace "[\r\n]+", " "
+    if ($summary.Length -gt 3500) { $summary = $summary.Substring(0, 3500) }
+    Write-Host "::error::$summary"
+    throw
 }
 finally {
     $env:PATH = $origPath
+    foreach ($k in $tempEnvNames) {
+        [Environment]::SetEnvironmentVariable($k, $savedEnvVars[$k], "Process")
+    }
     if ($gatewayProc -and -not $gatewayProc.HasExited) { & taskkill /PID $gatewayProc.Id /T /F 2>$null | Out-Null }
     if ($backendProc -and -not $backendProc.HasExited) { & taskkill /PID $backendProc.Id /T /F 2>$null | Out-Null }
-}
-
-if (-not (Test-Path (Join-Path $DataDir "app_metadata.db"))) { throw "SQLite DB missing in BI_DATA_DIR" }
-if (-not (Test-Path (Join-Path $DataDir "warehouse.duckdb"))) { throw "DuckDB warehouse missing in BI_DATA_DIR" }
-if (@(Get-ChildItem -Path (Join-Path $DataDir "uploads") -File -Recurse).Count -lt 1) { throw "Uploaded CSV missing in BI_DATA_DIR\uploads" }
-
-Write-Host "=== 4. Running silent uninstall and verifying user data is preserved ==="
-$unins = Join-Path $InstallDir "unins000.exe"
-$uProc = Start-Process -FilePath $unins -ArgumentList "/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES" -Wait -PassThru
-if ($uProc.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uProc.ExitCode)" }
-
-if (Test-Path (Join-Path $InstallDir "NexusBI.exe")) {
-    throw "Uninstall did not remove NexusBI.exe from $InstallDir"
-}
-if (-not (Test-Path (Join-Path $DataDir "app_metadata.db")) -or -not (Test-Path (Join-Path $DataDir "warehouse.duckdb"))) {
-    throw "Uninstall accidentally deleted preserved user databases!"
 }
 
 Remove-Item -Path $TestDataRoot -Recurse -Force -ErrorAction SilentlyContinue
