@@ -1356,6 +1356,13 @@ def _execute_single_widget(
         if target_ds_id
         else None
     )
+    if ds:
+        ds_dec = permission_resolver.resolve(db, user, "dataset", ds.id, "view")
+        if not ds_dec.allowed and ds_dec.reason.startswith("explicit_deny"):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Permission denied for dataset '{ds.name}' ({ds_dec.reason})",
+            )
 
     try:
         drill_info = resolve_drill_state(db, user, w, wdr, drill_stack)

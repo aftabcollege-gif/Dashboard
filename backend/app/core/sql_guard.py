@@ -180,29 +180,32 @@ def _walk_scoped(
     node: exp.Expression,
     active_ctes: frozenset[str],
     referenced_tables: set[str],
+    protected_tables: frozenset[str] = frozenset(),
 ) -> None:
     _validate_node_rules(node, active_ctes, referenced_tables)
 
     # Handle CTE scopes lexically so CTE aliases only shadow subsequent CTEs
     # and the body of their own query, never their own non-recursive definition
-    # nor sibling/outer queries.
+    # nor sibling/outer queries. Also forbid CTE aliases that shadow physical tables.
     with_node = node.args.get("with_") if hasattr(node, "args") else None
     child_scope = set(active_ctes)
     if isinstance(with_node, exp.With):
         is_recursive = bool(with_node.args.get("recursive"))
         for cte in with_node.expressions:
             alias = (cte.alias_or_name or "").strip().lower()
+            if alias and alias in protected_tables:
+                raise ValueError(f"CTE alias '{cte.alias_or_name}' cannot shadow a registered table")
             cte_body = cte.this
             if cte_body is not None:
                 if is_recursive and alias and isinstance(cte_body, exp.Union):
                     # Base term (left) cannot shadow physical table; recursive term (right) may reference alias
                     if cte_body.left is not None:
-                        _walk_scoped(cte_body.left, frozenset(child_scope), referenced_tables)
+                        _walk_scoped(cte_body.left, frozenset(child_scope), referenced_tables, protected_tables)
                     rec_scope = frozenset(child_scope | {alias})
                     if cte_body.right is not None:
-                        _walk_scoped(cte_body.right, rec_scope, referenced_tables)
+                        _walk_scoped(cte_body.right, rec_scope, referenced_tables, protected_tables)
                 else:
-                    _walk_scoped(cte_body, frozenset(child_scope), referenced_tables)
+                    _walk_scoped(cte_body, frozenset(child_scope), referenced_tables, protected_tables)
             if alias:
                 child_scope.add(alias)
 
@@ -211,20 +214,23 @@ def _walk_scoped(
         if key == "with_" or val is None:
             continue
         if isinstance(val, exp.Expression):
-            _walk_scoped(val, frozen_child, referenced_tables)
+            _walk_scoped(val, frozen_child, referenced_tables, protected_tables)
         elif isinstance(val, list):
             for item in val:
                 if isinstance(item, exp.Expression):
-                    _walk_scoped(item, frozen_child, referenced_tables)
+                    _walk_scoped(item, frozen_child, referenced_tables, protected_tables)
 
 
-def _validate_ast_tree(tree: exp.Expression) -> set[str]:
+def _validate_ast_tree(
+    tree: exp.Expression,
+    protected_tables: frozenset[str] = frozenset(),
+) -> set[str]:
     allowed_roots = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
     if not isinstance(tree, allowed_roots):
         raise ValueError(f"Only read-only SELECT queries are allowed (got {type(tree).__name__})")
 
     referenced_tables: set[str] = set()
-    _walk_scoped(tree, frozenset(), referenced_tables)
+    _walk_scoped(tree, frozenset(), referenced_tables, protected_tables)
     return referenced_tables
 
 
@@ -260,6 +266,7 @@ def validate_readonly_sql_ast(
     sql: str,
     *,
     allowed_tables: Optional[Iterable[str]] = None,
+    protected_tables: Optional[Iterable[str]] = None,
     dialect: str = "duckdb",
     require_table_allowlist: bool = False,
 ) -> set[str]:
@@ -287,8 +294,13 @@ def validate_readonly_sql_ast(
     if len(statements) != 1:
         raise ValueError("Only a single SELECT statement is allowed")
 
+    protected_set = frozenset(
+        t.strip().lower()
+        for t in list(allowed_tables or []) + list(protected_tables or [])
+        if t and t.strip()
+    )
     tree = statements[0]
-    referenced = _validate_ast_tree(tree)
+    referenced = _validate_ast_tree(tree, protected_tables=protected_set)
 
     stripped_literals = re.sub(r"'(?:''|[^'])*'", "''", cleaned)
     if FORBIDDEN_RAW_PATTERNS.search(stripped_literals):

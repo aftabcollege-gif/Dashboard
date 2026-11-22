@@ -370,7 +370,6 @@ def execute_dataset_sql(
     """
     cleaned_sql = (sql_text or "").strip().rstrip(";")
     bound_sql, bound_params = _bind_named_params(cleaned_sql, named_params or {})
-    referenced_tables = validate_readonly_sql_ast(bound_sql, dialect="duckdb")
 
     if dataset and dataset.organization_id != user.organization_id:
         raise PermissionError("Dataset belongs to another organization")
@@ -378,6 +377,11 @@ def execute_dataset_sql(
     # Resolve ONLY datasets owned by the caller's organization; unregistered physical tables are strictly forbidden
     org_datasets = db.query(Dataset).filter(Dataset.organization_id == user.organization_id).all()
     by_table_org = {d.warehouse_table.lower(): d for d in org_datasets if d.warehouse_table}
+    referenced_tables = validate_readonly_sql_ast(
+        bound_sql,
+        dialect="duckdb",
+        protected_tables=by_table_org.keys(),
+    )
 
     referenced_datasets: list[Dataset] = []
     seen_ds_ids: set[str] = set()
