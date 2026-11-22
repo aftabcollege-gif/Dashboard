@@ -107,6 +107,15 @@ def main() -> None:
             "GATEWAY_CONTROL_TOKEN": ctrl_token,
         }
 
+        mig_check = subprocess.run(
+            [PYTHON_EXE, "-m", "app.db_migrate"],
+            cwd=str(BACKEND_DIR),
+            env=py_env,
+            capture_output=True,
+            text=True,
+        )
+        assert mig_check.returncode == 0, f"Alembic migration failed:\n{mig_check.stdout}\n{mig_check.stderr}"
+
         backend_proc = subprocess.Popen(
             [PYTHON_EXE, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(backend_port)],
             cwd=str(BACKEND_DIR),

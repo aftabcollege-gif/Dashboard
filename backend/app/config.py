@@ -94,6 +94,7 @@ class Settings(BaseSettings):
     BI_REQUIRE_GENERATED_SECRETS: bool = _env_bool(
         "BI_REQUIRE_GENERATED_SECRETS", _ENV_NAME == "production"
     )
+    AUTO_CREATE_SCHEMA: bool = _env_bool("BI_AUTO_CREATE_SCHEMA", _ENV_NAME != "production")
     BI_INITIAL_SETUP_TOKEN: str | None = os.environ.get("BI_INITIAL_SETUP_TOKEN") or None
     BI_REQUIRE_ADMIN_MFA_IN_PROD: bool = _env_bool("BI_REQUIRE_ADMIN_MFA_IN_PROD", False)
 

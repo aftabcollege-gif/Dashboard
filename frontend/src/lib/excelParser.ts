@@ -1,4 +1,4 @@
-import * as XLSX from "xlsx";
+import readXlsxFile from "read-excel-file/universal";
 
 export interface ParsedExcelColumn {
   field_name: string;
@@ -107,7 +107,66 @@ function makeUniqueFieldName(rawHeader: string, idx: number, used: Set<string>):
   return candidate;
 }
 
-export function parseSpreadsheetBuffer(
+function parseDelimitedText(text: string, forcedDelimiter?: string): string[][] {
+  const cleaned = text.replace(/^\uFEFF/, "");
+  const firstLine = cleaned.split(/\r?\n/, 1)[0] || "";
+  const delimiter =
+    forcedDelimiter ||
+    (firstLine.includes("\t")
+      ? "\t"
+      : firstLine.split(";").length > firstLine.split(",").length
+      ? ";"
+      : ",");
+
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (cleaned[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === delimiter) {
+      row.push(field);
+      field = "";
+    } else if (ch === "\r") {
+      if (cleaned[i + 1] === "\n") i++;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (ch === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += ch;
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+export async function parseSpreadsheetBuffer(
   buffer: ArrayBuffer | Uint8Array,
   filename: string,
   options: {
@@ -118,7 +177,7 @@ export function parseSpreadsheetBuffer(
     columnRenames?: Record<string, string>;
     typeOverrides?: Record<string, string>;
   } = {}
-): ParsedExcelResult {
+): Promise<ParsedExcelResult> {
   const ext = (filename.split(".").pop() || "").toLowerCase();
   const hasHeader = options.hasHeader !== false;
   const nullStrategy = options.nullStrategy || "keep";
@@ -140,14 +199,25 @@ export function parseSpreadsheetBuffer(
     }
     sheets = ["JSON"];
     selectedSheet = "JSON";
+  } else if (ext === "csv" || ext === "tsv" || ext === "txt") {
+    const text = new TextDecoder("utf-8").decode(buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer));
+    rawMatrix = parseDelimitedText(text, ext === "tsv" ? "\t" : undefined);
+    sheets = [ext.toUpperCase()];
+    selectedSheet = ext.toUpperCase();
+  } else if (ext === "xls") {
+    throw new Error(
+      "Legacy binary .xls files require server-side upload or saving as .xlsx/.csv in browser preview mode."
+    );
   } else {
-    const wb = XLSX.read(buffer, { type: "array", cellDates: true, raw: false });
-    sheets = wb.SheetNames || [];
-    selectedSheet = selectedSheet && sheets.includes(selectedSheet) ? selectedSheet : sheets[0] || "";
-    const ws = selectedSheet ? wb.Sheets[selectedSheet] : undefined;
-    if (ws) {
-      rawMatrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" }) as any[][];
-    }
+    const inputBuffer = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const parsedSheets = await readXlsxFile(inputBuffer);
+    sheets = parsedSheets.map((s) => s.sheet);
+    const targetSheet =
+      (selectedSheet ? parsedSheets.find((s) => s.sheet === selectedSheet) : undefined) || parsedSheets[0];
+    selectedSheet = targetSheet?.sheet || "";
+    rawMatrix = (targetSheet?.data || []).map((row) =>
+      row.map((cell) => (cell === null || cell === undefined ? "" : cell))
+    );
   }
 
   // Filter completely empty trailing/leading rows
@@ -167,7 +237,7 @@ export function parseSpreadsheetBuffer(
 
   const maxCols = rawMatrix.reduce((mx, r) => Math.max(mx, r.length), 0);
   const headerRow = hasHeader
-    ? rawMatrix[0].map((v, i) => String(v ?? "").trim() || `ستون ${i + 1}`)
+    ? Array.from({ length: maxCols }, (_, i) => String(rawMatrix[0][i] ?? "").trim() || `ستون ${i + 1}`)
     : Array.from({ length: maxCols }, (_, i) => `ستون ${i + 1}`);
   const dataMatrix = hasHeader ? rawMatrix.slice(1) : rawMatrix;
 
@@ -189,7 +259,7 @@ export function parseSpreadsheetBuffer(
       } else if (typeof val === "string") {
         val = val.trim();
       }
-      obj[c.fieldName] = val === undefined ? "" : val;
+      obj[c.fieldName] = val === undefined || val === null ? "" : val;
     }
     return obj;
   });

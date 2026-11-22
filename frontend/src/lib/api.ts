@@ -84,7 +84,7 @@ async function handleClientDemoFileUpload(path: string, fd: FormData): Promise<a
     if (typeof t === "string" && t) typeOverrides = JSON.parse(t);
   } catch { /* ignore */ }
 
-  const parsed = parseSpreadsheetBuffer(buf, fileEntry.name, {
+  const parsed = await parseSpreadsheetBuffer(buf, fileEntry.name, {
     sheetName: (fd.get("sheet_name") as string) || undefined,
     hasHeader: String(fd.get("has_header") ?? "true") !== "false",
     nullStrategy: (fd.get("null_strategy") as string) || "keep",

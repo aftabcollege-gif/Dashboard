@@ -473,6 +473,41 @@ namespace NexusBILauncher
                 _backendLogWriter = OpenRotatingLog("backend.log");
                 _gatewayLogWriter = OpenRotatingLog("frontend.log");
 
+                _splash.UpdateStatus("Preparing analytical database schema...");
+                var migInfo = new ProcessStartInfo
+                {
+                    FileName = pythonExe,
+                    Arguments = "-m app.db_migrate",
+                    WorkingDirectory = backendDir,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                migInfo.EnvironmentVariables["ENVIRONMENT"] = "production";
+                migInfo.EnvironmentVariables["BI_DATA_DIR"] = _dataDir;
+                migInfo.EnvironmentVariables["BI_SEED_DEMO_USERS"] = "0";
+                migInfo.EnvironmentVariables["BI_REQUIRE_GENERATED_SECRETS"] = "1";
+                migInfo.EnvironmentVariables["BI_JWT_SECRET"] = secrets.JwtSecret;
+                migInfo.EnvironmentVariables["BI_CRED_KEY"] = secrets.CredKey;
+                migInfo.EnvironmentVariables["PYTHONNOUSERSITE"] = "1";
+                migInfo.EnvironmentVariables["PYTHONDONTWRITEBYTECODE"] = "1";
+                migInfo.EnvironmentVariables["PYTHONUTF8"] = "1";
+                migInfo.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";
+                using (var migProc = Process.Start(migInfo))
+                {
+                    string migOut = migProc.StandardOutput.ReadToEnd() + "\n" + migProc.StandardError.ReadToEnd();
+                    migProc.WaitForExit();
+                    if (_backendLogWriter != null && !string.IsNullOrWhiteSpace(migOut))
+                    {
+                        _backendLogWriter.WriteLine(migOut.Trim());
+                    }
+                    if (migProc.ExitCode != 0)
+                    {
+                        throw new Exception("Database schema migration failed: " + migOut);
+                    }
+                }
+
                 _splash.UpdateStatus("Starting analytical warehouse & BI API service...");
                 var pyInfo = new ProcessStartInfo
                 {

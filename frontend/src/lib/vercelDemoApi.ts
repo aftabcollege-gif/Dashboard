@@ -1974,7 +1974,7 @@ export async function handleVercelDemoApi(
     try {
       if (body.type_overrides_json) typeOverrides = JSON.parse(String(body.type_overrides_json));
     } catch { /* ignore */ }
-    const parsed = parseSpreadsheetBuffer(f.buffer, f.name, {
+    const parsed = await parseSpreadsheetBuffer(f.buffer, f.name, {
       sheetName: body.sheet_name || undefined,
       hasHeader: String(body.has_header ?? "true") !== "false",
       nullStrategy: body.null_strategy || "keep",

@@ -1,0 +1,79 @@
+# Local Development & Demo Compose Stack (NEVER use in production)
+# Launch with: docker compose -f docker-compose.dev.yml up --build
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bi_dev_db
+    environment:
+      POSTGRES_USER: bi_dev
+      POSTGRES_PASSWORD: dev_only_postgres_password
+      POSTGRES_DB: bi_platform_dev
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pg_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bi_dev -d bi_platform_dev"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: bi_dev_redis
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    container_name: bi_dev_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: development
+      BI_SEED_DEMO_USERS: "true"
+      BI_REQUIRE_GENERATED_SECRETS: "false"
+      BI_AUTO_CREATE_SCHEMA: "true"
+      DATABASE_URL: postgresql+psycopg2://bi_dev:dev_only_postgres_password@postgres:5432/bi_platform_dev
+      REDIS_URL: redis://redis:6379/0
+      WAREHOUSE_DUCKDB_PATH: /app/data/warehouse.duckdb
+      UPLOAD_DIR: /app/uploads
+      EXPORT_DIR: /app/exports
+      BI_COOKIE_SECURE: "false"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - bi_dev_warehouse:/app/data
+      - bi_dev_uploads:/app/uploads
+      - bi_dev_exports:/app/exports
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        BACKEND_INTERNAL_URL: http://backend:8000
+    container_name: bi_dev_frontend
+    depends_on:
+      - backend
+    environment:
+      NODE_ENV: production
+      BACKEND_INTERNAL_URL: http://backend:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  pg_dev_data:
+  bi_dev_warehouse:
+  bi_dev_uploads:
+  bi_dev_exports:

@@ -88,6 +88,30 @@ try {
     }
     Write-Host "[ok] Refused startup with default dev secrets in production mode."
 
+    # Run Alembic database migrations prior to starting production backend
+    $migPsi = New-Object System.Diagnostics.ProcessStartInfo
+    $migPsi.FileName = $pyExe
+    $migPsi.Arguments = "-m app.db_migrate"
+    $migPsi.WorkingDirectory = (Join-Path $InstallDir "backend")
+    $migPsi.UseShellExecute = $false
+    $migPsi.RedirectStandardOutput = $true
+    $migPsi.RedirectStandardError = $true
+    $migPsi.EnvironmentVariables["ENVIRONMENT"] = "production"
+    $migPsi.EnvironmentVariables["BI_DATA_DIR"] = $DataDir
+    $migPsi.EnvironmentVariables["BI_SEED_DEMO_USERS"] = "0"
+    $migPsi.EnvironmentVariables["BI_REQUIRE_GENERATED_SECRETS"] = "1"
+    $migPsi.EnvironmentVariables["BI_JWT_SECRET"] = $jwtSecret
+    $migPsi.EnvironmentVariables["BI_CRED_KEY"] = $credKey
+    $migPsi.EnvironmentVariables["PYTHONNOUSERSITE"] = "1"
+    $migPsi.EnvironmentVariables["PYTHONDONTWRITEBYTECODE"] = "1"
+    $migProc = [System.Diagnostics.Process]::Start($migPsi)
+    $migOut = $migProc.StandardOutput.ReadToEnd() + "`n" + $migProc.StandardError.ReadToEnd()
+    $migProc.WaitForExit()
+    if ($migProc.ExitCode -ne 0) {
+        throw "Bundled Alembic migration failed: $migOut"
+    }
+    Write-Host "[ok] Bundled Alembic migration completed cleanly."
+
     # Start real bundled backend
     $pyPsi = New-Object System.Diagnostics.ProcessStartInfo
     $pyPsi.FileName = $pyExe

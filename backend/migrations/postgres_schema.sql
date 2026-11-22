@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS external_identities (
     synced_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (provider_type, external_id)
+    CONSTRAINT uq_ext_conn_provider_id UNIQUE (directory_connection_id, provider_type, external_id)
 );
 
 CREATE TABLE IF NOT EXISTS directory_sync_jobs (

@@ -5,6 +5,7 @@ import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect as sa_inspect
 from app.api import (
     ai,
     auth,
@@ -30,8 +31,15 @@ from app.seed.bootstrap import seed_database
 async def lifespan(app: FastAPI):
     # Enforce secret & data directory checks before booting
     settings.validate_runtime_security()
-    # Ensure all Layer 1 metadata tables exist
-    Base.metadata.create_all(bind=engine)
+    # In non-production (or explicit BI_AUTO_CREATE_SCHEMA=1), ensure Layer 1 tables exist.
+    # Production deployments must run `alembic upgrade head` prior to booting workers.
+    if settings.AUTO_CREATE_SCHEMA:
+        Base.metadata.create_all(bind=engine)
+    elif not sa_inspect(engine).has_table("organizations"):
+        raise RuntimeError(
+            "Database schema is not initialized for production startup. "
+            "Run 'alembic upgrade head' before starting the server."
+        )
     # Seed enterprise roles, themes & (in dev/demo mode) demo accounts + dashboards
     with db_session_scope() as db:
         seed_database(db)

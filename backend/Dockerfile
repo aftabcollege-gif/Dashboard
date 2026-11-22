@@ -13,11 +13,17 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY alembic.ini ./alembic.ini
+COPY alembic ./alembic
 COPY migrations ./migrations
 
-RUN mkdir -p /app/data /app/uploads /app/exports
+RUN groupadd --system appgroup && useradd --system --gid appgroup --home /app --shell /usr/sbin/nologin appuser \
+    && mkdir -p /app/data /app/uploads /app/exports \
+    && chown -R appuser:appgroup /app
+
+USER appuser
 
 EXPOSE 8000
 
-# Single worker prevents DuckDB write-lock contention and duplicate APScheduler/in-memory rate-limit runs.
+# Single worker prevents DuckDB write-lock contention; leader election guards scheduler if scaled.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
