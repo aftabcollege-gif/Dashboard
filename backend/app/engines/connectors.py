@@ -120,8 +120,8 @@ def parse_file_to_preview(
         )
         if not has_header:
             df.columns = [f"col_{i+1}" for i in range(len(df.columns))]
-    elif ext == ".csv":
-        df = pd.read_csv(io.BytesIO(file_bytes), header=0 if has_header else None)
+    elif ext in (".csv", ".tsv"):
+        df = pd.read_csv(io.BytesIO(file_bytes), sep="\t" if ext == ".tsv" else ",", header=0 if has_header else None)
         if not has_header:
             df.columns = [f"col_{i+1}" for i in range(len(df.columns))]
     elif ext == ".json":
@@ -190,15 +190,26 @@ def parse_file_to_preview(
     if deduplicate and duplicate_count > 0:
         df = df.drop_duplicates().reset_index(drop=True)
 
-    # Auto-parse date-like strings
+    # Auto-parse Persian/Arabic numerals & comma-formatted numbers and date-like strings
+    persian_digits = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
     for col in df.columns:
-        if df[col].dtype == object:
-            sample = df[col].dropna().astype(str).head(20)
+        if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
+            sample = df[col].dropna().astype(str).head(30)
             if len(sample) > 0 and sample.str.match(r"^\d{4}-\d{2}-\d{2}").all():
                 try:
                     df[col] = pd.to_datetime(df[col], errors="coerce")
                 except Exception:
                     pass
+                continue
+            if len(sample) > 0:
+                norm_sample = sample.str.translate(persian_digits).str.replace(r"[,،\s]", "", regex=True).str.strip()
+                if norm_sample.str.match(r"^-?\d+(\.\d+)?$").all():
+                    converted = pd.to_numeric(
+                        df[col].astype(str).str.translate(persian_digits).str.replace(r"[,،\s]", "", regex=True),
+                        errors="coerce",
+                    )
+                    if not converted.dropna().empty:
+                        df[col] = converted
 
     # Apply type overrides
     if type_overrides:

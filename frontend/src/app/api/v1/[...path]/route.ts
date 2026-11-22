@@ -36,6 +36,25 @@ async function handle(
       } catch {
         body = null;
       }
+    } else if (contentType.includes("multipart/form-data")) {
+      try {
+        const fd = await req.formData();
+        const fileEntry = fd.get("file");
+        const parsedObj: Record<string, any> = {};
+        fd.forEach((v, k) => {
+          if (k !== "file" && typeof v === "string") parsedObj[k] = v;
+        });
+        if (fileEntry && typeof (fileEntry as any).arrayBuffer === "function") {
+          const f = fileEntry as File;
+          parsedObj.__file = {
+            name: f.name || "upload.xlsx",
+            buffer: await f.arrayBuffer(),
+          };
+        }
+        body = parsedObj;
+      } catch {
+        body = null;
+      }
     }
   }
 

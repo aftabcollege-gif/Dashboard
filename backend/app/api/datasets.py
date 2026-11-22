@@ -80,6 +80,7 @@ def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(
             "row_count": d.row_count,
             "last_refreshed_at": d.last_refreshed_at,
             "freshness_status": d.freshness_status,
+            "is_uploaded_excel": bool(d.warehouse_table and d.warehouse_table.startswith("wh_file_")),
             "fields": [
                 {
                     "id": f.id, "field_name": f.field_name, "display_name": f.display_name,
@@ -266,3 +267,17 @@ def add_transformation(
     db.add(tr)
     db.commit()
     return {"id": tr.id, "step_order": tr.step_order}
+
+
+@router.delete("/{dataset_id}")
+def delete_dataset(dataset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    enforce_permission(db, user, "dataset", dataset_id, "edit")
+    ds = db.query(Dataset).filter(Dataset.id == dataset_id, Dataset.organization_id == user.organization_id).first()
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    db.query(DatasetField).filter(DatasetField.dataset_id == ds.id).delete()
+    db.query(DataTransformation).filter(DataTransformation.dataset_id == ds.id).delete()
+    db.delete(ds)
+    db.commit()
+    return {"status": "deleted"}
+

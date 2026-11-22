@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -232,7 +233,8 @@ async def import_uploaded_file_dataset(
     ext = os.path.splitext(fname.lower())[1].lstrip(".")
 
     # Persist raw uploaded file in workspace uploads dir
-    safe_fname = f"{int(datetime.now().timestamp())}_{sanitize_identifier(fname)}.{ext}"
+    safe_stem = re.sub(r"_+", "_", sanitize_identifier(os.path.splitext(fname)[0])).strip("_") or "upload"
+    safe_fname = f"{int(datetime.now().timestamp())}_{safe_stem}.{ext}"
     saved_path = os.path.join(settings.UPLOADS_DIR, safe_fname)
     with open(saved_path, "wb") as f:
         f.write(content)
@@ -265,7 +267,8 @@ async def import_uploaded_file_dataset(
     db.add(src)
     db.flush()
 
-    wh_table = f"wh_file_{sanitize_identifier(dataset_name)}_{int(datetime.now().timestamp()) % 100000}"
+    clean_slug = re.sub(r"_+", "_", sanitize_identifier(dataset_name)).strip("_") or "excel"
+    wh_table = f"wh_file_{clean_slug}_{int(datetime.now().timestamp()) % 100000}"
     load_stats = warehouse.load_dataframe(wh_table, parsed["dataframe"], mode="replace")
 
     ds = Dataset(

@@ -1,10 +1,35 @@
 import rawDemoData from "@/lib/vercelDemoData.json";
+import { parseSpreadsheetBuffer } from "@/lib/excelParser";
 
 const demoData = rawDemoData as any;
 
 type Row = Record<string, any>;
 
-function getTableForDataset(datasetId?: string | null): { tableName: string; rows: Row[]; columns: string[] } {
+function getExtraDatasets(body?: any): any[] {
+  if (Array.isArray(body?.demo_uploaded_datasets)) return body.demo_uploaded_datasets;
+  if (Array.isArray(body?.demo_context?.uploaded_datasets)) return body.demo_context.uploaded_datasets;
+  return [];
+}
+
+function getEffectiveDatasets(extraDatasets: any[] = []): any[] {
+  const base: any[] = demoData.datasets || [];
+  if (!extraDatasets.length) return base;
+  const ids = new Set(extraDatasets.map((d) => d.id));
+  return [...extraDatasets, ...base.filter((b) => !ids.has(b.id))];
+}
+
+function getTableForDataset(
+  datasetId?: string | null,
+  extraDatasets: any[] = []
+): { tableName: string; rows: Row[]; columns: string[] } {
+  const extraHit = extraDatasets.find((d: any) => d.id === datasetId);
+  if (extraHit) {
+    return {
+      tableName: extraHit.warehouse_table || extraHit.id,
+      rows: (extraHit.rows || []) as Row[],
+      columns: (extraHit.columns || (extraHit.fields || []).map((f: any) => f.field_name)) as string[],
+    };
+  }
   const ds = (demoData.datasets || []).find((d: any) => d.id === datasetId);
   const tableName = ds?.warehouse_table || "wh_enterprise_sales";
   const tbl = demoData.tables?.[tableName] || demoData.tables?.wh_enterprise_sales;
@@ -84,9 +109,10 @@ function executeVisualSpec(
   username: string | null,
   filters: any[] = [],
   overrideDimension: string | null = null,
-  rawMode = false
+  rawMode = false,
+  extraDatasets: any[] = []
 ) {
-  const { rows: allRows, columns: tableCols } = getTableForDataset(datasetId);
+  const { rows: allRows, columns: tableCols } = getTableForDataset(datasetId, extraDatasets);
   const filtered = applyRlsAndFilters(allRows, username, filters);
   const agg = String(spec?.aggregation || "SUM").toUpperCase();
   const limit = Number(spec?.limit || 200);
@@ -165,7 +191,8 @@ function executeWidgetForDemo(
   username: string | null,
   activeFilters: any[] = [],
   crossFilters: any[] = [],
-  drillStack: any[] = []
+  drillStack: any[] = [],
+  extraDatasets: any[] = []
 ) {
   const drillRule = widget.drill_rule;
   const hierarchy = drillRule?.hierarchy || [];
@@ -205,7 +232,7 @@ function executeWidgetForDemo(
   ];
 
   const spec = widget.query?.visual_spec || {};
-  const res = executeVisualSpec(widget.dataset_id, spec, username, combinedFilters, effectiveDim, isRaw);
+  const res = executeVisualSpec(widget.dataset_id, spec, username, combinedFilters, effectiveDim, isRaw, extraDatasets);
 
   return {
     widget_id: widget.id,
@@ -228,13 +255,16 @@ function executeWidgetForDemo(
   };
 }
 
-function executeSimpleDemoSql(sqlText: string, username: string | null) {
+function executeSimpleDemoSql(sqlText: string, username: string | null, extraDatasets: any[] = []) {
   const text = (sqlText || "").trim();
   const fromMatch = text.match(/\bFROM\s+([A-Za-z0-9_]+)/i);
   const tableName = fromMatch ? fromMatch[1] : "wh_enterprise_sales";
-  const tbl = demoData.tables?.[tableName];
+  const extraMatch = extraDatasets.find((d: any) => d.warehouse_table === tableName || d.id === tableName);
+  const tbl = extraMatch
+    ? { rows: extraMatch.rows || [], columns: extraMatch.columns || (extraMatch.fields || []).map((f: any) => f.field_name) }
+    : demoData.tables?.[tableName];
   if (!tbl) {
-    return { status: 400, body: { detail: `Demo table '${tableName}' not found. Available: wh_enterprise_sales, wh_enterprise_expenses, wh_hr_workforce` } };
+    return { status: 400, body: { detail: `Demo table '${tableName}' not found.` } };
   }
 
   let rows: Row[] = applyRlsAndFilters(tbl.rows || [], username, []);
@@ -442,6 +472,20 @@ function getDemoDatasetSchema(ds: any) {
         .map((c: any) => c.name),
     };
   }
+  if (ds?.fields?.length && (!demoData.tables?.[ds.warehouse_table] || ds.is_uploaded_excel)) {
+    const colsInfo = ds.fields.map((f: any) => ({
+      name: String(f.field_name),
+      label: normalizeFaText(f.display_name || String(f.field_name).replace(/_/g, " ")),
+      role: f.semantic_role || (["integer", "float"].includes(f.data_type) ? "measure" : f.data_type === "date" ? "time" : "dimension"),
+    }));
+    return {
+      colsInfo,
+      numCols: colsInfo.filter((c: any) => c.role === "measure").map((c: any) => c.name),
+      dimCols: colsInfo
+        .filter((c: any) => c.role !== "measure" && !c.name.endsWith("_id") && c.name !== "id")
+        .map((c: any) => c.name),
+    };
+  }
   const tbl = demoData.tables?.[ds.warehouse_table] || { columns: [], rows: [] };
   const sample = tbl.rows?.[0] || {};
   const fieldMetaMap = new Map<string, any>();
@@ -540,7 +584,8 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
   const rawPrompt = String(body?.prompt || "").trim();
   const freeReply = normalizeFaText(String(clar.free_text || "").trim());
   const norm = normalizeFaText(rawPrompt);
-  const datasets: any[] = demoData.datasets || [];
+  const extraDatasets = getExtraDatasets(body);
+  const datasets: any[] = getEffectiveDatasets(extraDatasets);
 
   if (datasets.length === 0) {
     return {
@@ -768,16 +813,18 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
   const effChart = chartType || "bar";
   const effAgg = agg || (yField === "*" ? "COUNT" : "SUM");
   const effY = yField || "*";
+  const xLbl = xField ? (colsInfo.find((c: any) => c.name === xField)?.label || xField) : "";
+  const yLbl = effY === "*" ? "تعداد" : (colsInfo.find((c: any) => c.name === effY)?.label || effY);
   const finalTitle =
     extractedTitle ||
-    (xField ? `${effY === "*" ? "تعداد" : effY} بر اساس ${xField}` : `${effAgg} ${effY === "*" ? "تعداد" : effY}`);
+    (xField ? `${yLbl} بر اساس ${xLbl}` : `${effAgg} ${yLbl}`);
 
   const visualSpec: any = { y_field: effY, aggregation: effAgg, limit: 100 };
   if (xField && effChart !== "kpi" && effChart !== "gauge") visualSpec.x_field = xField;
   const isCurr = ["rev", "cost", "profit", "price", "amount", "salary", "budget"].some((k) => effY.toLowerCase().includes(k));
   const styleCfg = { number_format: isCurr && effAgg !== "COUNT" ? "currency" : "number" };
   const vizCfg = { show_legend: true, show_tooltip: true, data_labels: false };
-  const previewData = executeVisualSpec(chosenDs.id, visualSpec, username, []);
+  const previewData = executeVisualSpec(chosenDs.id, visualSpec, username, [], null, false, extraDatasets);
 
   let createdWidget: any = null;
   if (body?.create_widget !== false && body?.dashboard_id) {
@@ -1090,7 +1137,8 @@ function handleCreateDashboardDemo(body: any) {
   const freeReply = normalizeFaText(String(clar.free_text || "").trim());
   const norm = normalizeFaText(String(body?.prompt || "").trim());
   const combinedLow = normalizeFaText(`${norm} ${freeReply}`).toLowerCase();
-  const datasets: any[] = demoData.datasets || [];
+  const extraDatasets = getExtraDatasets(body);
+  const datasets: any[] = getEffectiveDatasets(extraDatasets);
   const themes: any[] = demoData.themes || [];
 
   let dashTitle: string | null = clar.title || null;
@@ -1281,7 +1329,7 @@ function handleEditDashboardOrWidgetDemo(body: any, username: string | null) {
     }
 
     if (combinedLow.includes("فیلتر")) {
-      const datasets: any[] = demoData.datasets || [];
+      const datasets: any[] = getEffectiveDatasets(getExtraDatasets(body));
       for (const w of widgets) {
         const dObj = datasets.find((d) => d.id === w.dataset_id);
         if (dObj) {
@@ -1368,7 +1416,8 @@ function handleEditDashboardOrWidgetDemo(body: any, username: string | null) {
     }
   }
 
-  const datasets: any[] = demoData.datasets || [];
+  const extraDatasets = getExtraDatasets(body);
+  const datasets: any[] = getEffectiveDatasets(extraDatasets);
   const dsObj = datasets.find((d) => d.id === targetWidget.dataset_id) || null;
   let newX: string | null = null;
   let newY: string | null = null;
@@ -1422,7 +1471,7 @@ function handleEditDashboardOrWidgetDemo(body: any, username: string | null) {
     ...(newY ? { y_field: newY } : {}),
     ...(newAgg ? { aggregation: newAgg } : {}),
   };
-  const previewData = dsObj ? executeVisualSpec(dsObj.id, visualSpec, username, []) : null;
+  const previewData = dsObj ? executeVisualSpec(dsObj.id, visualSpec, username, [], null, false, extraDatasets) : null;
 
   return {
     status: "widget_updated",
@@ -1623,6 +1672,8 @@ export async function handleVercelDemoApi(
     return { status: 401, body: { detail: "Authentication required" } };
   }
 
+  const extraDatasets = getExtraDatasets(body);
+
   // Dashboards
   if (method === "GET" && path === "/dashboards") {
     return { status: 200, body: demoData.dashboards_list || [] };
@@ -1664,14 +1715,15 @@ export async function handleVercelDemoApi(
     return { status: 200, body: { id: `clone__${srcId}__${Date.now()}`, title: `${det.title} (Copy)` } };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[2] === "execute-batch") {
-    const det = findDashboard(segments[1]);
+    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
+    const det = customDashes.find((d) => d?.id === segments[1]) || findDashboard(segments[1]);
     if (!det) return { status: 404, body: { detail: "Dashboard not found" } };
     const widgets: Record<string, any> = {};
     const pageId = body?.page_id;
     for (const w of det.widgets || []) {
       if (pageId && w.page_id !== pageId) continue;
       const dStack = body?.drill_states?.[w.id] || [];
-      widgets[w.id] = executeWidgetForDemo(w, username, body?.active_filters || [], body?.cross_filters || [], dStack);
+      widgets[w.id] = executeWidgetForDemo(w, username, body?.active_filters || [], body?.cross_filters || [], dStack, extraDatasets);
     }
     return {
       status: 200,
@@ -1685,16 +1737,25 @@ export async function handleVercelDemoApi(
     };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "data") {
-    const found = findWidget(segments[2]);
-    if (!found) return { status: 404, body: { detail: "Widget not found" } };
+    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
+    let foundWidget: any = null;
+    for (const d of customDashes) {
+      const hit = (d?.widgets || []).find((x: any) => x.id === segments[2]);
+      if (hit) { foundWidget = hit; break; }
+    }
+    if (!foundWidget) {
+      foundWidget = findWidget(segments[2])?.widget || null;
+    }
+    if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
     return {
       status: 200,
       body: executeWidgetForDemo(
-        found.widget,
+        foundWidget,
         username,
         body?.active_filters || [],
         body?.cross_filters || [],
-        body?.drill_stack || []
+        body?.drill_stack || [],
+        extraDatasets
       ),
     };
   }
@@ -1738,12 +1799,12 @@ export async function handleVercelDemoApi(
   }
   if (method === "GET" && segments[0] === "datasets" && segments[2] === "preview") {
     const limit = Number(searchParams.get("limit") || 30);
-    const { rows, columns } = getTableForDataset(segments[1]);
+    const { rows, columns } = getTableForDataset(segments[1], extraDatasets);
     const visible = applyRlsAndFilters(rows, username, []).slice(0, limit);
     return { status: 200, body: { columns, rows: visible, row_count: visible.length } };
   }
   if (method === "POST" && segments[0] === "datasets" && segments[2] === "filter-options") {
-    const { rows } = getTableForDataset(segments[1]);
+    const { rows } = getTableForDataset(segments[1], extraDatasets);
     const fromArray = Array.isArray(body?.parent_filters) ? body.parent_filters : [];
     const fromMap = Object.entries(body?.parent_values || {})
       .filter(([, v]) => v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0))
@@ -1757,7 +1818,67 @@ export async function handleVercelDemoApi(
     return { status: 200, body: { field_name: field, values: vals } };
   }
 
-  // Data Sources
+  // Data Sources & Excel/CSV File Ingestion
+  if (method === "POST" && (path === "/data-sources/files/preview" || path === "/data-sources/files/import")) {
+    const f = body?.__file;
+    if (!f?.buffer) {
+      return { status: 400, body: { detail: "No file uploaded" } };
+    }
+    let colRenames: Record<string, string> = {};
+    let typeOverrides: Record<string, string> = {};
+    try {
+      if (body.column_renames_json) colRenames = JSON.parse(String(body.column_renames_json));
+    } catch { /* ignore */ }
+    try {
+      if (body.type_overrides_json) typeOverrides = JSON.parse(String(body.type_overrides_json));
+    } catch { /* ignore */ }
+    const parsed = parseSpreadsheetBuffer(f.buffer, f.name, {
+      sheetName: body.sheet_name || undefined,
+      hasHeader: String(body.has_header ?? "true") !== "false",
+      nullStrategy: body.null_strategy || "keep",
+      deduplicate: String(body.deduplicate ?? "false") === "true",
+      columnRenames: colRenames,
+      typeOverrides: typeOverrides,
+    });
+    if (path === "/data-sources/files/preview") {
+      return {
+        status: 200,
+        body: {
+          sheets: parsed.sheets,
+          selected_sheet: parsed.selected_sheet,
+          total_rows: parsed.total_rows,
+          duplicate_count: parsed.duplicate_count,
+          columns: parsed.columns,
+          preview_rows: parsed.preview_rows,
+        },
+      };
+    }
+    const dsName = String(body.dataset_name || f.name.replace(/\.[^.]+$/, "")).trim() || "Excel Dataset";
+    const dsId = `ds_xl_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const whTable = `wh_upload_${Date.now()}`;
+    return {
+      status: 200,
+      body: {
+        id: dsId,
+        dataset_id: dsId,
+        name: dsName,
+        warehouse_table: whTable,
+        row_count: parsed.total_rows,
+        columns_count: parsed.columns.length,
+        columns: parsed.columns.map((c) => c.field_name),
+        fields: parsed.columns.map((c, idx) => ({
+          id: `${dsId}_f_${idx + 1}`,
+          field_name: c.field_name,
+          display_name: c.display_name,
+          data_type: c.data_type,
+          semantic_role: c.semantic_role,
+          nullable: c.nullable,
+        })),
+        rows: parsed.all_rows,
+        created_at: new Date().toISOString(),
+      },
+    };
+  }
   if (method === "GET" && path === "/data-sources") {
     return { status: 200, body: demoData.data_sources || [] };
   }
@@ -1788,11 +1909,11 @@ export async function handleVercelDemoApi(
     return { status: 200, body: demoData.queries_history || [] };
   }
   if (method === "POST" && path === "/queries/execute-visual") {
-    const res = executeVisualSpec(body?.dataset_id, body?.visual_spec || {}, username, body?.filters || []);
+    const res = executeVisualSpec(body?.dataset_id, body?.visual_spec || {}, username, body?.filters || [], null, false, extraDatasets);
     return { status: 200, body: { ...res, execution_ms: 4.8, generated_sql: "-- Preview Visual Query" } };
   }
   if (method === "POST" && path === "/queries/execute-sql") {
-    return executeSimpleDemoSql(body?.sql_text || "", username);
+    return executeSimpleDemoSql(body?.sql_text || "", username, extraDatasets);
   }
   if (method === "POST" && path === "/queries/format-sql") {
     return { status: 200, body: { formatted_sql: String(body?.sql_text || "").trim() } };
@@ -1903,6 +2024,21 @@ export async function handleVercelDemoApi(
     };
   }
   if (method === "POST" && path === "/ai/generate-dashboard") {
+    const allDs = getEffectiveDatasets(extraDatasets);
+    const targetDs = allDs.find((d) => d.id === body?.dataset_id) || allDs[0];
+    if (targetDs) {
+      const [friendly] = friendlyDemoDatasetLabel(targetDs);
+      const title = `داشبورد ${friendly.split("(")[0].trim()}`;
+      const built = buildDemoFullDashboard(targetDs, title, "executive_full", null);
+      return {
+        status: 200,
+        body: {
+          dashboard_id: built.created_dashboard.id,
+          title: built.created_dashboard.title,
+          created_dashboard: built.created_dashboard,
+        },
+      };
+    }
     const first = demoData.dashboards_list?.[0];
     return { status: 200, body: { dashboard_id: first?.id, title: first?.title || "Executive Dashboard" } };
   }

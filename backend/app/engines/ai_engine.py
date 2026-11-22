@@ -32,6 +32,7 @@ class AiAnalyticsEngine:
     @staticmethod
     def recommend_widgets_for_dataset(db: Session, dataset: Dataset) -> dict[str, Any]:
         fields = db.query(DatasetField).filter(DatasetField.dataset_id == dataset.id).all()
+        label_map: dict[str, str] = {}
         if not fields:
             # Infer from warehouse table directly
             cols = warehouse.describe_table(dataset.warehouse_table)
@@ -57,11 +58,20 @@ class AiAnalyticsEngine:
                 for c in cols
                 if c["column_name"] not in measures and c["column_name"] not in times and not c["column_name"].endswith("_id")
             ]
+            for c in cols:
+                label_map[c["column_name"]] = c["column_name"].replace("_", " ").title()
         else:
+            for f in fields:
+                label_map[f.field_name] = f.display_name or f.field_name.replace("_", " ").title()
             measures = [f.field_name for f in fields if f.semantic_role == "measure"]
             times = [f.field_name for f in fields if f.semantic_role == "time"]
             geos = [f.field_name for f in fields if f.semantic_role == "geo"]
             dims = [f.field_name for f in fields if f.semantic_role in ("dimension", "geo")]
+
+        def _lbl(col_name: Optional[str]) -> str:
+            if not col_name or col_name == "*":
+                return "تعداد"
+            return label_map.get(col_name, col_name.replace("_", " ").title())
 
         primary_m = measures[0] if measures else "*"
         secondary_m = measures[1] if len(measures) > 1 else None
@@ -72,19 +82,20 @@ class AiAnalyticsEngine:
         specs: list[dict[str, Any]] = []
         # Up to 3 KPI cards
         for idx, m in enumerate(measures[:3]):
+            m_lbl = _lbl(m)
             specs.append(
                 {
-                    "title": f"Total {m.replace('_', ' ').title()}",
+                    "title": f"مجموع {m_lbl}" if any(ord(ch) > 127 for ch in m_lbl) else f"Total {m_lbl}",
                     "chart_type": "kpi",
                     "layout": {"x": idx * 4, "y": 0, "w": 4, "h": 3},
                     "visual_spec": {"y_field": m, "aggregation": "SUM"},
-                    "style": {"number_format": "currency" if any(k in m for k in ("rev", "cost", "profit", "price", "amount")) else "number"},
+                    "style": {"number_format": "currency" if any(k in f"{m} {m_lbl}".lower() for k in ("rev", "cost", "profit", "price", "amount", "مبلغ", "ریال", "تومان", "هزینه")) else "number"},
                 }
             )
         if not measures:
             specs.append(
                 {
-                    "title": f"Total Records ({dataset.name})",
+                    "title": f"تعداد کل ({dataset.name})",
                     "chart_type": "kpi",
                     "layout": {"x": 0, "y": 0, "w": 4, "h": 3},
                     "visual_spec": {"y_field": "*", "aggregation": "COUNT"},
@@ -94,9 +105,11 @@ class AiAnalyticsEngine:
 
         # Time-series trend chart
         if primary_t:
+            m_lbl = _lbl(primary_m)
+            t_lbl = _lbl(primary_t)
             specs.append(
                 {
-                    "title": f"{primary_m.replace('_', ' ').title()} Trend Over Time",
+                    "title": f"روند {m_lbl} بر اساس {t_lbl}" if any(ord(ch) > 127 for ch in f"{m_lbl}{t_lbl}") else f"{m_lbl} Trend Over Time",
                     "chart_type": "area",
                     "layout": {"x": 0, "y": 3, "w": 8, "h": 7},
                     "visual_spec": {
@@ -110,9 +123,11 @@ class AiAnalyticsEngine:
 
         # Category Breakdown Donut / Bar
         if primary_d:
+            m_lbl = _lbl(primary_m)
+            d_lbl = _lbl(primary_d)
             specs.append(
                 {
-                    "title": f"{primary_m.replace('_', ' ').title()} by {primary_d.replace('_', ' ').title()}",
+                    "title": f"{m_lbl} به تفکیک {d_lbl}" if any(ord(ch) > 127 for ch in f"{m_lbl}{d_lbl}") else f"{m_lbl} by {d_lbl}",
                     "chart_type": "bar",
                     "layout": {"x": 8 if primary_t else 0, "y": 3, "w": 4 if primary_t else 6, "h": 7},
                     "visual_spec": {
@@ -124,9 +139,10 @@ class AiAnalyticsEngine:
             )
 
         if secondary_d:
+            d2_lbl = _lbl(secondary_d)
             specs.append(
                 {
-                    "title": f"Share by {secondary_d.replace('_', ' ').title()}",
+                    "title": f"سهم بر اساس {d2_lbl}" if any(ord(ch) > 127 for ch in d2_lbl) else f"Share by {d2_lbl}",
                     "chart_type": "donut",
                     "layout": {"x": 0, "y": 10, "w": 5, "h": 7},
                     "visual_spec": {
@@ -140,7 +156,7 @@ class AiAnalyticsEngine:
         # Comparison table
         specs.append(
             {
-                "title": f"Detailed Breakdown — {dataset.name}",
+                "title": f"جدول تفکیکی — {dataset.name}" if any(ord(ch) > 127 for ch in f"{dataset.name}{_lbl(primary_d)}{_lbl(primary_m)}") else f"Detailed Breakdown — {dataset.name}",
                 "chart_type": "table",
                 "layout": {"x": 5 if secondary_d else 0, "y": 10, "w": 7 if secondary_d else 12, "h": 7},
                 "visual_spec": {
@@ -153,7 +169,7 @@ class AiAnalyticsEngine:
         )
 
         suggested_filters = [
-            {"name": d.replace("_", " ").title(), "field_name": d, "filter_type": "multi_select"}
+            {"name": _lbl(d), "field_name": d, "filter_type": "multi_select"}
             for d in (dims + geos)[:3]
         ]
         return {
@@ -937,8 +953,10 @@ class AiAnalyticsEngine:
         eff_agg = agg or ("COUNT" if y_field == "*" else "SUM")
         eff_y = y_field or "*"
         if not extracted_title:
-            y_lbl = "تعداد" if eff_y == "*" else eff_y.replace("_", " ").title()
-            extracted_title = f"{y_lbl} بر اساس {x_field}" if x_field else f"{eff_agg} {y_lbl}"
+            col_lbl_map = {c["name"]: c["label"] for c in cols_info}
+            y_lbl = "تعداد" if eff_y == "*" else col_lbl_map.get(eff_y, eff_y.replace("_", " ").title())
+            x_lbl = col_lbl_map.get(x_field, x_field) if x_field else ""
+            extracted_title = f"{y_lbl} بر اساس {x_lbl}" if x_field else f"{eff_agg} {y_lbl}"
 
         visual_spec: dict[str, Any] = {
             "y_field": eff_y,

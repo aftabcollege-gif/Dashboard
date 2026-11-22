@@ -1,9 +1,9 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Sparkles, CheckCircle2, ArrowLeft, Wand2, LayoutDashboard, Pencil, PlusCircle, RotateCcw } from "lucide-react";
+import { Sparkles, CheckCircle2, ArrowLeft, Wand2, LayoutDashboard, Pencil, PlusCircle, RotateCcw, FileSpreadsheet, Upload } from "lucide-react";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 import {
@@ -68,8 +68,78 @@ export function PersianAssistantPanel({
   const [clarifications, setClarifications] = useState<Record<string, string>>({});
   const [freeTextReply, setFreeTextReply] = useState("");
   const [loading, setLoading] = useState(false);
+  const [excelUploading, setExcelUploading] = useState(false);
+  const [uploadedDataset, setUploadedDataset] = useState<{ id: string; name: string; row_count: number; columns_count?: number } | null>(null);
   const [result, setResult] = useState<any>(null);
   const [targetWidgetId, setTargetWidgetId] = useState<string | null>(initialWidgetId || null);
+  const excelInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleQuickExcelUpload = async (file: File | undefined) => {
+    if (!file) return;
+    setExcelUploading(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const cleanName = file.name.replace(/\.[^.]+$/, "").trim() || "Excel Data";
+      fd.append("dataset_name", cleanName);
+      fd.append("has_header", "true");
+      fd.append("null_strategy", "keep");
+      fd.append("deduplicate", "false");
+      const res = await apiFetch<any>("/data-sources/files/import", {
+        method: "POST",
+        body: fd,
+      });
+      const dsId = res.dataset_id || res.id;
+      const dsName = res.name || cleanName;
+      setUploadedDataset({
+        id: dsId,
+        name: dsName,
+        row_count: Number(res.row_count || 0),
+        columns_count: Number(res.columns_count || res.fields?.length || 0),
+      });
+      setMode("create_dashboard");
+      setPrompt(`از فایل اکسل «${dsName}» یک داشبورد کامل بساز`);
+      setClarifications({ dataset_id: dsId });
+      setResult(null);
+      showToast(`فایل «${dsName}» با ${res.row_count} ردیف با موفقیت وارد شد!`);
+    } catch (e: any) {
+      showToast(e.message || "خطا در خواندن فایل اکسل");
+    } finally {
+      setExcelUploading(false);
+      if (excelInputRef.current) excelInputRef.current.value = "";
+    }
+  };
+
+  const buildDashboardFromUploaded = async () => {
+    if (!uploadedDataset) return;
+    setLoading(true);
+    try {
+      const res = await apiFetch<any>("/ai/assistant", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt: `از روی داده‌های «${uploadedDataset.name}» یک داشبورد کامل و آماده با عنوان «گزارش ${uploadedDataset.name}» بساز`,
+          mode: "create_dashboard",
+          clarifications: {
+            dataset_id: uploadedDataset.id,
+            layout_preset: "executive_full",
+            theme_id: "__default__",
+            title: `داشبورد ${uploadedDataset.name}`,
+          },
+          demo_context: buildDemoContext(),
+        }),
+      });
+      setResult(res);
+      if (res.status !== "needs_clarification") {
+        persistDemoResult(res);
+        showToast(res.message_fa || "داشبورد با موفقیت ساخته شد!");
+        onApplied?.(res);
+      }
+    } catch (e: any) {
+      showToast(e.message || "خطا در ساخت داشبورد از فایل اکسل");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (initialWidgetId) {
@@ -332,6 +402,58 @@ export function PersianAssistantPanel({
           <Pencil className="w-4 h-4 shrink-0" />
           <span>ویرایش داشبورد یا نمودار</span>
         </button>
+      </div>
+
+      {/* Direct Excel / CSV Upload Bar */}
+      <div
+        className="rounded-xl border border-dashed p-3 flex flex-wrap items-center justify-between gap-2.5"
+        style={{ borderColor: "var(--bi-border)", backgroundColor: "var(--bi-surface)" }}
+      >
+        <input
+          ref={excelInputRef}
+          type="file"
+          accept=".xlsx,.xls,.csv,.tsv,.json"
+          className="hidden"
+          onChange={(e) => handleQuickExcelUpload(e.target.files?.[0])}
+        />
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span className="w-8 h-8 rounded-lg bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
+            <FileSpreadsheet className="w-4 h-4" />
+          </span>
+          <div className="min-w-0">
+            <p className="text-xs font-semibold">
+              {uploadedDataset
+                ? `فایل «${uploadedDataset.name}» آماده است (${uploadedDataset.row_count.toLocaleString()} ردیف${uploadedDataset.columns_count ? ` · ${uploadedDataset.columns_count} ستون` : ""})`
+                : "فایل اکسل یا CSV خودتان را دارید؟ همین‌جا بارگذاری کنید"}
+            </p>
+            <p className="text-[11px]" style={{ color: "var(--bi-muted)" }}>
+              پشتیبانی از ستون‌های فارسی و انگلیسی (xlsx, xls, csv) — بلافاصله می‌توانید از آن داشبورد بسازید
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={excelUploading}
+            onClick={() => excelInputRef.current?.click()}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold hover:bg-emerald-500/10"
+            style={{ borderColor: "var(--bi-border)" }}
+          >
+            <Upload className="w-3.5 h-3.5" />
+            {excelUploading ? "در حال خواندن فایل..." : uploadedDataset ? "بارگذاری فایل دیگر" : "انتخاب فایل اکسل"}
+          </button>
+          {uploadedDataset && (
+            <button
+              type="button"
+              disabled={loading}
+              onClick={buildDashboardFromUploaded}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              ساخت فوری داشبورد از این فایل
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Quick Starter Chips */}

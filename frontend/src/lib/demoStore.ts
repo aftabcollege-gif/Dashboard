@@ -218,3 +218,94 @@ export function applyDemoDashboardOverrides(
     filters: [...(dash.filters || []), ...extraFilters],
   };
 }
+
+export interface DemoUploadedDataset {
+  id: string;
+  name: string;
+  warehouse_table: string;
+  row_count: number;
+  columns_count: number;
+  columns: string[];
+  fields: {
+    id: string;
+    field_name: string;
+    display_name: string;
+    data_type: string;
+    semantic_role: string;
+    nullable: boolean;
+  }[];
+  rows: Record<string, any>[];
+  created_at: string;
+}
+
+const UPLOADED_DATASETS_KEY = "bi_demo_uploaded_datasets_v1";
+const PREVIEW_DEMO_FLAG_KEY = "bi_is_preview_demo";
+
+export function isDemoPreviewMode(): boolean {
+  if (!isBrowserDemo()) return false;
+  try {
+    return localStorage.getItem(PREVIEW_DEMO_FLAG_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function setDemoPreviewMode(active: boolean): void {
+  if (!isBrowserDemo()) return;
+  try {
+    localStorage.setItem(PREVIEW_DEMO_FLAG_KEY, active ? "1" : "0");
+  } catch {
+    // ignore
+  }
+}
+
+export function getDemoUploadedDatasets(): DemoUploadedDataset[] {
+  if (!isBrowserDemo()) return [];
+  try {
+    const raw = localStorage.getItem(UPLOADED_DATASETS_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveDemoUploadedDataset(ds: DemoUploadedDataset): void {
+  if (!isBrowserDemo() || !ds?.id) return;
+  try {
+    const list = getDemoUploadedDatasets().filter((d) => d.id !== ds.id);
+    // Keep rows trimmed cleanly to fit comfortably within localStorage if extremely huge (> 3000 rows)
+    const trimmed = ds.rows.length > 3000 ? { ...ds, rows: ds.rows.slice(0, 3000) } : ds;
+    localStorage.setItem(UPLOADED_DATASETS_KEY, JSON.stringify([trimmed, ...list]));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+export function deleteDemoUploadedDataset(dsId: string): void {
+  if (!isBrowserDemo()) return;
+  try {
+    const list = getDemoUploadedDatasets().filter((d) => d.id !== dsId);
+    localStorage.setItem(UPLOADED_DATASETS_KEY, JSON.stringify(list));
+  } catch {
+    // ignore
+  }
+}
+
+export function mergeDemoDatasetList(serverDatasets: any[]): any[] {
+  const uploaded = getDemoUploadedDatasets();
+  if (!uploaded.length) return serverDatasets || [];
+  const existingIds = new Set(uploaded.map((u) => u.id));
+  const summaryUploaded = uploaded.map((u) => ({
+    id: u.id,
+    name: u.name,
+    warehouse_table: u.warehouse_table,
+    row_count: u.row_count,
+    columns_count: u.columns_count,
+    sync_status: "synced",
+    last_synced_at: u.created_at,
+    fields: u.fields,
+    is_uploaded_excel: true,
+  }));
+  return [...summaryUploaded, ...(serverDatasets || []).filter((s) => !existingIds.has(s.id))];
+}

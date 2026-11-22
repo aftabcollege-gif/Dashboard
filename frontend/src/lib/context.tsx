@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { apiFetch, getStoredToken, setStoredToken } from "@/lib/api";
+import { setDemoPreviewMode } from "@/lib/demoStore";
 import { Locale, TRANSLATIONS } from "@/lib/i18n";
 import { BiTheme, ThemeTokens } from "@/types/bi";
 
@@ -115,6 +116,7 @@ export function BiProvider({ children }: { children: React.ReactNode }) {
     try {
       const st = await apiFetch<AuthStatusInfo>("/auth/status");
       setAuthStatus(st);
+      setDemoPreviewMode(st?.environment === "vercel-preview-demo");
       return st;
     } catch {
       return null;

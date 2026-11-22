@@ -1,15 +1,20 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { CheckCircle2, Database, FileSpreadsheet, Play, Plus, Trash2, UploadCloud, XCircle } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { CheckCircle2, Database, FileSpreadsheet, Play, Plus, Sparkles, Trash2, UploadCloud, XCircle } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
 export default function DataSourcesPage() {
-  const { user, showToast } = useBi();
+  const router = useRouter();
+  const { user, locale, showToast } = useBi();
   const [sources, setSources] = useState<any[]>([]);
+  const [datasets, setDatasets] = useState<any[]>([]);
   const [supported, setSupported] = useState<{ databases: string[]; files: string[] }>({ databases: [], files: [] });
+  const [lastImported, setLastImported] = useState<any>(null);
+  const [buildingDash, setBuildingDash] = useState(false);
 
   // New DB Connector form
   const [name, setName] = useState("");
@@ -42,6 +47,7 @@ export default function DataSourcesPage() {
 
   const load = () => {
     apiFetch("/data-sources").then(setSources).catch(() => {});
+    apiFetch("/datasets").then(setDatasets).catch(() => {});
     apiFetch("/data-sources/supported-types").then(setSupported).catch(() => {});
   };
 
@@ -144,7 +150,8 @@ export default function DataSourcesPage() {
     fd.append("type_overrides_json", JSON.stringify(typeOverrides));
     try {
       const res = await apiFetch("/data-sources/files/import", { method: "POST", body: fd });
-      showToast(`Imported ${res.row_count} rows into Warehouse table '${res.warehouse_table}'!`);
+      showToast(`Imported ${res.row_count} rows into '${res.name || res.warehouse_table}'!`);
+      setLastImported(res);
       setPreviewData(null);
       setFileObj(null);
       setColRenames({});
@@ -152,6 +159,22 @@ export default function DataSourcesPage() {
       load();
     } catch (err: any) {
       showToast(err.message);
+    }
+  };
+
+  const handleBuildDashboardForDataset = async (dsId: string) => {
+    setBuildingDash(true);
+    try {
+      const res = await apiFetch<any>("/ai/generate-dashboard", {
+        method: "POST",
+        body: JSON.stringify({ dataset_id: dsId }),
+      });
+      showToast(locale === "fa" ? `داشبورد «${res.title}» ساخته شد!` : `Created dashboard "${res.title}"`);
+      router.push(`/dashboards/${res.dashboard_id}`);
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setBuildingDash(false);
     }
   };
 
@@ -189,15 +212,93 @@ export default function DataSourcesPage() {
           >
             <UploadCloud className="w-8 h-8 mx-auto mb-2 opacity-60" />
             <p className="text-xs font-semibold">
-              Drag & drop `.xlsx`, `.xls`, `.csv`, `.json`, `.xml` here or select a file
+              {locale === "fa"
+                ? "فایل اکسل (.xlsx / .xls / .csv / .json) را اینجا بکشید و رها کنید یا انتخاب نمایید"
+                : "Drag & drop .xlsx, .xls, .csv, .tsv, .json, .xml here or select a file"}
             </p>
             <input
               type="file"
-              accept=".xlsx,.xls,.csv,.json,.xml"
+              accept=".xlsx,.xls,.csv,.tsv,.json,.xml"
               onChange={(e) => e.target.files?.[0] && handlePreviewFile(e.target.files[0])}
               className="mt-3 text-xs"
             />
           </div>
+
+          {lastImported && (
+            <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-3.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400 font-semibold">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>
+                  {locale === "fa"
+                    ? `فایل «${lastImported.name}» با ${lastImported.row_count} ردیف با موفقیت وارد شد!`
+                    : `Dataset "${lastImported.name}" (${lastImported.row_count} rows) imported and ready!`}
+                </span>
+              </div>
+              <button
+                type="button"
+                disabled={buildingDash}
+                onClick={() => handleBuildDashboardForDataset(lastImported.dataset_id || lastImported.id)}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                {buildingDash
+                  ? locale === "fa" ? "در حال ساخت داشبورد..." : "Building..."
+                  : locale === "fa" ? "ساخت فوری داشبورد از این فایل" : "Auto-Build Dashboard"}
+              </button>
+            </div>
+          )}
+
+          {datasets.length > 0 && (
+            <div className="pt-3 border-t space-y-2" style={{ borderColor: "var(--bi-border)" }}>
+              <div className="text-xs font-bold flex items-center justify-between">
+                <span>
+                  {locale === "fa" ? `مجموعه‌داده‌های آماده (${datasets.length})` : `Available Datasets (${datasets.length})`}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 text-xs">
+                {datasets.map((ds) => (
+                  <div
+                    key={ds.id}
+                    className="p-2.5 rounded-lg border flex items-center justify-between gap-2"
+                    style={{ borderColor: "var(--bi-border)", backgroundColor: "var(--bi-surface)" }}
+                  >
+                    <div className="min-w-0">
+                      <div className="font-semibold truncate flex items-center gap-1.5">
+                        {ds.name}
+                        {ds.is_uploaded_excel && (
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 text-[10px]">Excel</span>
+                        )}
+                      </div>
+                      <div className="text-[11px]" style={{ color: "var(--bi-muted)" }}>
+                        {(ds.row_count || 0).toLocaleString()} {locale === "fa" ? "ردیف" : "rows"}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        disabled={buildingDash}
+                        onClick={() => handleBuildDashboardForDataset(ds.id)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-violet-600 text-white text-[11px] font-semibold hover:bg-violet-700 disabled:opacity-60"
+                      >
+                        <Sparkles className="w-3 h-3" />
+                        {locale === "fa" ? "ساخت داشبورد" : "Build Dashboard"}
+                      </button>
+                      {ds.is_uploaded_excel && (
+                        <button
+                          type="button"
+                          onClick={() => apiFetch(`/datasets/${ds.id}`, { method: "DELETE" }).then(load)}
+                          className="p-1 text-red-500 hover:bg-red-500/10 rounded"
+                          title="Delete uploaded dataset"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {previewData && (
             <div className="space-y-3 pt-2 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
