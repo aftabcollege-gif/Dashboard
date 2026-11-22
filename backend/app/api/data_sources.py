@@ -214,13 +214,20 @@ def execute_direct_source_query(
     bounded_limit = max(1, min(int(body.limit), 2000))
     try:
         df = DataConnectorEngine.extract_dataframe(
-            src.source_type, src.config_json, creds, query=body.query, read_only=src.read_only
+            src.source_type,
+            src.config_json,
+            creds,
+            query=body.query,
+            read_only=True,
+            max_rows=bounded_limit,
         )
         df_head = df.head(bounded_limit)
         rows = json.loads(df_head.to_json(orient="records", date_format="iso"))
         return {"columns": list(df_head.columns), "rows": rows, "row_count": len(rows), "total_rows": len(df)}
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:

@@ -101,16 +101,30 @@ class Settings(BaseSettings):
     MAX_FAILED_LOGINS: int = int(os.environ.get("MAX_FAILED_LOGINS", "5"))
     LOCKOUT_MINUTES: int = int(os.environ.get("LOCKOUT_MINUTES", "15"))
     RATE_LIMIT_ENABLED: bool = _env_bool("RATE_LIMIT_ENABLED", True)
+    RATE_LIMIT_FAIL_CLOSED_PROD: bool = _env_bool("RATE_LIMIT_FAIL_CLOSED_PROD", True)
     RATE_LIMIT_LOGIN_PER_MIN: int = int(os.environ.get("RATE_LIMIT_LOGIN_PER_MIN", "30"))
     RATE_LIMIT_SQL_PER_MIN: int = int(os.environ.get("RATE_LIMIT_SQL_PER_MIN", "120"))
     RATE_LIMIT_PUBLIC_PER_MIN: int = int(os.environ.get("RATE_LIMIT_PUBLIC_PER_MIN", "240"))
+
+    TRUST_PROXY_HEADERS: bool = _env_bool("TRUST_PROXY_HEADERS", False)
+    TRUSTED_PROXY_IPS: str = os.environ.get("TRUSTED_PROXY_IPS", "127.0.0.1,::1")
 
     QUERY_TIMEOUT_SECONDS: float = float(os.environ.get("QUERY_TIMEOUT_SECONDS", "15.0"))
     QUERY_MAX_CONCURRENCY: int = int(os.environ.get("QUERY_MAX_CONCURRENCY", "12"))
     QUERY_DEFAULT_LIMIT: int = int(os.environ.get("QUERY_DEFAULT_LIMIT", "5000"))
     MAX_QUERY_ROWS: int = int(os.environ.get("MAX_QUERY_ROWS", "10000"))
+    MAX_EXTRACT_ROWS: int = int(os.environ.get("MAX_EXTRACT_ROWS", "100000"))
+    EXTERNAL_QUERY_TIMEOUT_SECONDS: int = int(os.environ.get("EXTERNAL_QUERY_TIMEOUT_SECONDS", "15"))
     DUCKDB_MEMORY_LIMIT: str = os.environ.get("DUCKDB_MEMORY_LIMIT", "1GB")
     DUCKDB_THREADS: int = int(os.environ.get("DUCKDB_THREADS", "4"))
+
+    # Background Scheduler & ETL Reliability
+    BI_ENABLE_SCHEDULER: bool = _env_bool("BI_ENABLE_SCHEDULER", True)
+    ETL_STALE_RUN_TIMEOUT_MINUTES: int = int(os.environ.get("ETL_STALE_RUN_TIMEOUT_MINUTES", "30"))
+    ETL_RUN_TIMEOUT_SECONDS: int = int(os.environ.get("ETL_RUN_TIMEOUT_SECONDS", "120"))
+
+    # LDAP TLS CA Certificate Path (optional custom CA bundle)
+    LDAP_TLS_CA_CERT_FILE: str | None = os.environ.get("LDAP_TLS_CA_CERT_FILE") or None
 
     # Uploads, Exports & Multi-Tenant Quotas
     UPLOADS_DIR: str = os.environ.get("UPLOADS_DIR") or os.environ.get("UPLOAD_DIR") or str(DATA_DIR / "uploads")

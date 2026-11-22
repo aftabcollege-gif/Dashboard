@@ -1,12 +1,21 @@
 import re
 import time
 from typing import Any, Optional
+import sqlglot
+from sqlglot import exp
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.core.cache import cache_manager
 from app.core.permissions import permission_resolver
-from app.core.rls_cls import apply_cls_and_masking, build_data_security_context, DataSecurityContext
-from app.core.sql_guard import validate_readonly_sql_ast
+from app.core.rls_cls import (
+    DataSecurityContext,
+    apply_cls_and_masking,
+    build_data_security_context,
+    build_public_data_security_context,
+    build_security_cte_sql,
+    build_security_projection_and_where,
+)
+from app.core.sql_guard import extract_ast_column_references, validate_readonly_sql_ast
 from app.engines.data_engine import FormulaCompiler
 from app.engines.filter_engine import compile_filters_to_sql
 from app.engines.warehouse import warehouse
@@ -65,6 +74,21 @@ def _combine_ctes(rls_ctes: list[str], sql: str) -> str:
     return f"WITH {cte_block} {stripped}"
 
 
+def _assert_expr_no_hidden_cols(compiled_expr: str, hidden_cols: set[str], avail_cols: set[str]) -> None:
+    if not hidden_cols:
+        return
+    try:
+        tree = sqlglot.parse_one(f"SELECT {compiled_expr} AS _m", read="duckdb")
+        for col in tree.find_all(exp.Column):
+            cname = (col.name or "").strip()
+            if cname and cname in hidden_cols and cname not in avail_cols:
+                raise PermissionError(f"Access denied to hidden column '{cname}'")
+    except PermissionError:
+        raise
+    except Exception:
+        pass
+
+
 def build_visual_query_sql(
     db: Session,
     dataset: Dataset,
@@ -74,22 +98,52 @@ def build_visual_query_sql(
     rls_params: list[Any],
     override_dimension: Optional[str] = None,
     raw_mode: bool = False,
+    user: Optional[User] = None,
+    public_mode: bool = False,
+    enforce_join_rbac: bool = True,
+    security_bundle_out: Optional[dict[str, Any]] = None,
 ) -> tuple[str, list[Any], str]:
     """
     Compiles a Visual Query Builder / Widget Visual Spec into safe parameterized DuckDB SQL.
-    Only permits joins to datasets belonging to the same organization.
+    - Enforces organization ownership + dataset:view RBAC on primary and all joined datasets.
+    - Applies per-dataset pre-SQL RLS, CLS (hidden-column exclusion), and masking inside
+      isolated subqueries BEFORE joins, WHERE, GROUP BY, ORDER BY, or aggregates execute.
     """
     base_table = dataset.warehouse_table
     if not IDENT_RE.match(base_table):
         raise ValueError("Invalid warehouse table name")
 
-    cols_meta = warehouse.describe_table(base_table)
-    avail_cols = {c["column_name"] for c in cols_meta}
+    if user is not None:
+        primary_sc = build_data_security_context(db, user, dataset.id)
+    elif public_mode:
+        primary_sc = build_public_data_security_context(db, dataset.organization_id, dataset.id)
+    else:
+        primary_sc = DataSecurityContext(
+            user_id="system",
+            rls_where_clauses=list(rls_clauses),
+            rls_params=list(rls_params),
+            hidden_columns=set(),
+            masked_columns={},
+            context_hash="legacy",
+        )
+
+    base_cols_meta = warehouse.describe_table(base_table)
+    base_sub_sql, base_sub_params, visible_base_cols = build_security_projection_and_where(
+        base_table, base_cols_meta, primary_sc
+    )
+
+    alias_base = "t0"
+    table_expr = f"({base_sub_sql}) AS {alias_base}"
+    subquery_params: list[Any] = list(base_sub_params)
+    avail_cols = set(visible_base_cols)
+
+    merged_hidden: set[str] = set(primary_sc.hidden_columns)
+    merged_masks: dict[str, str] = dict(primary_sc.masked_columns)
+    sec_hashes: list[str] = [primary_sc.context_hash]
+    joined_meta: list[dict[str, Any]] = []
 
     join_clauses = ""
     joins = visual_spec.get("joins", [])
-    alias_base = "t0"
-    table_expr = f'"{base_table}" AS {alias_base}'
     if joins:
         for idx, j in enumerate(joins, start=1):
             target_ds_id = j.get("dataset_id")
@@ -99,21 +153,84 @@ def build_visual_query_sql(
                 .first()
             )
             if not target_ds or not IDENT_RE.match(target_ds.warehouse_table):
-                continue
+                raise PermissionError("Joined dataset not found or outside organization scope")
+
+            if user is not None and enforce_join_rbac:
+                dec = permission_resolver.resolve(db, user, "dataset", target_ds.id, "view")
+                if not dec.allowed:
+                    raise PermissionError(
+                        f"Permission denied for joined dataset '{target_ds.name}' ({dec.reason})"
+                    )
+
+            if user is not None:
+                join_sc = build_data_security_context(db, user, target_ds.id)
+            elif public_mode:
+                join_sc = build_public_data_security_context(db, dataset.organization_id, target_ds.id)
+            else:
+                join_sc = DataSecurityContext("system", [], [], set(), {}, "legacy")
+
+            j_cols_meta = warehouse.describe_table(target_ds.warehouse_table)
+            j_sub_sql, j_sub_params, j_visible_cols = build_security_projection_and_where(
+                target_ds.warehouse_table, j_cols_meta, join_sc
+            )
+
             jtype = str(j.get("join_type", "LEFT")).upper()
             if jtype not in ("INNER", "LEFT", "RIGHT", "FULL"):
                 jtype = "LEFT"
             lf = str(j.get("left_field", ""))
             rf = str(j.get("right_field", ""))
-            if IDENT_RE.match(lf) and IDENT_RE.match(rf):
-                alias_j = f"t{idx}"
-                join_clauses += f' {jtype} JOIN "{target_ds.warehouse_table}" AS {alias_j} ON {alias_base}."{lf}" = {alias_j}."{rf}"'
-                for jc in warehouse.describe_table(target_ds.warehouse_table):
-                    avail_cols.add(jc["column_name"])
+            if not (IDENT_RE.match(lf) and IDENT_RE.match(rf)):
+                raise ValueError("Invalid join column identifier")
+
+            if lf in primary_sc.hidden_columns or lf not in visible_base_cols:
+                raise PermissionError(f"Access denied to hidden or unavailable join column '{lf}'")
+            if rf in join_sc.hidden_columns or rf not in j_visible_cols:
+                raise PermissionError(f"Access denied to hidden or unavailable join column '{rf}'")
+
+            alias_j = f"t{idx}"
+            join_clauses += (
+                f' {jtype} JOIN ({j_sub_sql}) AS {alias_j} '
+                f'ON {alias_base}."{lf}" = {alias_j}."{rf}"'
+            )
+            subquery_params.extend(j_sub_params)
+            avail_cols.update(j_visible_cols)
+            merged_hidden.update(join_sc.hidden_columns)
+            merged_masks.update(join_sc.masked_columns)
+            sec_hashes.append(join_sc.context_hash)
+            joined_meta.append(
+                {
+                    "id": target_ds.id,
+                    "data_version": target_ds.data_version,
+                    "context_hash": join_sc.context_hash,
+                }
+            )
+
+    if security_bundle_out is not None:
+        security_bundle_out["merged_sec_ctx"] = DataSecurityContext(
+            user_id=user.id if user else ("public" if public_mode else "system"),
+            rls_where_clauses=[],
+            rls_params=[],
+            hidden_columns=merged_hidden,
+            masked_columns=merged_masks,
+            context_hash=":".join(sec_hashes),
+        )
+        security_bundle_out["joined_meta"] = joined_meta
+        security_bundle_out["combined_context_hash"] = ":".join(sec_hashes)
+        security_bundle_out["joined_versions"] = [
+            f"{jm['id']}:{jm['data_version']}" for jm in joined_meta
+        ]
+
+    # Reject any filter referencing hidden columns before compiling SQL
+    for flt in filters or []:
+        if flt.get("is_active") is False:
+            continue
+        ffield = str(flt.get("field_name") or flt.get("field") or "").strip()
+        if ffield and ffield in merged_hidden and ffield not in avail_cols:
+            raise PermissionError(f"Access denied to hidden column '{ffield}' in filter")
 
     compiled_filters = compile_filters_to_sql(filters, available_columns=avail_cols)
-    where_parts = list(rls_clauses) + list(compiled_filters["where_clauses"])
-    params = list(rls_params) + list(compiled_filters["params"])
+    where_parts = list(compiled_filters["where_clauses"])
+    params = list(subquery_params) + list(compiled_filters["params"])
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     if raw_mode:
@@ -128,8 +245,22 @@ def build_visual_query_sql(
     measures: list[dict[str, Any]] = visual_spec.get("measures") or []
     explicit_cols: list[str] = visual_spec.get("columns") or []
 
+    # Enforce CLS on every visual_spec field reference
+    for candidate in (
+        x_field,
+        series_field,
+        visual_spec.get("secondary_y_field"),
+        visual_spec.get("size_field"),
+        visual_spec.get("order_by"),
+        visual_spec.get("sort_by"),
+        time_col,
+        *(explicit_cols or []),
+    ):
+        if candidate and str(candidate) in merged_hidden and str(candidate) not in avail_cols:
+            raise PermissionError(f"Access denied to hidden column '{candidate}'")
+
     if explicit_cols and not x_field and not y_field and not measures:
-        safe_cols = [f'"{c}"' for c in explicit_cols if IDENT_RE.match(c)]
+        safe_cols = [f'"{c}"' for c in explicit_cols if IDENT_RE.match(c) and c in avail_cols]
         sel_sql = ", ".join(safe_cols) if safe_cols else "*"
         lim = max(1, min(int(visual_spec.get("limit", 1000)), settings.MAX_QUERY_ROWS))
         order_col = visual_spec.get("order_by")
@@ -155,14 +286,18 @@ def build_visual_query_sql(
             if not IDENT_RE.match(m_alias):
                 m_alias = f"value_{idx+1}"
             compiled_expr = FormulaCompiler.compile_measure(m_expr, time_col=time_col, order_col=x_field)
+            _assert_expr_no_hidden_cols(compiled_expr, merged_hidden, avail_cols)
             select_parts.append(f'{compiled_expr} AS "{m_alias}"')
     elif y_field:
         if agg in ("RAW", "NONE"):
             if IDENT_RE.match(y_field):
+                if y_field in merged_hidden and y_field not in avail_cols:
+                    raise PermissionError(f"Access denied to hidden column '{y_field}'")
                 select_parts.append(f'"{y_field}"')
         else:
             formula = f"{agg}({y_field})" if "(" not in y_field else y_field
             compiled_expr = FormulaCompiler.compile_measure(formula, time_col=time_col, order_col=x_field)
+            _assert_expr_no_hidden_cols(compiled_expr, merged_hidden, avail_cols)
             alias_name = visual_spec.get("y_alias") or "value"
             if not IDENT_RE.match(alias_name):
                 alias_name = "value"
@@ -174,11 +309,13 @@ def build_visual_query_sql(
         if IDENT_RE.match(sec_field):
             sec_agg = str(visual_spec.get("secondary_aggregation", "AVG")).upper()
             sec_expr = FormulaCompiler.compile_measure(f"{sec_agg}({sec_field})", time_col=time_col, order_col=x_field)
+            _assert_expr_no_hidden_cols(sec_expr, merged_hidden, avail_cols)
             select_parts.append(f'{sec_expr} AS "secondary_value"')
 
     if size_field := visual_spec.get("size_field"):
         if IDENT_RE.match(size_field):
             size_expr = FormulaCompiler.compile_measure(f"SUM({size_field})", time_col=time_col, order_col=x_field)
+            _assert_expr_no_hidden_cols(size_expr, merged_hidden, avail_cols)
             select_parts.append(f'{size_expr} AS "size_value"')
 
     group_sql = f"GROUP BY {', '.join(group_fields)}" if group_fields and agg not in ("RAW", "NONE") else ""
@@ -223,12 +360,13 @@ def execute_dataset_sql(
 ) -> dict[str, Any]:
     """
     Central Query Execution Engine (Section 27F):
-    - AST-based read-only SQL guard + cross-tenant table allowlist
-    - Per-table dataset:view authorization + RLS predicate shadowing across all referenced datasets
+    - AST-based read-only SQL guard + strict organization-owned registered Dataset allowlist
+      (NO unregistered DuckDB tables, main.*, or super_admin arbitrary-table bypasses)
+    - Per-table dataset:view authorization
+    - Pre-SQL RLS + CLS (hidden column omission) + Column Masking CTE wrapping across all
+      referenced datasets BEFORE user SQL / WHERE / GROUP BY / ORDER BY / aggregates execute
     - Bounded row limit (1..MAX_QUERY_ROWS) and active timeout guard
     - Layer 3 Smart Cache keyed by org/dash/widget/dataset/version/query/filter/perm_hash
-    - CLS & Data Masking
-    - Performance log persistence
     """
     cleaned_sql = (sql_text or "").strip().rstrip(";")
     bound_sql, bound_params = _bind_named_params(cleaned_sql, named_params or {})
@@ -237,42 +375,42 @@ def execute_dataset_sql(
     if dataset and dataset.organization_id != user.organization_id:
         raise PermissionError("Dataset belongs to another organization")
 
-    # Resolve all registered datasets to verify tenant ownership and dataset RBAC
-    all_registered = db.query(Dataset).all()
-    by_table_all = {d.warehouse_table.lower(): d for d in all_registered if d.warehouse_table}
-    eff_summary = permission_resolver.get_effective_permissions_summary(db, user)
-    is_super_admin = bool(eff_summary.get("is_super_admin"))
+    # Resolve ONLY datasets owned by the caller's organization; unregistered physical tables are strictly forbidden
+    org_datasets = db.query(Dataset).filter(Dataset.organization_id == user.organization_id).all()
+    by_table_org = {d.warehouse_table.lower(): d for d in org_datasets if d.warehouse_table}
 
     referenced_datasets: list[Dataset] = []
     seen_ds_ids: set[str] = set()
     if dataset:
+        if enforce_dataset_rbac:
+            dec = permission_resolver.resolve(db, user, "dataset", dataset.id, "view")
+            if not dec.allowed:
+                raise PermissionError(f"Permission denied for dataset '{dataset.name}' ({dec.reason})")
         referenced_datasets.append(dataset)
         seen_ds_ids.add(dataset.id)
 
     for tbl in referenced_tables:
         tlow = tbl.lower()
-        ds_match = by_table_all.get(tlow)
-        if ds_match is not None:
-            if ds_match.organization_id != user.organization_id:
-                raise PermissionError(f"Access denied to table '{tbl}' outside your organization")
-            if enforce_dataset_rbac:
-                dec = permission_resolver.resolve(db, user, "dataset", ds_match.id, "view")
-                if not dec.allowed:
-                    raise PermissionError(f"Permission denied for dataset '{ds_match.name}' ({dec.reason})")
-            if ds_match.id not in seen_ds_ids:
-                referenced_datasets.append(ds_match)
-                seen_ds_ids.add(ds_match.id)
-        else:
-            # Unregistered physical tables (e.g. system benchmark tables) may only be queried by super_admin
-            if not is_super_admin:
-                raise PermissionError(f"Access denied to unregistered table '{tbl}'")
+        ds_match = by_table_org.get(tlow)
+        if ds_match is None:
+            raise PermissionError(f"Access denied to unregistered or unauthorized table '{tbl}'")
+        if enforce_dataset_rbac:
+            dec = permission_resolver.resolve(db, user, "dataset", ds_match.id, "view")
+            if not dec.allowed:
+                raise PermissionError(f"Permission denied for dataset '{ds_match.name}' ({dec.reason})")
+        if ds_match.id not in seen_ds_ids:
+            referenced_datasets.append(ds_match)
+            seen_ds_ids.add(ds_match.id)
 
-    # Aggregate RLS and CLS policies across all referenced datasets (or explicit dataset)
+    # Wrap every referenced dataset in a security CTE enforcing RLS, CLS (hidden col removal),
+    # and SQL-level masking BEFORE any user SQL expressions run.
     merged_hidden: set[str] = set()
     merged_masks: dict[str, str] = {}
     rls_ctes: list[str] = []
     rls_cte_params: list[Any] = []
     sec_hashes: list[str] = []
+    hidden_by_table: dict[str, set[str]] = {}
+    visible_cols_union: set[str] = set()
 
     if referenced_datasets:
         for ds_item in referenced_datasets:
@@ -280,16 +418,27 @@ def execute_dataset_sql(
             merged_hidden.update(sc.hidden_columns)
             merged_masks.update(sc.masked_columns)
             sec_hashes.append(sc.context_hash)
-            if sc.rls_where_clauses:
-                tname = ds_item.warehouse_table
-                rls_where = " AND ".join(sc.rls_where_clauses)
-                rls_ctes.append(f'"{tname}" AS (SELECT * FROM main."{tname}" WHERE {rls_where})')
-                rls_cte_params.extend(sc.rls_params)
+            tname = ds_item.warehouse_table
+            hidden_by_table[tname.lower()] = sc.hidden_columns
+            cols_meta = warehouse.describe_table(tname)
+            cte_sql, cte_params, vis_cols = build_security_cte_sql(tname, cols_meta, sc, source_schema="main")
+            rls_ctes.append(cte_sql)
+            rls_cte_params.extend(cte_params)
+            visible_cols_union.update(vis_cols)
     else:
         sc = build_data_security_context(db, user, None)
         merged_hidden.update(sc.hidden_columns)
         merged_masks.update(sc.masked_columns)
         sec_hashes.append(sc.context_hash)
+
+    # Reject explicit AST column references to hidden columns cleanly with PermissionError (403)
+    if merged_hidden:
+        for tqual, cname in extract_ast_column_references(bound_sql, dialect="duckdb"):
+            if tqual and tqual.lower() in hidden_by_table:
+                if cname in hidden_by_table[tqual.lower()]:
+                    raise PermissionError(f"Access denied to hidden column '{cname}'")
+            elif cname in merged_hidden and cname not in visible_cols_union:
+                raise PermissionError(f"Access denied to hidden column '{cname}'")
 
     merged_sec_ctx = DataSecurityContext(
         user_id=user.id,
@@ -306,8 +455,14 @@ def execute_dataset_sql(
     final_params = list(rls_cte_params) + list(bound_params)
 
     if filters:
-        avail = (
-            {c["column_name"] for c in warehouse.describe_table(dataset.warehouse_table)}
+        for flt in filters:
+            if flt.get("is_active") is False:
+                continue
+            ffield = str(flt.get("field_name") or flt.get("field") or "").strip()
+            if ffield and ffield in merged_hidden and ffield not in visible_cols_union:
+                raise PermissionError(f"Access denied to hidden column '{ffield}' in filter")
+        avail = visible_cols_union if visible_cols_union else (
+            {c["column_name"] for c in warehouse.describe_table(dataset.warehouse_table)} - merged_hidden
             if dataset
             else None
         )
@@ -321,7 +476,12 @@ def execute_dataset_sql(
     primary_ds = dataset or (referenced_datasets[0] if referenced_datasets else None)
     data_ver = primary_ds.data_version if primary_ds else 1
     ds_id = primary_ds.id if primary_ds else "adhoc"
-    q_hash = cache_manager.hash_dict({"sql": cleaned_sql, "params": named_params or {}, "limit": bounded_limit})
+    q_hash = cache_manager.hash_dict({
+        "sql": cleaned_sql,
+        "params": named_params or {},
+        "limit": bounded_limit,
+        "versions": [f"{d.id}:{d.data_version}" for d in referenced_datasets],
+    })
     f_hash = cache_manager.hash_dict(filters or [])
     cache_key = cache_manager.build_key(
         organization_id=user.organization_id,
@@ -418,4 +578,8 @@ def execute_dataset_sql(
             )
         )
         db.commit()
+        # Convert DuckDB Binder errors on hidden columns into PermissionError (403)
+        msg = str(exc)
+        if merged_hidden and "Binder Error" in msg and any(f'"{hc}"' in msg for hc in merged_hidden):
+            raise PermissionError("Access denied to hidden column") from exc
         raise

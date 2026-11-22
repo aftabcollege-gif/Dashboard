@@ -119,12 +119,22 @@ def execute_visual_builder(
     ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
     enforce_permission(db, user, "dataset", ds.id, "view")
     try:
+        sec_bundle: dict[str, Any] = {}
         sec_ctx = build_data_security_context(db, user, ds.id)
         sql, params, _ = build_visual_query_sql(
-            db, ds, body.visual_spec, body.filters, sec_ctx.rls_where_clauses, sec_ctx.rls_params
+            db,
+            ds,
+            body.visual_spec,
+            body.filters,
+            sec_ctx.rls_where_clauses,
+            sec_ctx.rls_params,
+            user=user,
+            enforce_join_rbac=True,
+            security_bundle_out=sec_bundle,
         )
         res = warehouse.execute_query(sql, params)
-        vis_cols, masked_rows = apply_cls_and_masking(res["columns"], res["rows"], sec_ctx)
+        eff_ctx = sec_bundle.get("merged_sec_ctx") or sec_ctx
+        vis_cols, masked_rows = apply_cls_and_masking(res["columns"], res["rows"], eff_ctx)
         return {
             "generated_sql": sql,
             "columns": vis_cols,
@@ -132,6 +142,8 @@ def execute_visual_builder(
             "row_count": len(masked_rows),
             "execution_ms": res["execution_ms"],
         }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc))
     except Exception as exc:
@@ -165,13 +177,20 @@ def list_saved_queries(user: User = Depends(get_current_user), db: Session = Dep
 def save_query(body: SaveQueryRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "query", "*", "add")
     if body.dataset_id:
-        get_dataset_for_org(db, body.dataset_id, user.organization_id)
+        ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
+        enforce_permission(db, user, "dataset", ds.id, "view")
     if body.query_mode == "sql" and body.sql_text:
-        org_tables = set(list_org_allowed_dataset_tables(db, user.organization_id).keys())
+        org_map = list_org_allowed_dataset_tables(db, user.organization_id)
         try:
-            validate_readonly_sql_ast(body.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
+            refs = validate_readonly_sql_ast(
+                body.sql_text, allowed_tables=set(org_map.keys()), require_table_allowlist=True
+            )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid saved SQL: {exc}")
+        for tbl in refs:
+            rds = org_map.get(tbl.lower())
+            if rds:
+                enforce_permission(db, user, "dataset", rds.id, "view")
 
     sq = SavedQuery(
         organization_id=user.organization_id,
@@ -234,13 +253,25 @@ def convert_query_to_widget(
     if page_dash.id != dash.id:
         raise HTTPException(status_code=400, detail="Dashboard page does not belong to target dashboard")
     if body.dataset_id:
-        get_dataset_for_org(db, body.dataset_id, user.organization_id)
+        ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
+        enforce_permission(db, user, "dataset", ds.id, "view")
+    for j in (body.visual_spec or {}).get("joins", []) or []:
+        jid = j.get("dataset_id")
+        if jid:
+            jds = get_dataset_for_org(db, str(jid), user.organization_id)
+            enforce_permission(db, user, "dataset", jds.id, "view")
     if body.query_mode == "sql" and body.sql_text:
-        org_tables = set(list_org_allowed_dataset_tables(db, user.organization_id).keys())
+        org_map = list_org_allowed_dataset_tables(db, user.organization_id)
         try:
-            validate_readonly_sql_ast(body.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
+            refs = validate_readonly_sql_ast(
+                body.sql_text, allowed_tables=set(org_map.keys()), require_table_allowlist=True
+            )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid widget SQL: {exc}")
+        for tbl in refs:
+            rds = org_map.get(tbl.lower())
+            if rds:
+                enforce_permission(db, user, "dataset", rds.id, "view")
 
     w = Widget(
         dashboard_id=dash.id,

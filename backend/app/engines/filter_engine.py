@@ -1,6 +1,7 @@
 import re
 from datetime import date, timedelta
 from typing import Any, Optional
+from app.core.rls_cls import DataSecurityContext, build_security_projection_and_where
 from app.core.sql_guard import validate_filter_expression_ast
 from app.engines.warehouse import warehouse
 
@@ -142,19 +143,42 @@ def get_cascading_filter_options(
     rls_params: list[Any],
     search: Optional[str] = None,
     limit: int = 200,
+    sec_ctx: Optional[DataSecurityContext] = None,
 ) -> list[Any]:
     if not IDENT_RE.match(warehouse_table) or not IDENT_RE.match(field_name):
         raise ValueError("Invalid table or field identifier")
 
     bounded_limit = max(1, min(int(limit), 1000))
     cols_meta = warehouse.describe_table(warehouse_table)
-    avail = {c["column_name"] for c in cols_meta}
+    eff_ctx = sec_ctx or DataSecurityContext(
+        user_id="filter_opts",
+        rls_where_clauses=list(rls_clauses or []),
+        rls_params=list(rls_params or []),
+        hidden_columns=set(),
+        masked_columns={},
+        context_hash="filter_opts",
+    )
+
+    if field_name in eff_ctx.hidden_columns:
+        return []
+
+    for pf in parent_filters or []:
+        if pf.get("is_active") is False:
+            continue
+        pfield = str(pf.get("field_name") or pf.get("field") or "").strip()
+        if pfield and pfield in eff_ctx.hidden_columns:
+            raise PermissionError(f"Access denied to hidden column '{pfield}' in filter")
+
+    sub_sql, sub_params, visible_cols = build_security_projection_and_where(
+        warehouse_table, cols_meta, eff_ctx, source_schema="main"
+    )
+    avail = set(visible_cols)
     if field_name not in avail:
-        raise ValueError("Field not found in dataset")
+        raise ValueError("Field not found or restricted in dataset")
 
     compiled = compile_filters_to_sql(parent_filters, available_columns=avail)
-    where_parts = list(rls_clauses) + list(compiled["where_clauses"])
-    params = list(rls_params) + list(compiled["params"])
+    where_parts = list(compiled["where_clauses"])
+    params = list(sub_params) + list(compiled["params"])
 
     if search:
         where_parts.append(f'LOWER(CAST("{field_name}" AS VARCHAR)) LIKE ?')
@@ -162,7 +186,7 @@ def get_cascading_filter_options(
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     sql = (
-        f'SELECT DISTINCT "{field_name}" AS val FROM "{warehouse_table}" '
+        f'SELECT DISTINCT "{field_name}" AS val FROM ({sub_sql}) AS _fopt '
         f"{where_sql} ORDER BY 1 ASC LIMIT {bounded_limit}"
     )
     res = warehouse.execute_query(sql, params, limit=bounded_limit)

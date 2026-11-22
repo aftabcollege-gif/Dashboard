@@ -3,6 +3,7 @@ import time
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.api.deps import enforce_permission, get_client_ip, get_current_user
 from app.config import settings
@@ -10,8 +11,15 @@ from app.core.audit import record_audit
 from app.core.cache import cache_manager
 from app.core.permissions import permission_resolver
 from app.core.rate_limit import rate_limiter
-from app.core.rls_cls import apply_cls_and_masking, build_data_security_context
-from app.core.sql_guard import validate_readonly_sql_ast
+from app.core.rls_cls import (
+    DataSecurityContext,
+    apply_cls_and_masking,
+    build_data_security_context,
+    build_public_data_security_context,
+    build_security_cte_sql,
+    inspect_dataset_public_safety,
+)
+from app.core.sql_guard import extract_ast_column_references, validate_readonly_sql_ast
 from app.core.tenant import (
     get_dashboard_for_org,
     get_dataset_for_org,
@@ -205,6 +213,140 @@ def _check_optimistic_concurrency(dash: Dashboard, expected_updated_at: Optional
         )
 
 
+def _assert_dataset_public_safe(db: Session, org_id: str, ds: Dataset) -> None:
+    safe, reason = inspect_dataset_public_safety(db, org_id, ds)
+    if not safe:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Public sharing blocked by data protection policy: {reason}",
+        )
+
+
+def _assert_dashboard_public_safe(db: Session, org_id: str, dash: Dashboard) -> None:
+    if (dash.settings_json or {}).get("allow_public_restricted") is True:
+        return
+    widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
+    if not widgets:
+        return
+    w_ids = [w.id for w in widgets]
+    wqs = {wq.widget_id: wq for wq in db.query(WidgetQuery).filter(WidgetQuery.widget_id.in_(w_ids)).all()}
+    org_datasets = db.query(Dataset).filter(Dataset.organization_id == org_id).all()
+    ds_by_id = {d.id: d for d in org_datasets}
+    ds_by_tbl = {d.warehouse_table.lower(): d for d in org_datasets if d.warehouse_table}
+
+    checked_ds: dict[str, Dataset] = {}
+    for w in widgets:
+        wq = wqs.get(w.id)
+        for cand_id in (w.dataset_id, wq.dataset_id if wq else None):
+            if cand_id and cand_id in ds_by_id:
+                checked_ds[cand_id] = ds_by_id[cand_id]
+        if wq and wq.visual_spec_json:
+            for j in wq.visual_spec_json.get("joins", []) or []:
+                jid = j.get("dataset_id")
+                if jid and jid in ds_by_id:
+                    checked_ds[jid] = ds_by_id[jid]
+        if wq and wq.query_mode == "sql" and wq.sql_text:
+            try:
+                refs = validate_readonly_sql_ast(wq.sql_text, dialect="duckdb")
+                for tbl in refs:
+                    d_match = ds_by_tbl.get(tbl.lower())
+                    if d_match:
+                        checked_ds[d_match.id] = d_match
+            except Exception:
+                pass
+    for ds_item in checked_ds.values():
+        _assert_dataset_public_safe(db, org_id, ds_item)
+
+
+def _enforce_widget_dataset_permissions(
+    db: Session,
+    user: User,
+    dataset_id: Optional[str],
+    query_mode: str,
+    sql_text: Optional[str],
+    visual_spec: Optional[dict[str, Any]],
+    ip_address: Optional[str] = None,
+) -> None:
+    if dataset_id:
+        ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+        enforce_permission(db, user, "dataset", ds.id, "view", ip_address=ip_address)
+    if visual_spec:
+        for j in visual_spec.get("joins", []) or []:
+            jid = j.get("dataset_id")
+            if jid:
+                jds = get_dataset_for_org(db, str(jid), user.organization_id)
+                enforce_permission(db, user, "dataset", jds.id, "view", ip_address=ip_address)
+    if query_mode == "sql" and sql_text:
+        org_map = list_org_allowed_dataset_tables(db, user.organization_id)
+        try:
+            refs = validate_readonly_sql_ast(
+                sql_text, allowed_tables=set(org_map.keys()), require_table_allowlist=True
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid widget SQL: {exc}")
+        for tbl in refs:
+            ref_ds = org_map.get(tbl.lower())
+            if ref_ds:
+                enforce_permission(db, user, "dataset", ref_ds.id, "view", ip_address=ip_address)
+
+
+def _execute_public_sql_widget(
+    db: Session,
+    org_id: str,
+    ds: Dataset,
+    sql_text: str,
+    filters: list[dict[str, Any]],
+    named_params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """
+    Executes a public SQL widget strictly bound to its single registered dataset `ds.warehouse_table`,
+    enforcing public CLS/masking/all-RLS CTE isolation BEFORE user SQL executes.
+    """
+    from app.engines.query_engine import _bind_named_params, _combine_ctes
+    from app.engines.filter_engine import compile_filters_to_sql
+
+    cleaned_sql = (sql_text or "").strip().rstrip(";")
+    bound_sql, bound_params = _bind_named_params(cleaned_sql, named_params or {})
+    validate_readonly_sql_ast(
+        bound_sql,
+        allowed_tables={ds.warehouse_table},
+        dialect="duckdb",
+        require_table_allowlist=True,
+    )
+    sc = build_public_data_security_context(db, org_id, ds.id)
+    cols_meta = warehouse.describe_table(ds.warehouse_table)
+    cte_sql, cte_params, vis_cols = build_security_cte_sql(
+        ds.warehouse_table, cols_meta, sc, source_schema="main"
+    )
+    if sc.hidden_columns:
+        for tqual, cname in extract_ast_column_references(bound_sql, dialect="duckdb"):
+            if (not tqual or tqual.lower() == ds.warehouse_table.lower()) and cname in sc.hidden_columns:
+                raise PermissionError(f"Access denied to hidden column '{cname}'")
+
+    final_sql = _combine_ctes([cte_sql], bound_sql)
+    final_params = list(cte_params) + list(bound_params)
+    if filters:
+        for flt in filters:
+            if flt.get("is_active") is False:
+                continue
+            ff = str(flt.get("field_name") or flt.get("field") or "").strip()
+            if ff and ff in sc.hidden_columns:
+                raise PermissionError(f"Access denied to hidden column '{ff}' in filter")
+        fc = compile_filters_to_sql(filters, available_columns=set(vis_cols))
+        if fc["where_clauses"]:
+            final_sql = f"SELECT * FROM ({final_sql}) AS _qf WHERE {' AND '.join(fc['where_clauses'])}"
+            final_params.extend(fc["params"])
+
+    raw_res = warehouse.execute_query(final_sql, final_params, limit=1000)
+    cols, rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], sc)
+    return {
+        "columns": cols,
+        "rows": rows,
+        "row_count": len(rows),
+        "execution_ms": raw_res["execution_ms"],
+    }
+
+
 def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, Any]:
     pages = (
         db.query(DashboardPage)
@@ -216,17 +358,51 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
     dash_filters = db.query(DashboardFilter).filter(DashboardFilter.dashboard_id == dash.id).all()
     theme = db.query(DashboardTheme).filter(DashboardTheme.id == dash.theme_id).first() if dash.theme_id else None
 
+    w_ids = [w.id for w in widgets_all]
+    ds_ids = list({w.dataset_id for w in widgets_all if w.dataset_id})
+    page_ids = [p.id for p in pages]
+
+    cfg_map = (
+        {c.widget_id: c for c in db.query(WidgetConfig).filter(WidgetConfig.widget_id.in_(w_ids)).all()}
+        if w_ids
+        else {}
+    )
+    wq_map = (
+        {q.widget_id: q for q in db.query(WidgetQuery).filter(WidgetQuery.widget_id.in_(w_ids)).all()}
+        if w_ids
+        else {}
+    )
+    wdr_map = (
+        {d.widget_id: d for d in db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id.in_(w_ids)).all()}
+        if w_ids
+        else {}
+    )
+    wf_map: dict[str, list[WidgetFilter]] = {}
+    if w_ids:
+        for wf in db.query(WidgetFilter).filter(WidgetFilter.widget_id.in_(w_ids)).all():
+            wf_map.setdefault(wf.widget_id, []).append(wf)
+    ds_map = (
+        {d.id: d for d in db.query(Dataset).filter(Dataset.id.in_(ds_ids)).all()}
+        if ds_ids
+        else {}
+    )
+    lay_map = (
+        {l.page_id: l for l in db.query(DashboardLayout).filter(DashboardLayout.page_id.in_(page_ids)).all()}
+        if page_ids
+        else {}
+    )
+
     visible_widgets = []
     for w in widgets_all:
         parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
         dec = permission_resolver.resolve(db, user, "widget", w.id, "view", parent_chain=parent_chain)
         if not dec.allowed:
             continue
-        cfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
-        wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
-        wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
-        wfs = db.query(WidgetFilter).filter(WidgetFilter.widget_id == w.id).all()
-        ds = db.query(Dataset).filter(Dataset.id == w.dataset_id).first() if w.dataset_id else None
+        cfg = cfg_map.get(w.id)
+        wq = wq_map.get(w.id)
+        wdr = wdr_map.get(w.id)
+        wfs = wf_map.get(w.id, [])
+        ds = ds_map.get(w.dataset_id) if w.dataset_id else None
 
         can_edit_w = permission_resolver.resolve(db, user, "widget", w.id, "edit", parent_chain).allowed
         can_del_w = (
@@ -294,7 +470,7 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
 
     layouts_by_page = {}
     for p in pages:
-        lay = db.query(DashboardLayout).filter(DashboardLayout.page_id == p.id).first()
+        lay = lay_map.get(p.id)
         layouts_by_page[p.id] = {
             "columns_count": lay.columns_count if lay else 12,
             "row_height": lay.row_height if lay else 42,
@@ -366,34 +542,54 @@ def get_public_dashboard(embed_token: str, request: Request, db: Session = Depen
     if not row:
         raise HTTPException(status_code=404, detail="Shared dashboard not found or not public")
     dash, dash_org_id = row
-    org_tables = set(list_org_allowed_dataset_tables(db, dash_org_id).keys())
+    _assert_dashboard_public_safe(db, dash_org_id, dash)
 
     pages = db.query(DashboardPage).filter(DashboardPage.dashboard_id == dash.id).order_by(DashboardPage.page_order.asc()).all()
     widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
     theme = db.query(DashboardTheme).filter(DashboardTheme.id == dash.theme_id).first() if dash.theme_id else None
+    w_ids = [w.id for w in widgets]
+    wq_map = {q.widget_id: q for q in db.query(WidgetQuery).filter(WidgetQuery.widget_id.in_(w_ids)).all()} if w_ids else {}
+    cfg_map = {c.widget_id: c for c in db.query(WidgetConfig).filter(WidgetConfig.widget_id.in_(w_ids)).all()} if w_ids else {}
+    wdr_map = {d.widget_id: d for d in db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id.in_(w_ids)).all()} if w_ids else {}
+
     out_widgets = []
     for w in widgets:
-        wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
-        cfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
-        wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
+        wq = wq_map.get(w.id)
+        cfg = cfg_map.get(w.id)
+        wdr = wdr_map.get(w.id)
+        target_ds_id = wq.dataset_id if wq and wq.dataset_id else w.dataset_id
         ds = (
             db.query(Dataset)
-            .filter(Dataset.id == w.dataset_id, Dataset.organization_id == dash_org_id)
+            .filter(Dataset.id == target_ds_id, Dataset.organization_id == dash_org_id)
             .first()
-            if w.dataset_id
+            if target_ds_id
             else None
         )
-        data = {"columns": [], "rows": []}
+        data: dict[str, Any] = {"columns": [], "rows": []}
         if ds and wq:
             try:
+                _assert_dataset_public_safe(db, dash_org_id, ds)
                 if wq.query_mode == "sql" and wq.sql_text:
-                    validate_readonly_sql_ast(wq.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
-                    data = warehouse.execute_query(wq.sql_text)
-                else:
-                    sql, params, _ = build_visual_query_sql(
-                        db, ds, wq.visual_spec_json or {}, [], [], [], raw_mode=(w.chart_type == "bpmn")
+                    data = _execute_public_sql_widget(
+                        db, dash_org_id, ds, wq.sql_text, [], named_params=wq.parameters_json or {}
                     )
-                    data = warehouse.execute_query(sql, params)
+                else:
+                    sec_bundle: dict[str, Any] = {}
+                    sql, params, _ = build_visual_query_sql(
+                        db,
+                        ds,
+                        wq.visual_spec_json or {},
+                        [],
+                        [],
+                        [],
+                        raw_mode=(w.chart_type == "bpmn"),
+                        public_mode=True,
+                        security_bundle_out=sec_bundle,
+                    )
+                    raw_res = warehouse.execute_query(sql, params)
+                    eff_ctx = sec_bundle.get("merged_sec_ctx") or build_public_data_security_context(db, dash_org_id, ds.id)
+                    vis_cols, vis_rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], eff_ctx)
+                    data = {"columns": vis_cols, "rows": vis_rows, "row_count": len(vis_rows), "execution_ms": raw_res["execution_ms"]}
             except Exception:
                 pass
         out_widgets.append({
@@ -422,6 +618,10 @@ def get_public_dashboard(embed_token: str, request: Request, db: Session = Depen
         .filter((DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == dash_org_id))
         .all()
     )
+    serialized_themes = [
+        {"id": th.id, "name": th.name, "slug": th.slug, "mode": th.mode, "tokens": th.tokens_json}
+        for th in all_themes
+    ]
     return {
         "id": dash.id,
         "title": dash.title,
@@ -429,10 +629,8 @@ def get_public_dashboard(embed_token: str, request: Request, db: Session = Depen
         "theme": {
             "id": theme.id, "name": theme.name, "slug": theme.slug, "mode": theme.mode, "tokens": theme.tokens_json
         } if theme else None,
-        "available_themes": [
-            {"id": th.id, "name": th.name, "slug": th.slug, "mode": th.mode, "tokens": th.tokens_json}
-            for th in all_themes
-        ],
+        "themes": serialized_themes,
+        "available_themes": serialized_themes,
         "pages": [{"id": p.id, "title": p.title} for p in pages],
         "widgets": out_widgets,
     }
@@ -457,15 +655,18 @@ def execute_public_dashboard_batch(
     if not row:
         raise HTTPException(status_code=404, detail="Shared dashboard not found or not public")
     dash, dash_org_id = row
-    org_tables = set(list_org_allowed_dataset_tables(db, dash_org_id).keys())
+    _assert_dashboard_public_safe(db, dash_org_id, dash)
 
     t0 = time.perf_counter()
     widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
+    w_ids = [w.id for w in widgets]
+    wq_map = {q.widget_id: q for q in db.query(WidgetQuery).filter(WidgetQuery.widget_id.in_(w_ids)).all()} if w_ids else {}
+    wdr_map = {d.widget_id: d for d in db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id.in_(w_ids)).all()} if w_ids else {}
     results: dict[str, Any] = {}
 
     for w in widgets:
-        wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
-        wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
+        wq = wq_map.get(w.id)
+        wdr = wdr_map.get(w.id)
         target_ds_id = wq.dataset_id if wq and wq.dataset_id else w.dataset_id
         ds = (
             db.query(Dataset)
@@ -506,18 +707,37 @@ def execute_public_dashboard_batch(
                 eff_filters.append(cf)
         eff_filters.extend(drill_filters)
 
-        data = {"columns": [], "rows": [], "row_count": 0, "execution_ms": 0.0}
+        data: dict[str, Any] = {"columns": [], "rows": [], "row_count": 0, "execution_ms": 0.0}
         if ds and wq:
             try:
+                _assert_dataset_public_safe(db, dash_org_id, ds)
                 if wq.query_mode == "sql" and wq.sql_text:
-                    validate_readonly_sql_ast(wq.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
-                    data = warehouse.execute_query(wq.sql_text)
-                else:
-                    sql, params, _ = build_visual_query_sql(
-                        db, ds, wq.visual_spec_json or {}, eff_filters, [], [],
-                        override_dimension=eff_dim, raw_mode=(eff_chart == "bpmn"),
+                    data = _execute_public_sql_widget(
+                        db, dash_org_id, ds, wq.sql_text, eff_filters, named_params=wq.parameters_json or {}
                     )
-                    data = warehouse.execute_query(sql, params)
+                else:
+                    sec_bundle: dict[str, Any] = {}
+                    sql, params, _ = build_visual_query_sql(
+                        db,
+                        ds,
+                        wq.visual_spec_json or {},
+                        eff_filters,
+                        [],
+                        [],
+                        override_dimension=eff_dim,
+                        raw_mode=(eff_chart == "bpmn"),
+                        public_mode=True,
+                        security_bundle_out=sec_bundle,
+                    )
+                    raw_res = warehouse.execute_query(sql, params)
+                    eff_ctx = sec_bundle.get("merged_sec_ctx") or build_public_data_security_context(db, dash_org_id, ds.id)
+                    vis_cols, vis_rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], eff_ctx)
+                    data = {
+                        "columns": vis_cols,
+                        "rows": vis_rows,
+                        "row_count": len(vis_rows),
+                        "execution_ms": raw_res["execution_ms"],
+                    }
             except Exception:
                 data = {"columns": [], "rows": [], "error": "Widget query could not be executed"}
 
@@ -569,6 +789,17 @@ def list_dashboards(user: User = Depends(get_current_user), db: Session = Depend
         .filter(Workspace.organization_id == user.organization_id)
         .all()
     )
+    dash_ids = [d.id for d in all_dash]
+    widget_counts: dict[str, int] = (
+        dict(
+            db.query(Widget.dashboard_id, func.count(Widget.id))
+            .filter(Widget.dashboard_id.in_(dash_ids))
+            .group_by(Widget.dashboard_id)
+            .all()
+        )
+        if dash_ids
+        else {}
+    )
     visible = []
     for d in all_dash:
         if d.is_public or permission_resolver.resolve(db, user, "dashboard", d.id, "view").allowed:
@@ -576,7 +807,7 @@ def list_dashboards(user: User = Depends(get_current_user), db: Session = Depend
                 "id": d.id, "workspace_id": d.workspace_id, "title": d.title,
                 "description": d.description, "theme_id": d.theme_id, "is_public": d.is_public,
                 "is_template": d.is_template, "updated_at": d.updated_at,
-                "widget_count": db.query(Widget).filter(Widget.dashboard_id == d.id).count(),
+                "widget_count": int(widget_counts.get(d.id, 0)),
             })
     return visible
 
@@ -588,7 +819,10 @@ def create_dashboard(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    enforce_permission(db, user, "dashboard", "*", "add", ip_address=get_client_ip(request))
+    ip = get_client_ip(request)
+    enforce_permission(db, user, "dashboard", "*", "add", ip_address=ip)
+    if body.is_public:
+        enforce_permission(db, user, "dashboard", "*", "share", ip_address=ip)
     if body.workspace_id:
         ws = get_workspace_for_org(db, body.workspace_id, user.organization_id)
     else:
@@ -605,6 +839,7 @@ def create_dashboard(
         theme_id=body.theme_id,
         is_template=body.is_template,
         is_public=body.is_public,
+        embed_token=secrets.token_urlsafe(24) if body.is_public else None,
         created_by=user.id,
     )
     db.add(d)
@@ -662,6 +897,10 @@ def update_dashboard(
 
     if body.is_public is not None:
         enforce_permission(db, user, "dashboard", dash.id, "share", ip_address=get_client_ip(request))
+        if body.is_public:
+            _assert_dashboard_public_safe(db, user.organization_id, dash)
+            if not dash.embed_token:
+                dash.embed_token = secrets.token_urlsafe(24)
         dash.is_public = body.is_public
     if body.title is not None:
         dash.title = body.title
@@ -753,16 +992,14 @@ def create_widget(
     page, page_dash = get_page_for_org(db, body.page_id, user.organization_id)
     if page_dash.id != dash.id:
         raise HTTPException(status_code=400, detail="Page does not belong to dashboard")
-    if body.dataset_id:
-        get_dataset_for_org(db, body.dataset_id, user.organization_id)
+    _enforce_widget_dataset_permissions(
+        db, user, body.dataset_id, body.query_mode, body.sql_text, body.visual_spec, ip_address=ip
+    )
+    if dash.is_public and body.dataset_id:
+        ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
+        _assert_dataset_public_safe(db, user.organization_id, ds)
     if body.chart_type not in ALL_30_CHART_TYPES:
         raise HTTPException(status_code=400, detail=f"Unsupported chart_type: {body.chart_type}")
-    if body.query_mode == "sql" and body.sql_text:
-        org_tables = set(list_org_allowed_dataset_tables(db, user.organization_id).keys())
-        try:
-            validate_readonly_sql_ast(body.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid widget SQL: {exc}")
 
     w = Widget(
         dashboard_id=dash.id, page_id=page.id, title=body.title,
@@ -800,16 +1037,18 @@ def update_widget(
 ):
     w, dash = get_widget_for_org(db, widget_id, user.organization_id)
     parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
-    enforce_permission(db, user, "widget", w.id, "edit", parent_chain=parent_chain, ip_address=get_client_ip(request))
+    ip = get_client_ip(request)
+    enforce_permission(db, user, "widget", w.id, "edit", parent_chain=parent_chain, ip_address=ip)
 
-    if body.dataset_id is not None:
-        get_dataset_for_org(db, body.dataset_id, user.organization_id)
-    if body.sql_text is not None:
-        org_tables = set(list_org_allowed_dataset_tables(db, user.organization_id).keys())
-        try:
-            validate_readonly_sql_ast(body.sql_text, allowed_tables=org_tables, require_table_allowlist=True)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid widget SQL: {exc}")
+    eff_wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
+    eff_mode = body.query_mode or (eff_wq.query_mode if eff_wq else "visual")
+    eff_ds = body.dataset_id if body.dataset_id is not None else w.dataset_id
+    eff_spec = body.visual_spec_json if body.visual_spec_json is not None else (eff_wq.visual_spec_json if eff_wq else {})
+    eff_sql = body.sql_text if body.sql_text is not None else (eff_wq.sql_text if eff_wq else None)
+    if any(x is not None for x in (body.dataset_id, body.sql_text, body.visual_spec_json, body.query_mode)):
+        _enforce_widget_dataset_permissions(db, user, eff_ds, eff_mode, eff_sql, eff_spec, ip_address=ip)
+        if dash.is_public and eff_ds:
+            _assert_dataset_public_safe(db, user.organization_id, get_dataset_for_org(db, eff_ds, user.organization_id))
 
     if body.title is not None:
         w.title = body.title
@@ -1168,16 +1407,29 @@ def _execute_single_widget(
             named_params=wq.parameters_json or {},
             filters=effective_filters,
             dashboard_id=w.dashboard_id, widget_id=w.id, use_cache=use_cache,
-            enforce_dataset_rbac=False,
+            enforce_dataset_rbac=True,
         )
     elif ds:
         sec_ctx = build_data_security_context(db, user, ds.id)
-        perm_hash = permission_resolver.get_permission_context_hash(db, user) + ":" + sec_ctx.context_hash
         visual_spec = dict(wq.visual_spec_json) if wq else {}
         is_bpmn_raw = drill_info["effective_chart_type"] == "bpmn"
+        sec_bundle: dict[str, Any] = {}
+        sql, params, _ = build_visual_query_sql(
+            db, ds, visual_spec, effective_filters, sec_ctx.rls_where_clauses, sec_ctx.rls_params,
+            override_dimension=drill_info["effective_dimension"],
+            raw_mode=drill_info["is_raw_level"] or is_bpmn_raw,
+            user=user,
+            enforce_join_rbac=True,
+            security_bundle_out=sec_bundle,
+        )
+        eff_ctx: DataSecurityContext = sec_bundle.get("merged_sec_ctx") or sec_ctx
+        combined_sec_hash = sec_bundle.get("combined_context_hash") or sec_ctx.context_hash
+        joined_versions = sec_bundle.get("joined_versions") or []
+        perm_hash = permission_resolver.get_permission_context_hash(db, user) + ":" + combined_sec_hash
         q_hash = cache_manager.hash_dict({
             "spec": visual_spec, "dim": drill_info["effective_dimension"],
             "raw": drill_info["is_raw_level"] or is_bpmn_raw, "chart": drill_info["effective_chart_type"],
+            "joined_versions": joined_versions,
         })
         f_hash = cache_manager.hash_dict(effective_filters)
         cache_key = cache_manager.build_key(
@@ -1189,13 +1441,8 @@ def _execute_single_widget(
         if cached is not None:
             res = {**cached, "cache_hit": True}
         else:
-            sql, params, _ = build_visual_query_sql(
-                db, ds, visual_spec, effective_filters, sec_ctx.rls_where_clauses, sec_ctx.rls_params,
-                override_dimension=drill_info["effective_dimension"],
-                raw_mode=drill_info["is_raw_level"] or is_bpmn_raw,
-            )
             raw_res = warehouse.execute_query(sql, params)
-            vis_cols, masked_rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], sec_ctx)
+            vis_cols, masked_rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], eff_ctx)
             res = {
                 "columns": vis_cols,
                 "rows": masked_rows,
@@ -1253,10 +1500,17 @@ def get_widget_data(
     db: Session = Depends(get_db),
 ):
     w, _ = get_widget_for_org(db, widget_id, user.organization_id)
-    return _execute_single_widget(
-        db, user, w, body.active_filters, body.cross_filters, body.drill_stack,
-        body.use_cache, ip_address=get_client_ip(request)
-    )
+    try:
+        return _execute_single_widget(
+            db, user, w, body.active_filters, body.cross_filters, body.drill_stack,
+            body.use_cache, ip_address=get_client_ip(request)
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/{dashboard_id}/execute-batch")
@@ -1445,6 +1699,7 @@ def add_comment(
 def generate_share_link(dashboard_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
     enforce_permission(db, user, "dashboard", dash.id, "share")
+    _assert_dashboard_public_safe(db, user.organization_id, dash)
     if not dash.embed_token:
         dash.embed_token = secrets.token_urlsafe(24)
     dash.is_public = True

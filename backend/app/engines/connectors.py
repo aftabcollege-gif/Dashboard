@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import sqlite3
+import time
 import zipfile
 from typing import Any, Iterable, Optional
 from urllib.parse import urlparse
@@ -551,6 +552,43 @@ class DataConnectorEngine:
         return []
 
     @staticmethod
+    def _qmark_to_pyformat(sql: str) -> str:
+        """Convert DB-API '?' placeholders outside single-quoted string literals to '%s'."""
+        out: list[str] = []
+        i = 0
+        n = len(sql)
+        in_quote = False
+        while i < n:
+            ch = sql[i]
+            if ch == "'":
+                out.append(ch)
+                if in_quote and i + 1 < n and sql[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                in_quote = not in_quote
+                i += 1
+                continue
+            if not in_quote and ch == "?":
+                out.append("%s")
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    @staticmethod
+    def _fetch_bounded_df(cur, max_rows: int) -> pd.DataFrame:
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows: list[Any] = []
+        while len(rows) < max_rows:
+            chunk = cur.fetchmany(min(2000, max_rows - len(rows)))
+            if not chunk:
+                break
+            rows.extend(chunk)
+        return pd.DataFrame(rows, columns=cols)
+
+    @staticmethod
     def extract_dataframe(
         source_type: str,
         config: dict[str, Any],
@@ -559,22 +597,51 @@ class DataConnectorEngine:
         table_name: Optional[str] = None,
         read_only: bool = True,
         query_params: Optional[list[Any]] = None,
+        max_rows: Optional[int] = None,
+        timeout_sec: Optional[int] = None,
     ) -> pd.DataFrame:
         st = source_type.lower()
         safe_table = sanitize_identifier(table_name) if table_name else None
         sql = query or (f'SELECT * FROM "{safe_table}"' if safe_table else None)
-        if read_only and sql:
-            dialect = "sqlite" if st == "sqlite" else "postgres" if st == "postgresql" else "mysql" if st in ("mysql", "mariadb") else "duckdb"
+        eff_max_rows = max(1, min(int(max_rows or settings.MAX_EXTRACT_ROWS), settings.MAX_EXTRACT_ROWS))
+        eff_timeout = max(1, min(int(timeout_sec or settings.EXTERNAL_QUERY_TIMEOUT_SECONDS), 120))
+
+        # Unconditionally enforce AST read-only validation regardless of DataSource.read_only flag
+        if sql:
+            dialect = (
+                "sqlite"
+                if st == "sqlite"
+                else "postgres"
+                if st == "postgresql"
+                else "mysql"
+                if st in ("mysql", "mariadb")
+                else "duckdb"
+            )
             validate_readonly_sql(sql, dialect=dialect)
 
         if st == "sqlite":
             db_path = DataConnectorEngine._validate_sqlite_path(
                 config.get("file_path") or config.get("database")
             )
-            uri_mode = f"file:{db_path}?mode=ro" if read_only else f"file:{db_path}"
-            conn = sqlite3.connect(uri_mode, uri=True, timeout=5)
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=eff_timeout)
             try:
-                return pd.read_sql_query(sql, conn, params=query_params)
+                try:
+                    conn.execute("PRAGMA query_only = ON")
+                except Exception:
+                    pass
+                deadline = time.monotonic() + float(eff_timeout)
+
+                def _progress_abort() -> int:
+                    return 1 if time.monotonic() > deadline else 0
+
+                conn.set_progress_handler(_progress_abort, 10000)
+                try:
+                    cur = conn.execute(sql, tuple(query_params or ()))
+                    return DataConnectorEngine._fetch_bounded_df(cur, eff_max_rows)
+                except sqlite3.OperationalError as exc:
+                    if "interrupted" in str(exc).lower():
+                        raise TimeoutError(f"SQLite query exceeded {eff_timeout}s timeout") from exc
+                    raise
             finally:
                 conn.close()
 
@@ -586,11 +653,20 @@ class DataConnectorEngine:
                 dbname=config.get("database", "postgres"),
                 user=credentials.get("username", ""),
                 password=credentials.get("password", ""),
-                connect_timeout=5,
+                connect_timeout=eff_timeout,
             )
             try:
-                return pd.read_sql_query(sql, conn, params=query_params)
+                conn.set_session(readonly=True, autocommit=False)
+                cur = conn.cursor()
+                cur.execute(f"SET LOCAL statement_timeout = {int(eff_timeout * 1000)}")
+                pg_sql = DataConnectorEngine._qmark_to_pyformat(sql) if query_params else sql
+                cur.execute(pg_sql, tuple(query_params) if query_params else None)
+                return DataConnectorEngine._fetch_bounded_df(cur, eff_max_rows)
             finally:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 conn.close()
 
         if st in ("mysql", "mariadb"):
@@ -601,21 +677,34 @@ class DataConnectorEngine:
                 database=config.get("database", ""),
                 user=credentials.get("username", ""),
                 password=credentials.get("password", ""),
-                connect_timeout=5,
+                connect_timeout=eff_timeout,
+                read_timeout=eff_timeout,
+                write_timeout=eff_timeout,
             )
             try:
-                return pd.read_sql_query(sql, conn, params=query_params)
+                cur = conn.cursor()
+                try:
+                    cur.execute("SET SESSION TRANSACTION READ ONLY")
+                except Exception:
+                    pass
+                try:
+                    cur.execute(f"SET SESSION MAX_EXECUTION_TIME = {int(eff_timeout * 1000)}")
+                except Exception:
+                    pass
+                my_sql = DataConnectorEngine._qmark_to_pyformat(sql) if query_params else sql
+                cur.execute(my_sql, tuple(query_params) if query_params else None)
+                return DataConnectorEngine._fetch_bounded_df(cur, eff_max_rows)
             finally:
                 conn.close()
 
         if st == "mongodb":
             from pymongo import MongoClient
             uri = credentials.get("connection_uri") or config.get("uri")
-            client = MongoClient(uri, serverSelectionTimeoutMS=4000)
+            client = MongoClient(uri, serverSelectionTimeoutMS=min(eff_timeout * 1000, 10000))
             try:
                 db = client[config.get("database", "test")]
                 coll = db[table_name or config.get("collection", "items")]
-                docs = list(coll.find({}, {"_id": 0}).limit(50000))
+                docs = list(coll.find({}, {"_id": 0}).max_time_ms(eff_timeout * 1000).limit(min(eff_max_rows, 50000)))
                 return pd.json_normalize(docs)
             finally:
                 client.close()
@@ -628,7 +717,7 @@ class DataConnectorEngine:
             headers = dict(config.get("headers", {}))
             if credentials.get("bearer_token"):
                 headers["Authorization"] = f"Bearer {credentials['bearer_token']}"
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=float(eff_timeout)) as client:
                 if st == "graphql":
                     resp = client.post(url, json={"query": query or config.get("query", "")}, headers=headers)
                 else:
@@ -644,6 +733,7 @@ class DataConnectorEngine:
                         if isinstance(v, list):
                             data = v
                             break
-                return pd.json_normalize(data if isinstance(data, list) else [data])
+                df_api = pd.json_normalize(data if isinstance(data, list) else [data])
+                return df_api.head(eff_max_rows)
 
         raise ValueError(f"Cannot extract live rows from source type: {source_type}")

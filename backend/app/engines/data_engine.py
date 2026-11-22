@@ -1,6 +1,7 @@
 import re
 from typing import Any, Optional
 import pandas as pd
+from app.core.rls_cls import DataSecurityContext, build_security_projection_and_where
 from app.core.sql_guard import safe_eval_dataframe_formula, validate_formula_ast
 from app.engines.warehouse import sanitize_identifier, warehouse
 
@@ -112,21 +113,34 @@ class DataProfiler:
         rls_clauses: Optional[list[str]] = None,
         rls_params: Optional[list[Any]] = None,
         hidden_columns: Optional[set[str]] = None,
+        sec_ctx: Optional[DataSecurityContext] = None,
     ) -> dict[str, Any]:
         cols_info = warehouse.describe_table(table_name)
-        where_sql = f"WHERE {' AND '.join(rls_clauses)}" if rls_clauses else ""
-        params = list(rls_params or [])
-        count_res = warehouse.execute_query(f'SELECT COUNT(*) AS cnt FROM "{table_name}" {where_sql}', params)
+        eff_ctx = sec_ctx or DataSecurityContext(
+            user_id="profiler",
+            rls_where_clauses=list(rls_clauses or []),
+            rls_params=list(rls_params or []),
+            hidden_columns=set(hidden_columns or set()),
+            masked_columns={},
+            context_hash="profiler",
+        )
+        sub_sql, params, visible_cols = build_security_projection_and_where(
+            table_name, cols_info, eff_ctx, source_schema="main"
+        )
+        count_res = warehouse.execute_query(f"SELECT COUNT(*) AS cnt FROM ({sub_sql}) AS _prof", params)
         row_count = int(count_res["rows"][0]["cnt"]) if count_res["rows"] else 0
 
-        hidden = hidden_columns or set()
+        visible_set = set(visible_cols)
         field_stats: list[dict[str, Any]] = []
         for c in cols_info:
             cname = c["column_name"]
-            if cname in hidden:
+            if cname not in visible_set:
                 continue
             ctype = c["column_type"].lower()
-            is_num = any(k in ctype for k in ("int", "double", "float", "decimal", "hugeint", "bigint"))
+            is_masked = cname in eff_ctx.masked_columns
+            is_num = (not is_masked) and any(
+                k in ctype for k in ("int", "double", "float", "decimal", "hugeint", "bigint")
+            )
             if is_num:
                 q = f'''
                     SELECT
@@ -136,7 +150,7 @@ class DataProfiler:
                         MAX("{cname}") AS max_val,
                         AVG("{cname}") AS avg_val,
                         MEDIAN("{cname}") AS median_val
-                    FROM "{table_name}" {where_sql}
+                    FROM ({sub_sql}) AS _prof
                 '''
             else:
                 q = f'''
@@ -147,13 +161,13 @@ class DataProfiler:
                         CAST(MAX("{cname}") AS VARCHAR) AS max_val,
                         NULL AS avg_val,
                         NULL AS median_val
-                    FROM "{table_name}" {where_sql}
+                    FROM ({sub_sql}) AS _prof
                 '''
             stat = warehouse.execute_query(q, params)["rows"][0]
             field_stats.append(
                 {
                     "field_name": cname,
-                    "raw_type": c["column_type"],
+                    "raw_type": "VARCHAR" if is_masked else c["column_type"],
                     "distinct_count": int(stat["distinct_cnt"] or 0),
                     "null_count": int(stat["null_cnt"] or 0),
                     "min": stat["min_val"],

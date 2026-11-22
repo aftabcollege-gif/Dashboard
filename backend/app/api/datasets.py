@@ -74,7 +74,9 @@ def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(
     for d in rows:
         if not permission_resolver.resolve(db, user, "dataset", d.id, "view").allowed:
             continue
+        sec_ctx = build_data_security_context(db, user, d.id)
         fields = db.query(DatasetField).filter(DatasetField.dataset_id == d.id).all()
+        visible_fields = [f for f in fields if f.field_name not in sec_ctx.hidden_columns]
         out.append({
             "id": d.id,
             "name": d.name,
@@ -94,7 +96,7 @@ def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(
                     "data_type": f.data_type, "semantic_role": f.semantic_role,
                     "is_primary_key": f.is_primary_key, "is_calculated": f.is_calculated, "expression": f.expression
                 }
-                for f in fields
+                for f in visible_fields
             ],
         })
     return out
@@ -193,9 +195,7 @@ def profile_dataset(dataset_id: str, user: User = Depends(get_current_user), db:
     sec_ctx = build_data_security_context(db, user, ds.id)
     return DataProfiler.profile_table(
         ds.warehouse_table,
-        rls_clauses=sec_ctx.rls_where_clauses,
-        rls_params=sec_ctx.rls_params,
-        hidden_columns=sec_ctx.hidden_columns,
+        sec_ctx=sec_ctx,
     )
 
 
@@ -228,15 +228,21 @@ def cascading_filter_options(
     sec_ctx = build_data_security_context(db, user, ds.id)
     if body.field_name in sec_ctx.hidden_columns:
         return {"values": []}
-    vals = get_cascading_filter_options(
-        ds.warehouse_table,
-        body.field_name,
-        body.parent_filters,
-        sec_ctx.rls_where_clauses,
-        sec_ctx.rls_params,
-        search=body.search,
-        limit=body.limit,
-    )
+    try:
+        vals = get_cascading_filter_options(
+            ds.warehouse_table,
+            body.field_name,
+            body.parent_filters,
+            sec_ctx.rls_where_clauses,
+            sec_ctx.rls_params,
+            search=body.search,
+            limit=body.limit,
+            sec_ctx=sec_ctx,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"field_name": body.field_name, "values": vals}
 
 

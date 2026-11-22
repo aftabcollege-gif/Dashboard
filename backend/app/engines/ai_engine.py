@@ -2,6 +2,7 @@ import math
 import re
 from typing import Any, Optional
 from sqlalchemy.orm import Session
+from app.core.rls_cls import build_data_security_context
 from app.engines.data_engine import DataProfiler
 from app.engines.query_engine import execute_dataset_sql
 from app.engines.warehouse import warehouse
@@ -30,12 +31,20 @@ class AiAnalyticsEngine:
     """
 
     @staticmethod
-    def recommend_widgets_for_dataset(db: Session, dataset: Dataset) -> dict[str, Any]:
-        fields = db.query(DatasetField).filter(DatasetField.dataset_id == dataset.id).all()
+    def recommend_widgets_for_dataset(
+        db: Session, dataset: Dataset, user: Optional[User] = None
+    ) -> dict[str, Any]:
+        sec_ctx = build_data_security_context(db, user, dataset.id) if user is not None else None
+        hidden = sec_ctx.hidden_columns if sec_ctx else set()
+        fields = [
+            f
+            for f in db.query(DatasetField).filter(DatasetField.dataset_id == dataset.id).all()
+            if f.field_name not in hidden
+        ]
         label_map: dict[str, str] = {}
         if not fields:
             # Infer from warehouse table directly
-            cols = warehouse.describe_table(dataset.warehouse_table)
+            cols = [c for c in warehouse.describe_table(dataset.warehouse_table) if c["column_name"] not in hidden]
             measures = [
                 c["column_name"]
                 for c in cols
@@ -143,7 +152,7 @@ class AiAnalyticsEngine:
                 if d
             ][:4]
             return {
-                "profile": DataProfiler.profile_table(dataset.warehouse_table),
+                "profile": DataProfiler.profile_table(dataset.warehouse_table, sec_ctx=sec_ctx),
                 "suggested_widgets": specs,
                 "suggested_filters": suggested_filters,
             }
@@ -241,7 +250,7 @@ class AiAnalyticsEngine:
             for d in (dims + geos)[:3]
         ]
         return {
-            "profile": DataProfiler.profile_table(dataset.warehouse_table),
+            "profile": DataProfiler.profile_table(dataset.warehouse_table, sec_ctx=sec_ctx),
             "suggested_widgets": specs,
             "suggested_filters": suggested_filters,
         }
@@ -254,7 +263,7 @@ class AiAnalyticsEngine:
         dataset: Dataset,
         title: Optional[str] = None,
     ) -> Dashboard:
-        rec = AiAnalyticsEngine.recommend_widgets_for_dataset(db, dataset)
+        rec = AiAnalyticsEngine.recommend_widgets_for_dataset(db, dataset, user=user)
         dash = Dashboard(
             workspace_id=workspace_id,
             title=title or f"AI Executive Insights — {dataset.name}",
@@ -618,8 +627,16 @@ class AiAnalyticsEngine:
         return None
 
     @staticmethod
-    def _get_dataset_schema(db: Session, ds: Dataset) -> tuple[list[dict[str, str]], list[str], list[str]]:
-        fields = db.query(DatasetField).filter(DatasetField.dataset_id == ds.id).all()
+    def _get_dataset_schema(
+        db: Session, ds: Dataset, user: Optional[User] = None
+    ) -> tuple[list[dict[str, str]], list[str], list[str]]:
+        sec_ctx = build_data_security_context(db, user, ds.id) if user is not None else None
+        hidden = sec_ctx.hidden_columns if sec_ctx else set()
+        fields = [
+            f
+            for f in db.query(DatasetField).filter(DatasetField.dataset_id == ds.id).all()
+            if f.field_name not in hidden
+        ]
         cols_info: list[dict[str, str]] = []
         if fields:
             for f in fields:
@@ -635,6 +652,8 @@ class AiAnalyticsEngine:
             raw_cols = warehouse.describe_table(ds.warehouse_table)
             for c in raw_cols:
                 cname = c["column_name"]
+                if cname in hidden:
+                    continue
                 ctype = (c.get("column_type") or "").lower()
                 is_num = (
                     any(k in ctype for k in ("int", "double", "float", "decimal", "numeric"))
@@ -879,7 +898,7 @@ class AiAnalyticsEngine:
                 matching_ds: list[Dataset] = []
                 probe_text = dim_mention or semantic_low
                 for d in datasets:
-                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d)
+                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d, user=user)
                     if dim_mention and AiAnalyticsEngine._match_column(dim_mention, cinfo, role_filter="dim"):
                         matching_ds.append(d)
                     elif not dim_mention and AiAnalyticsEngine._match_column(probe_text, cinfo):
@@ -941,7 +960,7 @@ class AiAnalyticsEngine:
             }
 
         # Now we have chosen_ds -> inspect its real columns!
-        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, chosen_ds)
+        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, chosen_ds, user=user)
 
         # Question B: Chart type if completely unspecified
         if not chart_type:
@@ -1126,6 +1145,7 @@ class AiAnalyticsEngine:
         sql, params, _ = build_visual_query_sql(
             db, chosen_ds, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
             raw_mode=(eff_chart == "bpmn"),
+            user=user,
         )
         raw_preview = warehouse.execute_query(sql, params)
         vis_cols, vis_rows = apply_cls_and_masking(raw_preview["columns"], raw_preview["rows"], sec_ctx)
@@ -1342,7 +1362,7 @@ class AiAnalyticsEngine:
             db.add(ws)
             db.flush()
 
-        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, ds)
+        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, ds, user=user)
         col_label_map = {c["name"]: c["label"] for c in cols_info}
 
         def _lbl(col: Optional[str]) -> str:
@@ -1905,14 +1925,14 @@ class AiAnalyticsEngine:
                     if w.dataset_id:
                         d_obj = next((x for x in ds_candidates if x.id == w.dataset_id), None)
                         if d_obj:
-                            cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d_obj)
+                            cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d_obj, user=user)
                             col = AiAnalyticsEngine._match_column(combined_low, cinfo, role_filter="dim")
                             if col:
                                 matched_col = col
                                 matched_ds = d_obj
                                 break
                 if matched_col and matched_ds:
-                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, matched_ds)
+                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, matched_ds, user=user)
                     lbl = next((c["label"] for c in cinfo if c["name"] == matched_col), matched_col)
                     db.add(
                         DashboardFilter(
@@ -2014,7 +2034,7 @@ class AiAnalyticsEngine:
         new_y: Optional[str] = None
         new_agg: Optional[str] = None
         if ds_obj:
-            cinfo, num_cols, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj)
+            cinfo, num_cols, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj, user=user)
             m_dim = re.search(
                 r"(?:بر\s+اساس|به\s+تفکیک|بر\s+حسب|روی\s+محور)\s+[\"«']?([^\"»'\n]+?)[\"»']?(?=\s*(?:نشان|نمایش|تبدیل|کن|بده|$))",
                 combined_text,
@@ -2075,7 +2095,7 @@ class AiAnalyticsEngine:
         if new_agg:
             visual_spec["aggregation"] = new_agg
         if target_widget.chart_type == "bpmn" and not visual_spec.get("bpmn_config") and ds_obj:
-            cinfo_e, _, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj)
+            cinfo_e, _, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj, user=user)
             inferred_e = AiAnalyticsEngine._infer_bpmn_config_from_cols(cinfo_e)
             if inferred_e:
                 visual_spec["bpmn_config"] = {**inferred_e, "heatmap_enabled": True}
@@ -2093,6 +2113,7 @@ class AiAnalyticsEngine:
             generated_sql, params, _ = build_visual_query_sql(
                 db, ds_obj, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
                 raw_mode=(target_widget.chart_type == "bpmn"),
+                user=user,
             )
             raw_prev = warehouse.execute_query(generated_sql, params)
             vis_cols, vis_rows = apply_cls_and_masking(raw_prev["columns"], raw_prev["rows"], sec_ctx)
