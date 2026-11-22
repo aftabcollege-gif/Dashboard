@@ -267,7 +267,7 @@ def main() -> None:
                 # 6. Verify files persisted ONLY in BI_DATA_DIR
                 assert (data_dir / "app_metadata.db").exists()
                 assert (data_dir / "warehouse.duckdb").exists()
-                assert len(list((data_dir / "uploads").iterdir())) == 1
+                assert len([p for p in (data_dir / "uploads").rglob("*") if p.is_file()]) == 1
                 print("[ok] All databases and uploaded files written strictly inside BI_DATA_DIR.")
 
                 # 7. Graceful shutdown test

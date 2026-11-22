@@ -195,12 +195,13 @@ try {
     if (-not $tok) { throw "Missing access_token from bootstrap-admin" }
 
     $headers = @{ Authorization = "Bearer $tok" }
-    $dashes = Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards" -Headers $headers -Method GET
+    $dashes = @(Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards" -Headers $headers -Method GET)
     if ($dashes.Count -lt 1) { throw "Expected seeded sample dashboards" }
 
     $dashId = $dashes[0].id
     $execRes = Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards/$dashId/execute-batch" -Headers $headers -Method POST -ContentType "application/json" -Body "{}"
-    if ($execRes.widgets.Count -lt 1) { throw "Expected widget execution results from DuckDB" }
+    $execWidgetCount = @($execRes.widgets.PSObject.Properties).Count
+    if ($execWidgetCount -lt 1) { throw "Expected widget execution results from DuckDB, got $execWidgetCount" }
 
     $bpmnDash = @($dashes) | Where-Object { $_.title -like "*BPMN*" } | Select-Object -First 1
     if (-not $bpmnDash) { throw "Expected seeded BPMN Bottleneck dashboard" }
@@ -219,6 +220,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "CSV file upload via bundled web gateway failed" }
     $impJson = $impOut | ConvertFrom-Json
     if ($impJson.row_count -ne 2) { throw "Expected 2 imported CSV rows, got $($impJson.row_count)" }
+    Write-Host "[ok] Verified CSV file upload via bundled web gateway."
 
     # Shutdown gracefully
     Invoke-RestMethod -Uri "$baseUrl/__gateway/shutdown" -Method POST -Headers @{ "X-Gateway-Token" = $ctrlTok } | Out-Null
@@ -233,7 +235,7 @@ finally {
 
 if (-not (Test-Path (Join-Path $DataDir "app_metadata.db"))) { throw "SQLite DB missing in BI_DATA_DIR" }
 if (-not (Test-Path (Join-Path $DataDir "warehouse.duckdb"))) { throw "DuckDB warehouse missing in BI_DATA_DIR" }
-if (-not (Get-ChildItem -Path (Join-Path $DataDir "uploads") -File)) { throw "Uploaded CSV missing in BI_DATA_DIR\uploads" }
+if (@(Get-ChildItem -Path (Join-Path $DataDir "uploads") -File -Recurse).Count -lt 1) { throw "Uploaded CSV missing in BI_DATA_DIR\uploads" }
 
 Write-Host "=== 4. Running silent uninstall and verifying user data is preserved ==="
 $unins = Join-Path $InstallDir "unins000.exe"

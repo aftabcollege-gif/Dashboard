@@ -144,7 +144,7 @@ if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
 if ($LASTEXITCODE -ne 0) { throw "pip install requirements failed" }
 
 # Smoke-check critical Python C-extension imports inside bundled runtime
-& $BundledPython -c "import fastapi, uvicorn, sqlalchemy, alembic, duckdb, pandas, openpyxl, reportlab, cryptography, bcrypt, apscheduler, sqlparse, ldap3; print('PYTHON_RUNTIME_OK')"
+& $BundledPython -c "import fastapi, uvicorn, sqlalchemy, alembic, duckdb, pandas, openpyxl, reportlab, cryptography, bcrypt, apscheduler, sqlparse, sqlglot, defusedxml, ldap3; print('PYTHON_RUNTIME_OK')"
 if ($LASTEXITCODE -ne 0) { throw "Bundled Python dependency smoke check failed" }
 
 # Strip __pycache__ inside site-packages to keep installer compact
