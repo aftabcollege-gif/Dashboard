@@ -222,7 +222,7 @@ def main() -> None:
 
                 # 5. Verify DuckDB analytics, dashboard batch execution, and CSV file upload via gateway
                 dashes = client.get(f"{base_url}/api/v1/dashboards", headers=headers).json()
-                assert len(dashes) >= 3
+                assert len(dashes) >= 4
                 exec_res = client.post(
                     f"{base_url}/api/v1/dashboards/{dashes[0]['id']}/execute-batch",
                     headers=headers,
@@ -230,6 +230,18 @@ def main() -> None:
                 )
                 assert exec_res.status_code == 200
                 assert len(exec_res.json()["widgets"]) >= 6
+
+                bpmn_dash = next((d for d in dashes if "BPMN" in d.get("title", "")), None)
+                assert bpmn_dash is not None, f"BPMN dashboard missing from {[d.get('title') for d in dashes]}"
+                bpmn_exec = client.post(
+                    f"{base_url}/api/v1/dashboards/{bpmn_dash['id']}/execute-batch",
+                    headers=headers,
+                    json={},
+                )
+                assert bpmn_exec.status_code == 200
+                bpmn_widgets = bpmn_exec.json()["widgets"]
+                assert len(bpmn_widgets) >= 6, f"Expected >=6 BPMN widgets, got {len(bpmn_widgets)}"
+                print(f"[ok] Verified BPMN Bottleneck dashboard execution ({len(bpmn_widgets)} widgets).")
 
                 csv_bytes = b"region,product,sales\nNorth,WidgetA,1200\nSouth,WidgetB,2450\n"
                 imp = client.post(

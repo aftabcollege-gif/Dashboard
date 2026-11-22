@@ -178,11 +178,12 @@ try {
     $execRes = Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards/$dashId/execute-batch" -Headers $headers -Method POST -ContentType "application/json" -Body "{}"
     if ($execRes.widgets.Count -lt 1) { throw "Expected widget execution results from DuckDB" }
 
-    $bpmnDash = $dashes | Where-Object { $_.title -like "*BPMN*" } | Select-Object -First 1
+    $bpmnDash = @($dashes) | Where-Object { $_.title -like "*BPMN*" } | Select-Object -First 1
     if (-not $bpmnDash) { throw "Expected seeded BPMN Bottleneck dashboard" }
     $bpmnExec = Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards/$($bpmnDash.id)/execute-batch" -Headers $headers -Method POST -ContentType "application/json" -Body "{}"
-    if ($bpmnExec.widgets.Count -lt 4) { throw "Expected BPMN dashboard widgets execution results" }
-    Write-Host "[ok] Verified BPMN Bottleneck dashboard execution ($($bpmnExec.widgets.Count) widgets)."
+    $bpmnWidgetCount = @($bpmnExec.widgets.PSObject.Properties).Count
+    if ($bpmnWidgetCount -lt 4) { throw "Expected BPMN dashboard widgets execution results, got $bpmnWidgetCount" }
+    Write-Host "[ok] Verified BPMN Bottleneck dashboard execution ($bpmnWidgetCount widgets)."
 
     # Upload CSV through web_gateway -> FastAPI -> DuckDB
     $tmpCsv = Join-Path $TestDataRoot "ci_sample.csv"
