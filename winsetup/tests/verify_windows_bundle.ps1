@@ -207,7 +207,15 @@ try {
     if (-not $tok) { throw "Missing access_token from bootstrap-admin" }
 
     $headers = @{ Authorization = "Bearer $tok" }
-    $dashes = @(Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards" -Headers $headers -Method GET)
+    $rawDashes = Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards" -Headers $headers -Method GET
+    $dashes = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $rawDashes) {
+        if ($item -is [System.Array]) {
+            foreach ($sub in $item) { $dashes.Add($sub) }
+        } else {
+            $dashes.Add($item)
+        }
+    }
     if ($dashes.Count -lt 1) { throw "Expected seeded sample dashboards" }
 
     $dashId = $dashes[0].id
@@ -215,7 +223,7 @@ try {
     $execWidgetCount = @($execRes.widgets.PSObject.Properties).Count
     if ($execWidgetCount -lt 1) { throw "Expected widget execution results from DuckDB, got $execWidgetCount" }
 
-    $bpmnDash = @($dashes) | Where-Object { $_.title -like "*BPMN*" } | Select-Object -First 1
+    $bpmnDash = $dashes | Where-Object { $_.title -like "*BPMN*" } | Select-Object -First 1
     if (-not $bpmnDash) { throw "Expected seeded BPMN Bottleneck dashboard" }
     $bpmnExec = Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards/$($bpmnDash.id)/execute-batch" -Headers $headers -Method POST -ContentType "application/json" -Body "{}"
     $bpmnWidgetCount = @($bpmnExec.widgets.PSObject.Properties).Count
