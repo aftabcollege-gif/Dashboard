@@ -166,7 +166,7 @@ try {
         include_sample_data = $true
         setup_token = $setupTok
     } | ConvertTo-Json
-    $bootResp = Invoke-RestMethod -Uri "$baseUrl/api/v1/auth/bootstrap-admin" -Method POST -ContentType "application/json" -Body $bootBody
+    $bootResp = Invoke-RestMethod -Uri "$baseUrl/api/v1/auth/bootstrap-admin" -Method POST -ContentType "application/json" -Headers @{ "X-Auth-Mode" = "bearer" } -Body $bootBody
     $tok = $bootResp.access_token
     if (-not $tok) { throw "Missing access_token from bootstrap-admin" }
 

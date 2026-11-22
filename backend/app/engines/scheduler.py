@@ -1,21 +1,90 @@
+import os
+import socket
+import uuid
 from datetime import datetime, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from app.database import db_session_scope
+from app.config import settings
+from app.core.cache import cache_manager
+from app.database import db_session_scope, engine
 from app.models.etl import EtlPipeline, EtlSchedule
 
 _scheduler: BackgroundScheduler | None = None
+_LEADER_ID = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+_pg_leader_conn = None
+
+_REDIS_LEADER_LUA = """
+local current = redis.call('GET', KEYS[1])
+if (not current) or (current == ARGV[1]) then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+    return 1
+end
+return 0
+"""
+
+
+def _acquire_or_renew_leader_lease() -> bool:
+    global _pg_leader_conn
+    redis_client = getattr(cache_manager, "_redis", None)
+    if redis_client is not None:
+        try:
+            res = redis_client.eval(_REDIS_LEADER_LUA, 1, "bi:scheduler:leader", _LEADER_ID, 60)
+            return int(res or 0) == 1
+        except Exception:
+            return False
+
+    if engine.dialect.name == "postgresql":
+        try:
+            if _pg_leader_conn is None:
+                _pg_leader_conn = engine.raw_connection()
+            cur = _pg_leader_conn.cursor()
+            cur.execute("SELECT pg_try_advisory_lock(83920144)")
+            row = cur.fetchone()
+            cur.close()
+            if row and bool(row[0]):
+                return True
+            _pg_leader_conn.close()
+            _pg_leader_conn = None
+            return False
+        except Exception:
+            if _pg_leader_conn is not None:
+                try:
+                    _pg_leader_conn.close()
+                except Exception:
+                    pass
+                _pg_leader_conn = None
+            return False
+
+    return True
+
+
+def _release_leader_lease() -> None:
+    global _pg_leader_conn
+    redis_client = getattr(cache_manager, "_redis", None)
+    if redis_client is not None:
+        try:
+            if redis_client.get("bi:scheduler:leader") == _LEADER_ID:
+                redis_client.delete("bi:scheduler:leader")
+        except Exception:
+            pass
+    if _pg_leader_conn is not None:
+        try:
+            _pg_leader_conn.close()
+        except Exception:
+            pass
+        _pg_leader_conn = None
 
 
 def _execute_scheduled_pipeline(pipeline_id: str) -> None:
+    if not _acquire_or_renew_leader_lease():
+        return
     from app.engines.etl_engine import run_etl_pipeline
 
     with db_session_scope() as db:
         sched = db.query(EtlSchedule).filter(EtlSchedule.pipeline_id == pipeline_id).first()
         if not sched or not sched.is_enabled:
             return
-        # Dependency check: verify upstream pipeline completed if configured
         if sched.depends_on_pipeline_id:
             dep = db.query(EtlPipeline).filter(EtlPipeline.id == sched.depends_on_pipeline_id).first()
             if dep and dep.is_running:
@@ -64,7 +133,6 @@ def sync_scheduler_jobs() -> None:
             job = _scheduler.get_job(job_id)
             if job and job.next_run_time:
                 s.next_run_at = job.next_run_time
-        # Remove obsolete jobs
         for job in _scheduler.get_jobs():
             if job.id.startswith("etl_") and job.id not in active_ids:
                 _scheduler.remove_job(job.id)
@@ -73,8 +141,18 @@ def sync_scheduler_jobs() -> None:
 
 def start_scheduler() -> None:
     global _scheduler
+    if not settings.BI_ENABLE_SCHEDULER:
+        return
     if _scheduler is not None and _scheduler.running:
         return
+    if not _acquire_or_renew_leader_lease():
+        return
+    try:
+        from app.engines.etl_engine import recover_stale_etl_runs
+        with db_session_scope() as db:
+            recover_stale_etl_runs(db)
+    except Exception:
+        pass
     _scheduler = BackgroundScheduler(timezone="UTC")
     _scheduler.start()
     try:
@@ -91,13 +169,21 @@ def stop_scheduler() -> None:
         except Exception:
             pass
         _scheduler = None
+    _release_leader_lease()
 
 
 def get_scheduler_status() -> dict:
     if _scheduler is None:
-        return {"running": False, "jobs": []}
+        return {
+            "enabled": settings.BI_ENABLE_SCHEDULER,
+            "running": False,
+            "leader": False,
+            "jobs": [],
+        }
     return {
+        "enabled": settings.BI_ENABLE_SCHEDULER,
         "running": _scheduler.running,
+        "leader": True,
         "jobs": [
             {
                 "id": j.id,

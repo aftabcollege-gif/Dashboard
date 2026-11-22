@@ -199,6 +199,7 @@ def main() -> None:
                         "include_sample_data": True,
                         "setup_token": setup_token,
                     },
+                    headers={"X-Auth-Mode": "bearer"},
                 )
                 assert boot.status_code == 200, boot.text
                 token = boot.json()["access_token"]

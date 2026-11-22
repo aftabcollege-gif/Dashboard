@@ -1,7 +1,10 @@
+import ssl
 from datetime import datetime, timezone
 from typing import Any, Optional
 import ldap3
+from ldap3.utils.conv import escape_filter_chars
 from sqlalchemy.orm import Session
+from app.config import settings
 from app.core.permissions import permission_resolver
 from app.core.security import decrypt_secret
 from app.models.identity import (
@@ -15,6 +18,7 @@ from app.models.identity import (
     User,
     UserProfile,
     UserRole,
+    UserSession,
 )
 
 # Built-in testable Corporate Active Directory state for 'mock_ad' mode
@@ -102,12 +106,29 @@ def get_mock_directory(domain: str) -> dict[str, Any]:
     return _MOCK_AD_DIRECTORIES[domain]
 
 
+def _build_ldap_server(conn_row: DirectoryConnection) -> ldap3.Server:
+    tls = None
+    if conn_row.use_ldaps:
+        tls_kwargs: dict[str, Any] = {"validate": ssl.CERT_REQUIRED}
+        if settings.LDAP_TLS_CA_CERT_FILE:
+            tls_kwargs["ca_certs_file"] = settings.LDAP_TLS_CA_CERT_FILE
+        tls = ldap3.Tls(**tls_kwargs)
+    return ldap3.Server(conn_row.server_url, use_ssl=conn_row.use_ldaps, tls=tls, connect_timeout=5)
+
+
+def _revoke_sessions(db: Session, user_id: str) -> None:
+    db.query(UserSession).filter(UserSession.user_id == user_id, UserSession.is_revoked == False).update(
+        {"is_revoked": True}, synchronize_session=False
+    )
+
+
 class ActiveDirectoryEngine:
     """
     Enterprise Active Directory & LDAP/LDAPS Engine (Section 19B).
     - Never stores AD passwords in the application database!
-    - Supports 'ldap'/'ldaps' via real ldap3 protocol AND 'mock_ad' for deterministic enterprise AD testing.
-    - Supports user/group discovery, import, sync, selected group filtering, and disabled-user propagation.
+    - Enforces RFC 4515 LDAP filter escaping and strict LDAPS TLS certificate validation.
+    - Scopes ExternalIdentity, User, and Group records strictly per directory_connection_id & organization_id.
+    - Propagates disabled and removed AD accounts cleanly (including immediate UserSession revocation).
     """
 
     @staticmethod
@@ -126,7 +147,7 @@ class ActiveDirectoryEngine:
             }
 
         try:
-            server = ldap3.Server(conn_row.server_url, use_ssl=conn_row.use_ldaps, connect_timeout=5)
+            server = _build_ldap_server(conn_row)
             ldap_conn = ldap3.Connection(server, user=conn_row.bind_dn, password=bind_pw, auto_bind=True)
             ldap_conn.unbind()
             return {"ok": True, "mode": "ldap3", "domain": conn_row.domain_name}
@@ -156,10 +177,11 @@ class ActiveDirectoryEngine:
             return {"users": users, "groups": groups}
 
         bind_pw = decrypt_secret(conn_row.bind_password_encrypted)
-        server = ldap3.Server(conn_row.server_url, use_ssl=conn_row.use_ldaps, connect_timeout=5)
+        server = _build_ldap_server(conn_row)
         ldap_conn = ldap3.Connection(server, user=conn_row.bind_dn, password=bind_pw, auto_bind=True)
         try:
-            u_filter = f"(&(objectClass=user)(|(sAMAccountName=*{query_text}*)(displayName=*{query_text}*)))"
+            safe_q = escape_filter_chars(query_text or "")
+            u_filter = f"(&(objectClass=user)(|(sAMAccountName=*{safe_q}*)(displayName=*{safe_q}*)))"
             ldap_conn.search(
                 conn_row.base_dn,
                 u_filter,
@@ -194,7 +216,12 @@ class ActiveDirectoryEngine:
         conn_row: DirectoryConnection, username: str, password: str
     ) -> Optional[dict[str, Any]]:
         """Verifies domain credentials directly against AD without ever saving password in App DB."""
-        clean_user = username.split("\\")[-1].split("@")[0].lower()
+        if not password:
+            return None
+        clean_user = username.split("\\")[-1].split("@")[0].strip().lower()
+        if not clean_user:
+            return None
+
         if conn_row.directory_mode == "mock_ad":
             ad_dir = get_mock_directory(conn_row.domain_name)
             for u in ad_dir["users"]:
@@ -206,14 +233,15 @@ class ActiveDirectoryEngine:
                     return None
             return None
 
-        # Real LDAP bind authentication
+        # Real LDAP bind authentication with RFC 4515 filter escaping & strict LDAPS cert validation
         bind_pw = decrypt_secret(conn_row.bind_password_encrypted)
-        server = ldap3.Server(conn_row.server_url, use_ssl=conn_row.use_ldaps, connect_timeout=5)
+        server = _build_ldap_server(conn_row)
         try:
             admin_conn = ldap3.Connection(server, user=conn_row.bind_dn, password=bind_pw, auto_bind=True)
+            safe_user = escape_filter_chars(clean_user)
             admin_conn.search(
                 conn_row.base_dn,
-                f"(&(objectClass=user)(sAMAccountName={clean_user}))",
+                f"(&(objectClass=user)(sAMAccountName={safe_user}))",
                 attributes=["objectGUID", "sAMAccountName", "mail", "displayName", "department", "memberOf", "userAccountControl"],
             )
             if not admin_conn.entries:
@@ -284,10 +312,10 @@ class ActiveDirectoryEngine:
                 else:
                     grp.external_dn = g.get("dn")
                     grp.source = "active_directory"
+                    grp.directory_connection_id = conn_row.id
                 group_map[g["cn"]] = grp
                 groups_synced += 1
 
-                # Auto-map AD group to BI role if specified
                 mapped_slug = g.get("mapped_role_slug")
                 if mapped_slug:
                     role = (
@@ -319,6 +347,7 @@ class ActiveDirectoryEngine:
                 ext = (
                     db.query(ExternalIdentity)
                     .filter(
+                        ExternalIdentity.directory_connection_id == conn_row.id,
                         ExternalIdentity.provider_type == "active_directory",
                         ExternalIdentity.external_id == ext_id,
                     )
@@ -326,15 +355,35 @@ class ActiveDirectoryEngine:
                 )
 
                 is_enabled = bool(ad_u.get("enabled", True))
+                target_email = ad_u.get("mail") or f"{ad_u['sAMAccountName']}@{conn_row.domain_name}"
+
                 if not ext:
+                    cross_org_conflict = (
+                        db.query(User)
+                        .filter(
+                            (User.username == ad_u["sAMAccountName"]) | (User.email == target_email),
+                            User.organization_id != conn_row.organization_id,
+                        )
+                        .first()
+                    )
+                    if cross_org_conflict:
+                        raise ValueError(
+                            f"Directory identity '{ad_u['sAMAccountName']}' conflicts with another organization"
+                        )
+
                     user = (
-                        db.query(User).filter(User.username == ad_u["sAMAccountName"]).first()
+                        db.query(User)
+                        .filter(
+                            User.organization_id == conn_row.organization_id,
+                            User.username == ad_u["sAMAccountName"],
+                        )
+                        .first()
                     )
                     if not user:
                         user = User(
                             organization_id=conn_row.organization_id,
                             username=ad_u["sAMAccountName"],
-                            email=ad_u.get("mail") or f"{ad_u['sAMAccountName']}@{conn_row.domain_name}",
+                            email=target_email,
                             password_hash=None,  # AD passwords are NEVER stored in App DB!
                             auth_source="active_directory",
                             is_active=is_enabled,
@@ -352,6 +401,13 @@ class ActiveDirectoryEngine:
                             )
                         )
                         imported += 1
+                    else:
+                        user.is_active = is_enabled
+                        if not is_enabled:
+                            _revoke_sessions(db, user.id)
+                            deactivated += 1
+                        else:
+                            updated += 1
                     ext = ExternalIdentity(
                         user_id=user.id,
                         directory_connection_id=conn_row.id,
@@ -363,13 +419,18 @@ class ActiveDirectoryEngine:
                     )
                     db.add(ext)
                 else:
-                    user = db.query(User).filter(User.id == ext.user_id).first()
+                    user = (
+                        db.query(User)
+                        .filter(User.id == ext.user_id, User.organization_id == conn_row.organization_id)
+                        .first()
+                    )
                     if user:
                         was_active = user.is_active
                         user.is_active = is_enabled
-                        user.email = ad_u.get("mail") or user.email
+                        user.email = target_email
                         if was_active and not is_enabled:
                             deactivated += 1
+                            _revoke_sessions(db, user.id)
                         else:
                             updated += 1
                         if user.profile:
@@ -379,13 +440,16 @@ class ActiveDirectoryEngine:
                     ext.raw_attributes_json = ad_u
                     ext.synced_at = datetime.now(timezone.utc)
 
-                # Sync Group Memberships
                 if user:
                     current_ad_gids = {
                         gm.group_id
                         for gm in db.query(GroupMember)
                         .join(Group, Group.id == GroupMember.group_id)
-                        .filter(GroupMember.user_id == user.id, Group.source == "active_directory")
+                        .filter(
+                            GroupMember.user_id == user.id,
+                            Group.organization_id == conn_row.organization_id,
+                            Group.source == "active_directory",
+                        )
                         .all()
                     }
                     target_gids = {group_map[cn].id for cn in u_groups if cn in group_map}
@@ -396,7 +460,6 @@ class ActiveDirectoryEngine:
                             GroupMember.group_id == gid_rem, GroupMember.user_id == user.id
                         ).delete()
 
-                    # Ensure at least viewer role if user has no roles
                     has_role = db.query(UserRole).filter(UserRole.user_id == user.id).first()
                     has_grp_role = (
                         db.query(GroupRole).filter(GroupRole.group_id.in_(list(target_gids))).first()
@@ -411,6 +474,34 @@ class ActiveDirectoryEngine:
                         )
                         if viewer:
                             db.add(UserRole(user_id=user.id, role_id=viewer.id))
+
+            # Deactivate stale AD accounts no longer present in directory / selected_groups
+            if sync_type in ("full", "manual", "scheduled"):
+                stale_exts = (
+                    db.query(ExternalIdentity)
+                    .filter(
+                        ExternalIdentity.directory_connection_id == conn_row.id,
+                        ExternalIdentity.provider_type == "active_directory",
+                    )
+                    .all()
+                )
+                for st_ext in stale_exts:
+                    if st_ext.external_id in seen_ext_ids:
+                        continue
+                    stale_user = (
+                        db.query(User)
+                        .filter(
+                            User.id == st_ext.user_id,
+                            User.organization_id == conn_row.organization_id,
+                            User.auth_source == "active_directory",
+                            User.is_active == True,
+                        )
+                        .first()
+                    )
+                    if stale_user:
+                        stale_user.is_active = False
+                        _revoke_sessions(db, stale_user.id)
+                        deactivated += 1
 
             conn_row.last_sync_at = datetime.now(timezone.utc)
             conn_row.last_sync_status = "succeeded"
@@ -433,9 +524,14 @@ class ActiveDirectoryEngine:
                 "groups_synced": groups_synced,
             }
         except Exception as exc:
-            job.status = "failed"
-            job.error_message = str(exc)
-            job.finished_at = datetime.now(timezone.utc)
-            conn_row.last_sync_status = "failed"
+            db.rollback()
+            job_row = db.query(DirectorySyncJob).filter(DirectorySyncJob.id == job.id).first()
+            if job_row:
+                job_row.status = "failed"
+                job_row.error_message = str(exc)
+                job_row.finished_at = datetime.now(timezone.utc)
+            conn_db = db.query(DirectoryConnection).filter(DirectoryConnection.id == conn_row.id).first()
+            if conn_db:
+                conn_db.last_sync_status = "failed"
             db.commit()
             raise

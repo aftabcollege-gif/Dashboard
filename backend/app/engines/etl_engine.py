@@ -4,10 +4,12 @@ import re
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 import psutil
 from sqlalchemy.orm import Session
+from app.config import settings
 from app.core.cache import cache_manager
 from app.core.security import decrypt_secret
 from app.core.sql_guard import validate_readonly_sql_ast
@@ -28,6 +30,12 @@ from app.models.performance import MaterializedViewMetadata
 
 _PIPELINE_LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
+_REDIS_UNLOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 def _get_pipeline_lock(pipeline_id: str) -> threading.Lock:
@@ -35,6 +43,88 @@ def _get_pipeline_lock(pipeline_id: str) -> threading.Lock:
         if pipeline_id not in _PIPELINE_LOCKS:
             _PIPELINE_LOCKS[pipeline_id] = threading.Lock()
         return _PIPELINE_LOCKS[pipeline_id]
+
+
+def _acquire_distributed_etl_lock(pipeline_id: str, ttl_sec: int) -> tuple[bool, Optional[str], Any]:
+    redis_client = getattr(cache_manager, "_redis", None)
+    if redis_client is None:
+        return True, None, None
+    token = uuid.uuid4().hex
+    try:
+        ok = redis_client.set(f"etl_lock:{pipeline_id}", token, nx=True, ex=max(30, ttl_sec))
+        return bool(ok), token if ok else None, redis_client
+    except Exception:
+        # Fall back to DB CAS lock when Redis lock is unreachable
+        return True, None, None
+
+
+def _release_distributed_etl_lock(pipeline_id: str, token: Optional[str], redis_client: Any) -> None:
+    if redis_client is not None and token:
+        try:
+            redis_client.eval(_REDIS_UNLOCK_LUA, 1, f"etl_lock:{pipeline_id}", token)
+        except Exception:
+            pass
+
+
+def recover_stale_etl_runs(
+    db: Session,
+    pipeline_id: Optional[str] = None,
+    max_age_minutes: Optional[int] = None,
+) -> int:
+    """Marks abandoned running ETL pipelines/runs older than timeout as failed and resets is_running."""
+    age_mins = settings.ETL_STALE_RUN_TIMEOUT_MINUTES if max_age_minutes is None else int(max_age_minutes)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=max(0, age_mins))
+
+    q = db.query(EtlPipeline).filter(EtlPipeline.is_running == True)
+    if pipeline_id:
+        q = q.filter(EtlPipeline.id == pipeline_id)
+    stuck_pipelines = q.all()
+    recovered = 0
+
+    for pl in stuck_pipelines:
+        running_runs = (
+            db.query(EtlJobRun)
+            .filter(EtlJobRun.pipeline_id == pl.id, EtlJobRun.status == "running")
+            .order_by(EtlJobRun.started_at.desc())
+            .all()
+        )
+        is_stale = False
+        if not running_runs:
+            upd = pl.updated_at if pl.updated_at.tzinfo else pl.updated_at.replace(tzinfo=timezone.utc)
+            if upd <= cutoff:
+                is_stale = True
+        else:
+            newest = running_runs[0]
+            st = newest.started_at if newest.started_at.tzinfo else newest.started_at.replace(tzinfo=timezone.utc)
+            if st <= cutoff:
+                is_stale = True
+
+        if not is_stale:
+            continue
+
+        for r in running_runs:
+            r.status = "failed"
+            r.finished_at = now
+            r.log_text = (r.log_text or "") + "\n[RECOVERY] Stale ETL run aborted after timeout/crash."
+            db.query(EtlJob).filter(EtlJob.id == r.job_id, EtlJob.status.in_(("running", "retrying"))).update(
+                {"status": "failed"}, synchronize_session=False
+            )
+            db.add(
+                EtlError(
+                    pipeline_id=pl.id,
+                    job_run_id=r.id,
+                    error_type="StaleRunRecovered",
+                    message="Recovered stale crashed or timed-out ETL execution",
+                    traceback="",
+                )
+            )
+        pl.is_running = False
+        recovered += 1
+
+    if recovered > 0:
+        db.commit()
+    return recovered
 
 
 def _row_hash(row: dict[str, Any]) -> str:
@@ -62,13 +152,12 @@ def run_etl_pipeline(
 ) -> dict[str, Any]:
     """
     Executes an ETL Pipeline with:
-    - Per-pipeline mutex lock preventing duplicate concurrent runs
+    - Distributed Redis lock + atomic DB CAS claim + per-process mutex preventing duplicate concurrent runs
+    - Automatic stale-run recovery after crashes/timeouts
     - Organization ownership enforcement on source & target dataset
-    - AST-validated base query & sanitized incremental cursor literal
-    - Exponential backoff retry policy
-    - Intelligent incremental / CDC hash extraction
+    - AST-validated base query & parameterized incremental cursor (never string-interpolated)
+    - Exponential backoff retry policy & bounded extraction timeout
     - Atomic warehouse load (failed extraction NEVER overwrites existing valid dataset)
-    - Checkpoint persistence, Lineage tracking, Cache invalidation, and Pre-Aggregation refresh
     """
     lock = _get_pipeline_lock(pipeline_id)
     if not lock.acquire(blocking=False):
@@ -78,34 +167,56 @@ def run_etl_pipeline(
             "pipeline_id": pipeline_id,
         }
 
-    pipeline = db.query(EtlPipeline).filter(EtlPipeline.id == pipeline_id).first()
-    if not pipeline:
-        lock.release()
-        raise ValueError(f"Pipeline not found: {pipeline_id}")
-
-    if pipeline.is_running:
-        lock.release()
-        return {
-            "status": "skipped_duplicate",
-            "message": "Pipeline marked running; duplicate prevented",
-            "pipeline_id": pipeline_id,
-        }
-
-    pipeline.is_running = True
-    job = EtlJob(pipeline_id=pipeline.id, trigger_type=trigger_type, status="running", attempt_count=1)
-    db.add(job)
-    db.commit()
-
-    retry_policy = pipeline.retry_policy_json or {}
-    max_retries = min(int(retry_policy.get("max_retries", 2)), 5)
-    backoff = min(float(retry_policy.get("initial_backoff_sec", 0.5)), 5.0)
-    multiplier = min(float(retry_policy.get("backoff_multiplier", 2.0)), 4.0)
-
-    last_exc: Optional[Exception] = None
-    run_record: Optional[EtlJobRun] = None
-    logs: list[str] = []
+    dist_token: Optional[str] = None
+    dist_redis: Any = None
+    claimed_db = False
 
     try:
+        dist_ok, dist_token, dist_redis = _acquire_distributed_etl_lock(
+            pipeline_id, max(settings.ETL_RUN_TIMEOUT_SECONDS * 2, 120)
+        )
+        if not dist_ok:
+            return {
+                "status": "skipped_duplicate",
+                "message": "Pipeline lock held by another worker; duplicate execution prevented",
+                "pipeline_id": pipeline_id,
+            }
+
+        pipeline = db.query(EtlPipeline).filter(EtlPipeline.id == pipeline_id).first()
+        if not pipeline:
+            raise ValueError(f"Pipeline not found: {pipeline_id}")
+
+        if pipeline.is_running:
+            recover_stale_etl_runs(db, pipeline_id=pipeline_id)
+
+        claimed = (
+            db.query(EtlPipeline)
+            .filter(EtlPipeline.id == pipeline_id, EtlPipeline.is_running == False)
+            .update({"is_running": True}, synchronize_session=False)
+        )
+        db.commit()
+        if claimed == 0:
+            return {
+                "status": "skipped_duplicate",
+                "message": "Pipeline marked running; duplicate prevented",
+                "pipeline_id": pipeline_id,
+            }
+        claimed_db = True
+        db.refresh(pipeline)
+
+        job = EtlJob(pipeline_id=pipeline.id, trigger_type=trigger_type, status="running", attempt_count=1)
+        db.add(job)
+        db.commit()
+
+        retry_policy = pipeline.retry_policy_json or {}
+        max_retries = min(int(retry_policy.get("max_retries", 2)), 5)
+        backoff = min(float(retry_policy.get("initial_backoff_sec", 0.5)), 5.0)
+        multiplier = min(float(retry_policy.get("backoff_multiplier", 2.0)), 4.0)
+
+        last_exc: Optional[Exception] = None
+        run_record: Optional[EtlJobRun] = None
+        logs: list[str] = []
+
         for attempt in range(1, max_retries + 2):
             job.attempt_count = attempt
             started_at = datetime.now(timezone.utc)
@@ -122,7 +233,6 @@ def run_etl_pipeline(
             try:
                 logs.append(f"[{started_at.isoformat()}] Attempt {attempt}: Starting ETL '{pipeline.name}' ({pipeline.extract_mode})")
 
-                # 1. EXTRACT (verify same organization for source, pipeline, and dataset)
                 source = (
                     db.query(DataSource)
                     .filter(
@@ -160,11 +270,22 @@ def run_etl_pipeline(
                 default_tbl = sanitize_identifier(str(source.config_json.get("default_table", "erp_orders")))
                 base_query = pipeline.source_query or f'SELECT * FROM "{default_tbl}"'
                 clean_base = base_query.strip().rstrip(";")
-                validate_readonly_sql_ast(clean_base, require_table_allowlist=False)
+                src_st = source.source_type.lower()
+                src_dialect = (
+                    "sqlite"
+                    if src_st == "sqlite"
+                    else "postgres"
+                    if src_st == "postgresql"
+                    else "mysql"
+                    if src_st in ("mysql", "mariadb")
+                    else "duckdb"
+                )
+                validate_readonly_sql_ast(clean_base, dialect=src_dialect, require_table_allowlist=False)
 
-                # Build incremental filter when cursor exists and warehouse table already populated
+                # Parameterized incremental filter (never interpolate cursor literal into SQL)
                 inc_col = pipeline.incremental_column
                 exec_query = clean_base
+                exec_params: Optional[list[Any]] = None
                 if (
                     pipeline.extract_mode == "incremental"
                     and inc_col
@@ -173,20 +294,24 @@ def run_etl_pipeline(
                 ):
                     clean_inc = sanitize_identifier(inc_col)
                     cursor_raw = str(checkpoint.last_cursor_value).replace("\x00", "")
-                    if re.fullmatch(r"-?\d+(\.\d+)?", cursor_raw):
-                        cursor_literal = cursor_raw
+                    if re.fullmatch(r"-?\d+", cursor_raw):
+                        cursor_param: Any = int(cursor_raw)
+                    elif re.fullmatch(r"-?\d+\.\d+", cursor_raw):
+                        cursor_param = float(cursor_raw)
                     else:
-                        cursor_escaped = cursor_raw.replace("'", "''")
-                        cursor_literal = f"'{cursor_escaped}'"
-                    exec_query = f'SELECT * FROM ({clean_base}) AS _src WHERE "{clean_inc}" > {cursor_literal}'
-                    logs.append(f"Incremental filter active: {clean_inc} > {cursor_raw}")
+                        cursor_param = cursor_raw
+                    exec_query = f'SELECT * FROM ({clean_base}) AS _src WHERE "{clean_inc}" > ?'
+                    exec_params = [cursor_param]
+                    logs.append(f"Incremental filter active (parameterized): {clean_inc} > ?")
 
                 raw_df = DataConnectorEngine.extract_dataframe(
                     source.source_type,
                     source.config_json,
                     creds,
                     query=exec_query,
-                    read_only=source.read_only,
+                    read_only=True,
+                    query_params=exec_params,
+                    timeout_sec=settings.ETL_RUN_TIMEOUT_SECONDS,
                 )
                 source.health_status = "healthy"
                 source.last_error = None
@@ -195,7 +320,6 @@ def run_etl_pipeline(
                 rows_extracted = len(raw_df)
                 logs.append(f"Extracted {rows_extracted} rows from source '{source.name}'")
 
-                # 2. TRANSFORM
                 steps = (
                     db.query(EtlPipelineStep)
                     .filter(EtlPipelineStep.pipeline_id == pipeline.id)
@@ -209,7 +333,6 @@ def run_etl_pipeline(
                 transformed_df = DataProfiler.apply_transformations(raw_df, step_dicts)
                 transformed_df.columns = [sanitize_identifier(str(c)) for c in transformed_df.columns]
 
-                # 3. INTELLIGENT CHANGE DETECTION & LOAD
                 pk_col = sanitize_identifier(pipeline.primary_key_column) if pipeline.primary_key_column else None
                 prev_hashes: dict[str, str] = dict(checkpoint.row_hashes_json or {})
                 rows_unchanged = 0
@@ -257,7 +380,6 @@ def run_etl_pipeline(
                                 for rec in transformed_df.to_dict(orient="records")
                             }
 
-                # Update incremental cursor if available
                 if inc_col:
                     s_inc = sanitize_identifier(inc_col)
                     if s_inc in transformed_df.columns and len(transformed_df) > 0:
@@ -266,7 +388,6 @@ def run_etl_pipeline(
                         logs.append(f"Updated checkpoint cursor {s_inc} = {max_cursor}")
                 checkpoint.last_success_at = datetime.now(timezone.utc)
 
-                # Sync Dataset schema metadata & bump version
                 total_res = warehouse.execute_query(f'SELECT COUNT(*) AS cnt FROM "{dataset.warehouse_table}"')
                 total_rows = int(total_res["rows"][0]["cnt"])
                 dataset.row_count = total_rows
@@ -404,6 +525,13 @@ def run_etl_pipeline(
             "logs": logs,
         }
     finally:
-        pipeline.is_running = False
-        db.commit()
+        if claimed_db:
+            try:
+                db.query(EtlPipeline).filter(EtlPipeline.id == pipeline_id).update(
+                    {"is_running": False}, synchronize_session=False
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+        _release_distributed_etl_lock(pipeline_id, dist_token, dist_redis)
         lock.release()

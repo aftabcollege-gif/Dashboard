@@ -3,10 +3,12 @@ import secrets
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from app.api.deps import get_client_ip, get_current_user
+from app.api.deps import get_client_ip, get_current_user, is_https_request
 from app.config import settings
 from app.core.audit import record_audit
 from app.core.permissions import permission_resolver
@@ -72,15 +74,8 @@ class MfaConfirmRequest(BaseModel):
     code: str
 
 
-def _is_https_request(request: Request) -> bool:
-    if settings.COOKIE_SECURE == "true":
-        return True
-    if settings.COOKIE_SECURE == "false":
-        return False
-    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
-    if proto:
-        return proto == "https"
-    return request.url.scheme == "https"
+def _wants_bearer_tokens(request: Request) -> bool:
+    return (request.headers.get("x-auth-mode") or "").strip().lower() == "bearer"
 
 
 def _set_auth_cookies(
@@ -89,7 +84,7 @@ def _set_auth_cookies(
     access_token: str,
     refresh_token: str,
 ) -> str:
-    secure = _is_https_request(request)
+    secure = is_https_request(request)
     samesite = settings.COOKIE_SAMESITE if settings.COOKIE_SAMESITE in ("lax", "strict", "none") else "lax"
     csrf_token = secrets.token_urlsafe(24)
 
@@ -124,7 +119,7 @@ def _set_auth_cookies(
 
 
 def _clear_auth_cookies(response: Response, request: Request) -> None:
-    secure = _is_https_request(request)
+    secure = is_https_request(request)
     samesite = settings.COOKIE_SAMESITE if settings.COOKIE_SAMESITE in ("lax", "strict", "none") else "lax"
     response.delete_cookie(settings.ACCESS_COOKIE_NAME, path="/", samesite=samesite, secure=secure)
     response.delete_cookie(settings.REFRESH_COOKIE_NAME, path=f"{settings.API_PREFIX}/auth", samesite=samesite, secure=secure)
@@ -137,7 +132,9 @@ def auth_status(db: Session = Depends(get_db)):
     return {
         "needs_initial_setup": user_count == 0,
         "demo_mode": bool(settings.BI_SEED_DEMO_USERS and settings.ENVIRONMENT != "production"),
-        "setup_token_required": bool(user_count == 0 and settings.BI_INITIAL_SETUP_TOKEN),
+        "setup_token_required": bool(
+            user_count == 0 and (settings.BI_INITIAL_SETUP_TOKEN or settings.ENVIRONMENT == "production")
+        ),
         "environment": settings.ENVIRONMENT,
     }
 
@@ -154,8 +151,18 @@ def bootstrap_admin(
     now = datetime.now(timezone.utc)
 
     with _BOOTSTRAP_LOCK:
+        # Acquire DB-level advisory lock on PostgreSQL so multi-worker/replica bootstraps cannot race
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            db.execute(text("SELECT pg_advisory_xact_lock(72839104)"))
+
         if db.query(User).count() > 0:
             raise HTTPException(status_code=403, detail="Initial setup already completed")
+
+        if settings.ENVIRONMENT == "production" and not settings.BI_INITIAL_SETUP_TOKEN:
+            raise HTTPException(
+                status_code=403,
+                detail="Initial admin bootstrap requires BI_INITIAL_SETUP_TOKEN in production",
+            )
 
         if settings.BI_INITIAL_SETUP_TOKEN:
             provided = (body.setup_token or request.headers.get("x-setup-token") or "").strip()
@@ -169,42 +176,46 @@ def bootstrap_admin(
             raise HTTPException(status_code=400, detail="Valid email address is required")
         validate_password_strength(body.password, allow_demo_passwords=False)
 
-        org, roles, theme_objs = seed_core_catalog(db)
-        if body.organization_name.strip():
-            org.name = body.organization_name.strip()[:200]
+        try:
+            org, roles, theme_objs = seed_core_catalog(db)
+            if body.organization_name.strip():
+                org.name = body.organization_name.strip()[:200]
 
-        admin_user = User(
-            organization_id=org.id,
-            username=uname,
-            email=body.email.strip(),
-            password_hash=hash_password(body.password),
-            auth_source="local",
-            is_active=True,
-            last_login_at=now,
-        )
-        db.add(admin_user)
-        db.flush()
-        db.add(
-            UserProfile(
-                user_id=admin_user.id,
-                full_name=body.full_name.strip() or uname,
-                department="Administration",
-                org_unit="Administration",
-                region="All",
+            admin_user = User(
+                organization_id=org.id,
+                username=uname,
+                email=body.email.strip(),
+                password_hash=hash_password(body.password),
+                auth_source="local",
+                is_active=True,
+                last_login_at=now,
             )
-        )
-        db.add(UserRole(user_id=admin_user.id, role_id=roles["super_admin"].id))
-
-        if not db.query(Workspace).filter(Workspace.organization_id == org.id).first():
+            db.add(admin_user)
+            db.flush()
             db.add(
-                Workspace(
-                    organization_id=org.id,
-                    name="Executive Intelligence Workspace",
-                    description="Primary BI workspace",
-                    created_by=admin_user.id,
+                UserProfile(
+                    user_id=admin_user.id,
+                    full_name=body.full_name.strip() or uname,
+                    department="Administration",
+                    org_unit="Administration",
+                    region="All",
                 )
             )
-        db.commit()
+            db.add(UserRole(user_id=admin_user.id, role_id=roles["super_admin"].id))
+
+            if not db.query(Workspace).filter(Workspace.organization_id == org.id).first():
+                db.add(
+                    Workspace(
+                        organization_id=org.id,
+                        name="Executive Intelligence Workspace",
+                        description="Primary BI workspace",
+                        created_by=admin_user.id,
+                    )
+                )
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=403, detail="Initial setup already completed") from exc
 
         if body.include_sample_data:
             seed_sample_bi_content(
@@ -240,28 +251,40 @@ def bootstrap_admin(
         )
         db.commit()
 
-        csrf_token = _set_auth_cookies(response, request, access_token, refresh_tok)
         eff = permission_resolver.get_effective_permissions_summary(db, admin_user)
+        user_payload = {
+            "id": admin_user.id,
+            "username": admin_user.username,
+            "email": admin_user.email,
+            "organization_id": admin_user.organization_id,
+            "auth_source": admin_user.auth_source,
+            "mfa_enabled": admin_user.mfa_enabled,
+            "full_name": admin_user.profile.full_name if admin_user.profile else admin_user.username,
+            "department": admin_user.profile.department if admin_user.profile else None,
+            "region": admin_user.profile.region if admin_user.profile else None,
+            "locale": admin_user.profile.locale if admin_user.profile else "en",
+            "roles": eff["roles"],
+            "is_super_admin": eff["is_super_admin"],
+        }
+
+        if _wants_bearer_tokens(request):
+            return {
+                "mfa_required": False,
+                "auth_mode": "bearer",
+                "access_token": access_token,
+                "refresh_token": refresh_tok,
+                "token_type": "bearer",
+                "user": user_payload,
+                "effective_permissions": eff,
+            }
+
+        csrf_token = _set_auth_cookies(response, request, access_token, refresh_tok)
         return {
             "mfa_required": False,
-            "access_token": access_token,
-            "refresh_token": refresh_tok,
+            "auth_mode": "cookie",
             "csrf_token": csrf_token,
-            "token_type": "bearer",
-            "user": {
-                "id": admin_user.id,
-                "username": admin_user.username,
-                "email": admin_user.email,
-                "organization_id": admin_user.organization_id,
-                "auth_source": admin_user.auth_source,
-                "mfa_enabled": admin_user.mfa_enabled,
-                "full_name": admin_user.profile.full_name if admin_user.profile else admin_user.username,
-                "department": admin_user.profile.department if admin_user.profile else None,
-                "region": admin_user.profile.region if admin_user.profile else None,
-                "locale": admin_user.profile.locale if admin_user.profile else "en",
-                "roles": eff["roles"],
-                "is_super_admin": eff["is_super_admin"],
-            },
+            "token_type": "cookie",
+            "user": user_payload,
             "effective_permissions": eff,
         }
 
@@ -277,9 +300,12 @@ def login(body: LoginRequest, request: Request, response: Response, db: Session 
         conn_q = db.query(DirectoryConnection).filter(DirectoryConnection.is_active == True)
         if body.domain:
             conn_q = conn_q.filter(DirectoryConnection.domain_name == body.domain)
-        ad_conn = conn_q.first()
-        if not ad_conn:
+        matching_conns = conn_q.all()
+        if not matching_conns:
             raise HTTPException(status_code=400, detail="No active Active Directory connection configured")
+        if len(matching_conns) > 1 and not body.domain:
+            raise HTTPException(status_code=400, detail="Multiple directory domains active; specify domain")
+        ad_conn = matching_conns[0]
 
         ad_profile = ActiveDirectoryEngine.authenticate_domain_user(ad_conn, body.username, body.password)
         if not ad_profile:
@@ -381,27 +407,39 @@ def login(body: LoginRequest, request: Request, response: Response, db: Session 
         details={"auth_mode": body.auth_mode}
     )
 
+    user_payload = {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "organization_id": user.organization_id,
+        "auth_source": user.auth_source,
+        "mfa_enabled": user.mfa_enabled,
+        "full_name": user.profile.full_name if user.profile else user.username,
+        "department": user.profile.department if user.profile else None,
+        "region": user.profile.region if user.profile else None,
+        "locale": user.profile.locale if user.profile else "en",
+        "roles": eff["roles"],
+        "is_super_admin": eff["is_super_admin"],
+    }
+
+    if _wants_bearer_tokens(request):
+        return {
+            "mfa_required": False,
+            "auth_mode": "bearer",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "user": user_payload,
+            "effective_permissions": eff,
+        }
+
     csrf_token = _set_auth_cookies(response, request, access_token, refresh_token)
     return {
         "mfa_required": False,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
+        "auth_mode": "cookie",
         "csrf_token": csrf_token,
-        "token_type": "bearer",
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "organization_id": user.organization_id,
-            "auth_source": user.auth_source,
-            "mfa_enabled": user.mfa_enabled,
-            "full_name": user.profile.full_name if user.profile else user.username,
-            "department": user.profile.department if user.profile else None,
-            "region": user.profile.region if user.profile else None,
-            "locale": user.profile.locale if user.profile else "en",
-            "roles": eff["roles"],
-            "is_super_admin": eff["is_super_admin"],
-        },
+        "token_type": "cookie",
+        "user": user_payload,
         "effective_permissions": eff,
     }
 
@@ -416,14 +454,15 @@ def refresh_token(
     ip = get_client_ip(request)
     rate_limiter.check(f"refresh:{ip}", limit=60, window_seconds=60)
 
-    raw_refresh = (body.refresh_token if body and body.refresh_token else None) or request.cookies.get(
+    has_body_refresh = bool(body and body.refresh_token)
+    raw_refresh = (body.refresh_token if has_body_refresh else None) or request.cookies.get(
         settings.REFRESH_COOKIE_NAME
     )
     if not raw_refresh:
         raise HTTPException(status_code=401, detail="Refresh token required")
 
     # Enforce CSRF when relying on refresh cookie without explicit body token
-    if not (body and body.refresh_token) and request.cookies.get(settings.REFRESH_COOKIE_NAME):
+    if not has_body_refresh and request.cookies.get(settings.REFRESH_COOKIE_NAME):
         csrf_cookie = request.cookies.get(settings.CSRF_COOKIE_NAME) or ""
         csrf_header = request.headers.get("x-csrf-token") or ""
         if not csrf_cookie or not csrf_header or not secrets.compare_digest(csrf_cookie, csrf_header):
@@ -454,10 +493,27 @@ def refresh_token(
         raise HTTPException(status_code=401, detail="Session not found")
 
     now = datetime.now(timezone.utc)
-    if sess.is_revoked:
-        # Refresh token reuse detected -> revoke all active sessions for safety!
+    if sess.expires_at:
+        sexp = sess.expires_at if sess.expires_at.tzinfo else sess.expires_at.replace(tzinfo=timezone.utc)
+        if sexp < now:
+            sess.is_revoked = True
+            db.commit()
+            raise HTTPException(status_code=401, detail="Refresh session expired")
+
+    # Atomic compare-and-swap rotation prevents concurrent refresh token replay races
+    updated = (
+        db.query(UserSession)
+        .filter(
+            UserSession.id == sess.id,
+            UserSession.user_id == user.id,
+            UserSession.is_revoked == False,
+        )
+        .update({"is_revoked": True}, synchronize_session=False)
+    )
+    if updated == 0:
+        # Refresh token reuse / concurrent replay detected -> revoke all active sessions for safety!
         db.query(UserSession).filter(UserSession.user_id == user.id, UserSession.is_revoked == False).update(
-            {"is_revoked": True}
+            {"is_revoked": True}, synchronize_session=False
         )
         db.commit()
         record_audit(
@@ -466,15 +522,6 @@ def refresh_token(
         )
         raise HTTPException(status_code=401, detail="Refresh token has already been revoked")
 
-    if sess.expires_at:
-        sexp = sess.expires_at if sess.expires_at.tzinfo else sess.expires_at.replace(tzinfo=timezone.utc)
-        if sexp < now:
-            sess.is_revoked = True
-            db.commit()
-            raise HTTPException(status_code=401, detail="Refresh session expired")
-
-    # Rotate refresh token: revoke previous jti and issue new session jti
-    sess.is_revoked = True
     access_token, new_jti, _ = create_access_token(
         user.id, user.username, user.organization_id, user.permission_version
     )
@@ -490,12 +537,19 @@ def refresh_token(
     )
     db.commit()
 
+    if has_body_refresh or _wants_bearer_tokens(request):
+        return {
+            "auth_mode": "bearer",
+            "access_token": access_token,
+            "refresh_token": new_refresh,
+            "token_type": "bearer",
+        }
+
     csrf_token = _set_auth_cookies(response, request, access_token, new_refresh)
     return {
-        "access_token": access_token,
-        "refresh_token": new_refresh,
+        "auth_mode": "cookie",
         "csrf_token": csrf_token,
-        "token_type": "bearer",
+        "token_type": "cookie",
     }
 
 

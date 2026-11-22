@@ -99,6 +99,7 @@ def test_stage2_multi_tenant_isolation(client, admin_headers):
     r_login = client_b.post(
         "/api/v1/auth/login",
         json={"username": tenant_b["username_b"], "password": tenant_b["password_b"]},
+        headers={"X-Auth-Mode": "bearer"},
     )
     assert r_login.status_code == 200
     h_b = {"Authorization": f"Bearer {r_login.json()['access_token']}"}
@@ -222,6 +223,9 @@ def test_stage2_cookies_csrf_session_rotation_and_reuse_detection(client, admin_
         json={"username": uname, "password": "CookieTest!2026"},
     )
     assert login_res.status_code == 200
+    # Cookie-mode JSON responses must NEVER leak raw tokens in JSON body
+    assert "access_token" not in login_res.json()
+    assert "refresh_token" not in login_res.json()
     # Security headers verified
     assert login_res.headers.get("X-Content-Type-Options") == "nosniff"
     assert login_res.headers.get("X-Frame-Options") == "DENY"
@@ -327,7 +331,11 @@ def test_stage2_privilege_escalation_password_policy_and_concurrency(client, adm
     assert sub_u.status_code == 200
     sub_uid = sub_u.json()["id"]
 
-    sub_tok = client.post("/api/v1/auth/login", json={"username": sub_uname, "password": "SubAdmin!2026"}).json()["access_token"]
+    sub_tok = client.post(
+        "/api/v1/auth/login",
+        json={"username": sub_uname, "password": "SubAdmin!2026"},
+        headers={"X-Auth-Mode": "bearer"},
+    ).json()["access_token"]
     sub_hdrs = {"Authorization": f"Bearer {sub_tok}"}
 
     # SubAdmin must NOT escalate themselves or others to super_admin (403)

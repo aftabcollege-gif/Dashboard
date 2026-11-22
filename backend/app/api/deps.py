@@ -1,5 +1,7 @@
+import ipaddress
 import secrets
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Optional
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -14,11 +16,62 @@ from app.models.identity import User, UserSession
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+@lru_cache(maxsize=16)
+def _parse_trusted_proxy_nets(raw: str) -> tuple[ipaddress._BaseNetwork, ...]:
+    nets: list[ipaddress._BaseNetwork] = []
+    for item in (raw or "").split(","):
+        token = item.strip()
+        if not token:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(token, strict=False))
+        except ValueError:
+            continue
+    return tuple(nets)
+
+
+def is_trusted_proxy_ip(host: Optional[str]) -> bool:
+    if not settings.TRUST_PROXY_HEADERS or not host:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(host.strip())
+    except ValueError:
+        return False
+    return any(ip_obj in net for net in _parse_trusted_proxy_nets(settings.TRUSTED_PROXY_IPS))
+
+
+def is_https_request(request: Request) -> bool:
+    if settings.COOKIE_SECURE == "true":
+        return True
+    if settings.COOKIE_SECURE == "false":
+        return False
+    peer_host = request.client.host if request.client else None
+    if is_trusted_proxy_ip(peer_host):
+        proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+        if proto:
+            return proto == "https"
+    return request.url.scheme == "https"
+
+
 def get_client_ip(request: Request) -> str:
+    peer_host = request.client.host if request.client else "unknown"
+    if not is_trusted_proxy_ip(peer_host):
+        return peer_host
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    if not forwarded:
+        return peer_host
+    hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+    trusted_nets = _parse_trusted_proxy_nets(settings.TRUSTED_PROXY_IPS)
+    # Walk right-to-left stripping trusted proxy hops so spoofed leftmost headers cannot bypass rate limits
+    for hop in reversed(hops):
+        try:
+            ip_obj = ipaddress.ip_address(hop)
+            if any(ip_obj in net for net in trusted_nets):
+                continue
+            return hop
+        except ValueError:
+            return hop
+    return hops[0] if hops else peer_host
 
 
 def _extract_token_and_mode(

@@ -18,6 +18,7 @@ from app.api import (
     themes,
     users_rbac,
 )
+from app.api.deps import is_https_request
 from app.config import settings
 from app.database import Base, db_session_scope, engine
 from app.engines.scheduler import start_scheduler, stop_scheduler
@@ -55,7 +56,14 @@ app.add_middleware(
     allow_origins=settings.get_cors_origins(),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token", "X-Setup-Token", "X-Desktop-Control-Token"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-CSRF-Token",
+        "X-Setup-Token",
+        "X-Desktop-Control-Token",
+        "X-Auth-Mode",
+    ],
 )
 
 
@@ -75,8 +83,7 @@ async def security_headers_middleware(request: Request, call_next):
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
 
-    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
-    if proto == "https" or request.url.scheme == "https":
+    if is_https_request(request):
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 
     if any(

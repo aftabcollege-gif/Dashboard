@@ -4,7 +4,11 @@ from app.engines.warehouse import warehouse
 
 
 def _login(client, username, password):
-    r = client.post("/api/v1/auth/login", json={"username": username, "password": password})
+    r = client.post(
+        "/api/v1/auth/login",
+        json={"username": username, "password": password},
+        headers={"X-Auth-Mode": "bearer"},
+    )
     assert r.status_code == 200
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
 

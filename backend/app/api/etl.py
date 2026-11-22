@@ -193,8 +193,18 @@ def create_pipeline(
     src = get_data_source_for_org(db, body.data_source_id, user.organization_id)
     ds = get_dataset_for_org(db, body.target_dataset_id, user.organization_id)
     if body.source_query and body.source_query.strip():
+        st_low = src.source_type.lower()
+        src_dialect = (
+            "sqlite"
+            if st_low == "sqlite"
+            else "postgres"
+            if st_low == "postgresql"
+            else "mysql"
+            if st_low in ("mysql", "mariadb")
+            else "duckdb"
+        )
         try:
-            validate_readonly_sql_ast(body.source_query, require_table_allowlist=False)
+            validate_readonly_sql_ast(body.source_query, dialect=src_dialect, require_table_allowlist=False)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid source_query: {exc}")
 

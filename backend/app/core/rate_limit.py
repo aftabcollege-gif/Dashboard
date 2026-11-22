@@ -5,9 +5,25 @@ from fastapi import HTTPException, status
 from app.config import settings
 from app.core.cache import cache_manager
 
+_REDIS_SLIDING_WINDOW_LUA = """
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+    ttl = tonumber(ARGV[1])
+end
+return {current, ttl}
+"""
+
 
 class RateLimiter:
-    """Sliding-window rate limiter backed by Redis when configured, else thread-safe in-memory."""
+    """
+    Atomic Redis Lua rate limiter when Redis is configured, with thread-safe in-memory
+    fallback in non-production and fail-closed enforcement in production if configured Redis fails.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -18,28 +34,35 @@ class RateLimiter:
             return
 
         now = time.time()
+        redis_configured = bool(settings.REDIS_URL)
         redis_client = getattr(cache_manager, "_redis", None)
+
         if redis_client is not None:
             try:
                 rkey = f"rl:{key}"
-                pipe = redis_client.pipeline()
-                pipe.incr(rkey)
-                pipe.ttl(rkey)
-                count, ttl = pipe.execute()
-                if ttl is None or ttl < 0:
-                    redis_client.expire(rkey, window_seconds)
-                    ttl = window_seconds
-                if int(count) > limit:
+                res = redis_client.eval(_REDIS_SLIDING_WINDOW_LUA, 1, rkey, int(window_seconds))
+                count = int(res[0])
+                ttl = int(res[1])
+                if count > limit:
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                         detail="Rate limit exceeded. Please wait and try again.",
-                        headers={"Retry-After": str(max(1, int(ttl or window_seconds)))},
+                        headers={"Retry-After": str(max(1, ttl or window_seconds))},
                     )
                 return
             except HTTPException:
                 raise
-            except Exception:
-                pass
+            except Exception as exc:
+                if settings.ENVIRONMENT == "production" and settings.RATE_LIMIT_FAIL_CLOSED_PROD:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="Rate limiting service temporarily unavailable",
+                    ) from exc
+        elif redis_configured and settings.ENVIRONMENT == "production" and settings.RATE_LIMIT_FAIL_CLOSED_PROD:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Rate limiting backend unavailable in production",
+            )
 
         cutoff = now - window_seconds
         with self._lock:

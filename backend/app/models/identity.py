@@ -115,7 +115,14 @@ class DirectoryConnection(Base, TimestampMixin):
 
 class ExternalIdentity(Base, TimestampMixin):
     __tablename__ = "external_identities"
-    __table_args__ = (UniqueConstraint("provider_type", "external_id", name="uq_ext_provider_id"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "directory_connection_id",
+            "provider_type",
+            "external_id",
+            name="uq_ext_conn_provider_id",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
     user_id: Mapped[str] = mapped_column(
