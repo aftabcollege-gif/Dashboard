@@ -1,0 +1,10 @@
+NexusBI Enterprise v1.1.0 has been installed.
+
+- Offline Execution: No Python, Node.js, Docker, PostgreSQL, or Redis installation is required.
+- Included Capabilities: Enterprise BI Dashboards, Persian/English Conversational Assistant,
+  Excel/CSV/TSV Dataset Uploader, and BPMN Process Bottleneck & Cartable Heatmap Analytics.
+- First Launch Security: On first launch, you will create your local Super Administrator
+  account and password. No default admin password is active.
+- User Data Location: %LocalAppData%\NexusBI\data
+- Logs Location: %LocalAppData%\NexusBI\logs
+- Uninstall Behavior: Uninstalling removes application binaries only and preserves %LocalAppData%\NexusBI.

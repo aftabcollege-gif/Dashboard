@@ -1,0 +1,111 @@
+name: Build and Verify Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "winsetup/**"
+      - "backend/**"
+      - "frontend/**"
+      - ".github/workflows/windows-installer.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-setup:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22 (build host only)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "frontend/package-lock.json"
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup -y --no-progress
+
+      - name: Build offline Windows setup.exe
+        shell: pwsh
+        run: |
+          .\winsetup\build.ps1
+
+      - name: Verify setup.exe on clean stripped environment
+        shell: pwsh
+        run: |
+          .\winsetup\tests\verify_windows_bundle.ps1
+
+      - name: Prepare versioned installer & checksums
+        id: versioned
+        shell: pwsh
+        run: |
+          $iss = Get-Content "winsetup\installer\NexusBI.iss" -Raw
+          if ($iss -match '#define\s+MyAppVersion\s+"([^"]+)"') {
+            $ver = $Matches[1]
+          } else {
+            $ver = "1.1.0"
+          }
+          $srcExe = Get-Item "winsetup\dist\setup.exe"
+          $versionedName = "NexusBI-Enterprise-v$ver-x64-Setup.exe"
+          $versionedPath = Join-Path "winsetup\dist" $versionedName
+          Copy-Item -Path $srcExe.FullName -Destination $versionedPath -Force
+
+          $sha = (Get-FileHash -Path $srcExe.FullName -Algorithm SHA256).Hash
+          $mb = [Math]::Round($srcExe.Length / 1MB, 2)
+          $sumFile = "winsetup\dist\SHA256SUMS.txt"
+          @(
+            "$sha  $versionedName"
+            "$sha  setup.exe"
+          ) | Out-File -FilePath $sumFile -Encoding ascii
+
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=v$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "versioned_name=$versionedName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          "### Windows Installer Build Succeeded (v$ver)`n- Installer: ``winsetup/dist/$versionedName```n- Alias: ``winsetup/dist/setup.exe```n- Size: **$mb MB**`n- SHA256: ``$sha``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload Windows setup.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusBI-Windows-x64-Setup-v${{ steps.versioned.outputs.version }}
+          path: |
+            winsetup/dist/setup.exe
+            winsetup/dist/${{ steps.versioned.outputs.versioned_name }}
+            winsetup/dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub Release on main
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $tag = "${{ steps.versioned.outputs.tag }}"
+          $ver = "${{ steps.versioned.outputs.version }}"
+          $vName = "${{ steps.versioned.outputs.versioned_name }}"
+          $notes = @(
+            "## NexusBI Enterprise $tag (Windows x64 Standalone Offline Installer)"
+            ""
+            "- **Offline Installer**: Single ``$vName`` (no external Python, Node.js, or Docker required)."
+            "- **New in $tag**:"
+            "  - BPMN Process Mining, Wait-Time Heatmap Overlay & Cartable Assignee Drill-Down."
+            "  - Persian & English Conversational Dashboard Builder & Editor Assistant."
+            "  - One-click Excel (``.xlsx``/``.xls``), CSV, TSV & JSON Dataset Importer."
+            "  - Secure first-run Windows Desktop supervisor (DPAPI secrets + setup token)."
+          ) -join "`n"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag "winsetup/dist/$vName" "winsetup/dist/setup.exe" "winsetup/dist/SHA256SUMS.txt" --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+            gh release edit $tag --title "NexusBI Enterprise $tag" --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
+          } else {
+            gh release create $tag "winsetup/dist/$vName" "winsetup/dist/setup.exe" "winsetup/dist/SHA256SUMS.txt" --title "NexusBI Enterprise $tag" --notes $notes --target main
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }

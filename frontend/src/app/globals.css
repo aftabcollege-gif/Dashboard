@@ -1,0 +1,75 @@
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource/vazirmatn/400.css";
+@import "@fontsource/vazirmatn/500.css";
+@import "@fontsource/vazirmatn/700.css";
+@import "react-grid-layout/css/styles.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bi-primary: #2563eb;
+  --bi-secondary: #0ea5e9;
+  --bi-bg: #f1f5f9;
+  --bi-surface: #ffffff;
+  --bi-card: #ffffff;
+  --bi-text: #0f172a;
+  --bi-muted: #64748b;
+  --bi-border: #e2e8f0;
+  --bi-radius: 12px;
+  --bi-shadow: 0 4px 20px rgba(15, 23, 42, 0.06);
+  --bi-blur: 0px;
+  --bi-font: Inter, Vazirmatn, sans-serif;
+}
+
+html,
+body {
+  font-family: var(--bi-font);
+  background: var(--bi-bg);
+  color: var(--bi-text);
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  overflow-x: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html[dir="rtl"] body {
+  font-family: Vazirmatn, Inter, sans-serif;
+}
+
+/* Smooth horizontal touch scrolling for tables/tabs on mobile */
+.overflow-auto,
+.overflow-x-auto {
+  -webkit-overflow-scrolling: touch;
+}
+
+.bi-card {
+  background: var(--bi-card);
+  border: 1px solid var(--bi-border);
+  border-radius: var(--bi-radius);
+  box-shadow: var(--bi-shadow);
+  backdrop-filter: blur(var(--bi-blur));
+  -webkit-backdrop-filter: blur(var(--bi-blur));
+}
+
+.bi-surface {
+  background: var(--bi-surface);
+  border: 1px solid var(--bi-border);
+  backdrop-filter: blur(var(--bi-blur));
+  -webkit-backdrop-filter: blur(var(--bi-blur));
+}
+
+.react-grid-item.react-grid-placeholder {
+  background: rgba(37, 99, 235, 0.14) !important;
+  border: 2px dashed var(--bi-primary) !important;
+  border-radius: var(--bi-radius);
+}
+
+.react-resizable-handle {
+  z-index: 20;
+}
