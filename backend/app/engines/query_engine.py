@@ -84,7 +84,7 @@ def build_visual_query_sql(
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     if raw_mode:
-        sql = f"WITH _base AS (SELECT * FROM {table_expr}{join_clauses} {where_sql}) SELECT * FROM _base LIMIT 500"
+        sql = f"WITH _base AS (SELECT * FROM {table_expr}{join_clauses} {where_sql}) SELECT * FROM _base LIMIT 1000"
         return sql, params, "raw"
 
     x_field = override_dimension or visual_spec.get("x_field") or visual_spec.get("dimension")

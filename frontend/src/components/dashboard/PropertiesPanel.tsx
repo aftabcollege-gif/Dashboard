@@ -5,6 +5,8 @@ import { Download, Plus, Trash2, X } from "lucide-react";
 import { apiDownload, apiFetch } from "@/lib/api";
 import { CHART_REGISTRY } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
+import { saveDemoWidgetEdit } from "@/lib/demoStore";
+import { parseBpmnXml } from "@/lib/bpmnParser";
 import { DashboardWidget, DatasetInfo } from "@/types/bi";
 
 interface Props {
@@ -17,7 +19,7 @@ interface Props {
 }
 
 export default function PropertiesPanel({ widget, datasets, pages, onClose, onUpdated, onChartSwitched }: Props) {
-  const { t, locale, showToast } = useBi();
+  const { t, locale, authStatus, showToast } = useBi();
   const [tab, setTab] = useState<"data" | "viz" | "style" | "filters" | "drill" | "advanced">("data");
 
   // Local editable drafts initialized from widget
@@ -63,6 +65,12 @@ export default function PropertiesPanel({ widget, datasets, pages, onClose, onUp
           drill_through_page_id: drillThroughPage || null,
         }),
       });
+      if (typeof window !== "undefined" && authStatus?.environment === "vercel-preview-demo") {
+        saveDemoWidgetEdit(widget.dashboard_id, widget.id, {
+          title,
+          visual_spec: visualSpec,
+        });
+      }
       showToast("Widget properties saved");
       onUpdated();
     } catch (err: any) {
@@ -247,6 +255,90 @@ export default function PropertiesPanel({ widget, datasets, pages, onClose, onUp
                     {dsFields.map((f) => <option key={f.field_name} value={f.field_name}>{f.field_name}</option>)}
                   </select>
                 </div>
+
+                {(widget.chart_type === "bpmn" || visualSpec.bpmn_config) && (
+                  <div className="p-2.5 rounded-lg border space-y-2 bg-blue-500/5" style={{ borderColor: "var(--bi-border)" }}>
+                    <div className="font-bold text-[11px]">
+                      {locale === "fa" ? "تنظیمات BPMN و نقشه حرارتی" : "BPMN Process & Heatmap Settings"}
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={visualSpec.bpmn_config?.heatmap_enabled ?? true}
+                        onChange={(e) =>
+                          setVisualSpec({
+                            ...visualSpec,
+                            bpmn_config: { ...(visualSpec.bpmn_config || {}), heatmap_enabled: e.target.checked },
+                          })
+                        }
+                      />
+                      <span>{locale === "fa" ? "نمایش نقشه حرارتی زمان انتظار" : "Show Wait-Time Heatmap"}</span>
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <div>
+                        <label className="block text-[10px] font-semibold">Assignee Field</label>
+                        <select
+                          value={visualSpec.bpmn_config?.assignee_field || ""}
+                          onChange={(e) =>
+                            setVisualSpec({
+                              ...visualSpec,
+                              bpmn_config: { ...(visualSpec.bpmn_config || {}), assignee_field: e.target.value || undefined },
+                            })
+                          }
+                          className="w-full px-1.5 py-1 rounded border bg-transparent text-[11px]"
+                          style={{ borderColor: "var(--bi-border)" }}
+                        >
+                          <option value="">Auto</option>
+                          {dsFields.map((f) => <option key={f.field_name} value={f.field_name}>{f.field_name}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-semibold">Status Field</label>
+                        <select
+                          value={visualSpec.bpmn_config?.status_field || ""}
+                          onChange={(e) =>
+                            setVisualSpec({
+                              ...visualSpec,
+                              bpmn_config: { ...(visualSpec.bpmn_config || {}), status_field: e.target.value || undefined },
+                            })
+                          }
+                          className="w-full px-1.5 py-1 rounded border bg-transparent text-[11px]"
+                          style={{ borderColor: "var(--bi-border)" }}
+                        >
+                          <option value="">Auto</option>
+                          {dsFields.map((f) => <option key={f.field_name} value={f.field_name}>{f.field_name}</option>)}
+                        </select>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-semibold mb-1">
+                        {locale === "fa" ? "بارگذاری فایل BPMN (.bpmn/.xml)" : "Upload BPMN Model (.bpmn/.xml)"}
+                      </label>
+                      <input
+                        type="file"
+                        accept=".bpmn,.xml"
+                        onChange={async (ev) => {
+                          const f = ev.target.files?.[0];
+                          if (!f) return;
+                          const xml = await f.text();
+                          const parsed = parseBpmnXml(xml);
+                          setVisualSpec({
+                            ...visualSpec,
+                            bpmn_config: {
+                              ...(visualSpec.bpmn_config || {}),
+                              process_name: parsed.processName,
+                              bpmn_xml: xml,
+                              nodes: parsed.nodes,
+                              edges: parsed.edges,
+                            },
+                          });
+                          showToast(`BPMN loaded: ${parsed.nodes.length} nodes`);
+                        }}
+                        className="text-[10px]"
+                      />
+                    </div>
+                  </div>
+                )}
               </>
             ) : (
               <div>

@@ -9,9 +9,11 @@ import WidgetRenderer from "@/components/charts/WidgetRenderer";
 import { apiFetch } from "@/lib/api";
 import { CHART_REGISTRY } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
+import { addDemoCustomWidget } from "@/lib/demoStore";
+import { inferBpmnFieldMapping } from "@/lib/bpmnParser";
 
 export default function QueryBuilderPage() {
-  const { user, activeThemeMode, showToast } = useBi();
+  const { user, activeThemeMode, authStatus, showToast } = useBi();
   const [datasets, setDatasets] = useState<any[]>([]);
   const [dashboards, setDashboards] = useState<any[]>([]);
   const [savedQueries, setSavedQueries] = useState<any[]>([]);
@@ -159,7 +161,22 @@ export default function QueryBuilderPage() {
       const dashDetail = await apiFetch<any>(`/dashboards/${targetDashId}`);
       const firstPageId = dashDetail.pages?.[0]?.id;
       if (!firstPageId) throw new Error("Target dashboard has no pages");
-      await apiFetch("/queries/convert-to-widget", {
+      const isBpmn = widgetChart === "bpmn";
+      const mapped = isBpmn ? inferBpmnFieldMapping(result?.columns || []) : null;
+      const visualSpecPayload = isBpmn && mapped
+        ? {
+            x_field: mapped.step_field,
+            y_field: mapped.wait_field || "*",
+            aggregation: "AVG",
+            bpmn_config: {
+              ...mapped,
+              heatmap_enabled: true,
+              heatmap_metric: "avg_wait",
+              process_name: widgetTitle,
+            },
+          }
+        : {};
+      const res = await apiFetch<any>("/queries/convert-to-widget", {
         method: "POST",
         body: JSON.stringify({
           dashboard_id: targetDashId,
@@ -167,10 +184,38 @@ export default function QueryBuilderPage() {
           title: widgetTitle,
           chart_type: widgetChart,
           dataset_id: selectedDsId || null,
-          query_mode: "sql",
-          sql_text: sqlText,
+          query_mode: mode === "visual" ? "visual" : "sql",
+          sql_text: mode === "sql" ? sqlText : null,
+          visual_spec: visualSpecPayload,
         }),
       });
+      if (typeof window !== "undefined" && authStatus?.environment === "vercel-preview-demo") {
+        addDemoCustomWidget(targetDashId, {
+          id: res?.widget_id || `qw_${Date.now()}`,
+          dashboard_id: targetDashId,
+          page_id: firstPageId,
+          title: widgetTitle,
+          description: "",
+          chart_type: widgetChart,
+          dataset_id: selectedDsId || null,
+          layout: { x: 0, y: 99, w: isBpmn ? 12 : 6, h: isBpmn ? 9 : 7 },
+          config: {
+            style: {},
+            visualization: { show_legend: true, show_tooltip: true },
+            interactions: { cross_filter: true },
+            advanced: {},
+          },
+          query: {
+            query_mode: mode === "visual" ? "visual" : "sql",
+            sql_text: mode === "sql" ? sqlText : null,
+            visual_spec: visualSpecPayload,
+            parameters: {},
+          },
+          drill_rule: { hierarchy: [], level_rules: [], drill_through_page_id: null },
+          widget_filters: [],
+          permissions: { view: true, edit: true, delete: true, drill_down: true },
+        });
+      }
       showToast("Query converted to live dashboard widget!");
       window.location.href = `/dashboards/${targetDashId}`;
     } catch (err: any) {

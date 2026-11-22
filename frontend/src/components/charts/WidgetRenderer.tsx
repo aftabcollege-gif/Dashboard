@@ -5,6 +5,7 @@ import * as echarts from "echarts";
 import { ArrowDownRight, ArrowUpRight, Search } from "lucide-react";
 import { formatBIValue } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
+import BpmnProcessViewer from "@/components/charts/BpmnProcessViewer";
 
 interface Props {
   chartType: string;
@@ -35,10 +36,26 @@ const GEO_CITY_COORDS: Record<string, [number, number]> = {
   Iran: [53.688, 32.4279],
 };
 
-export default function WidgetRenderer({
+export default function WidgetRenderer(props: Props) {
+  if (props.chartType === "bpmn") {
+    return (
+      <BpmnProcessViewer
+        columns={props.columns}
+        rows={props.rows}
+        styleConfig={props.styleConfig}
+        vizConfig={props.vizConfig}
+        visualSpec={props.visualSpec}
+        onPointClick={props.onPointClick}
+      />
+    );
+  }
+  return <StandardWidgetRenderer {...props} />;
+}
+
+function StandardWidgetRenderer({
   chartType,
-  columns,
-  rows,
+  columns: rawColumns,
+  rows: rawRows,
   styleConfig = {},
   vizConfig = {},
   visualSpec = {},
@@ -50,6 +67,33 @@ export default function WidgetRenderer({
   const [sortCol, setSortCol] = useState<string | null>(null);
   const [sortAsc, setSortAsc] = useState(true);
   const [isMobile, setIsMobile] = useState(false);
+
+  const { columns, rows } = useMemo(() => {
+    if (
+      visualSpec?.bpmn_config &&
+      chartType !== "table" &&
+      !rawColumns.includes("value") &&
+      rawRows.length > 0
+    ) {
+      const stepCol = visualSpec.bpmn_config.step_field || visualSpec.x_field || rawColumns[0];
+      const waitCol = visualSpec.bpmn_config.wait_field || visualSpec.y_field;
+      const groups = new Map<string, number[]>();
+      for (const r of rawRows) {
+        const k = String(r[stepCol] ?? "").trim();
+        if (!k) continue;
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k)!.push(waitCol ? Number(r[waitCol] ?? 0) || 0 : 1);
+      }
+      const aggRows = Array.from(groups.entries()).map(([k, vals]) => ({
+        [stepCol]: k,
+        value: waitCol
+          ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10
+          : vals.length,
+      }));
+      return { columns: [stepCol, "value"], rows: aggRows };
+    }
+    return { columns: rawColumns, rows: rawRows };
+  }, [rawColumns, rawRows, visualSpec, chartType]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;

@@ -3,6 +3,7 @@ import os
 import random
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 import pandas as pd
 from sqlalchemy.orm import Session
 from app.config import settings
@@ -641,6 +642,425 @@ def ensure_contractor_sample_dataset(db: Session, org: Organization) -> None:
     db.commit()
 
 
+def _build_bpmn_sample_rows() -> list[dict[str, Any]]:
+    """Generates realistic Persian procurement BPMN workflow events with clear bottlenecks & cartable assignees."""
+    templates = [
+        # (step_id, step_name, sla_hours, pending_cases[(assignee, role, dept, wait, status, priority)], completed_cases)
+        (
+            "step_submit",
+            "ثبت درخواست خرید",
+            8.0,
+            [
+                ("ندا مرادی", "کارشناس درخواست", "فنی و مهندسی", 5.5, "در انتظار اقدام", "متوسط"),
+                ("ندا مرادی", "کارشناس درخواست", "عملیات و لجستیک", 9.2, "دارای تاخیر", "بالا"),
+                ("پویا کیانی", "کارشناس تدارکات", "فناوری اطلاعات", 4.0, "در انتظار اقدام", "عادی"),
+                ("سارا احمدی", "کارشناس بازرگانی", "بازرگانی", 6.5, "در انتظار اقدام", "متوسط"),
+                ("پویا کیانی", "کارشناس تدارکات", "مالی و اداری", 3.5, "در انتظار اقدام", "عادی"),
+            ],
+            [
+                ("ندا مرادی", "کارشناس درخواست", "فنی و مهندسی", 3.0, "تکمیل‌شده", "متوسط"),
+                ("پویا کیانی", "کارشناس تدارکات", "فناوری اطلاعات", 4.2, "تکمیل‌شده", "عادی"),
+                ("سارا احمدی", "کارشناس بازرگانی", "بازرگانی", 5.0, "تکمیل‌شده", "متوسط"),
+                ("ندا مرادی", "کارشناس درخواست", "عملیات و لجستیک", 6.1, "تکمیل‌شده", "بالا"),
+            ],
+        ),
+        (
+            "step_tech",
+            "بررسی فنی و نیازسنجی",
+            12.0,
+            [
+                ("آرش شریفی", "مهندس بررسی فنی", "فنی و مهندسی", 14.5, "دارای تاخیر", "بالا"),
+                ("آرش شریفی", "مهندس بررسی فنی", "فناوری اطلاعات", 11.0, "در انتظار اقدام", "متوسط"),
+                ("سپیده نادری", "کارشناس ارشد فنی", "عملیات و لجستیک", 16.2, "دارای تاخیر", "بالا"),
+                ("سپیده نادری", "کارشناس ارشد فنی", "فنی و مهندسی", 9.5, "در انتظار اقدام", "متوسط"),
+                ("کیانوش پرتوی", "تحلیلگر فنی", "فناوری اطلاعات", 8.0, "در انتظار اقدام", "عادی"),
+                ("کیانوش پرتوی", "تحلیلگر فنی", "بازرگانی", 13.0, "دارای تاخیر", "متوسط"),
+                ("آرش شریفی", "مهندس بررسی فنی", "عملیات و لجستیک", 10.5, "در انتظار اقدام", "عادی"),
+            ],
+            [
+                ("آرش شریفی", "مهندس بررسی فنی", "فنی و مهندسی", 7.5, "تکمیل‌شده", "متوسط"),
+                ("سپیده نادری", "کارشناس ارشد فنی", "فناوری اطلاعات", 9.0, "تکمیل‌شده", "بالا"),
+                ("کیانوش پرتوی", "تحلیلگر فنی", "بازرگانی", 8.4, "تکمیل‌شده", "عادی"),
+                ("آرش شریفی", "مهندس بررسی فنی", "عملیات و لجستیک", 10.2, "تکمیل‌شده", "متوسط"),
+            ],
+        ),
+        (
+            "step_fix",
+            "اصلاح مستندات و پیوست",
+            16.0,
+            [
+                ("ندا مرادی", "کارشناس درخواست", "عملیات و لجستیک", 21.0, "دارای تاخیر", "بالا"),
+                ("پویا کیانی", "کارشناس تدارکات", "بازرگانی", 15.5, "در انتظار اقدام", "متوسط"),
+                ("سارا احمدی", "کارشناس بازرگانی", "فنی و مهندسی", 18.0, "دارای تاخیر", "متوسط"),
+                ("ندا مرادی", "کارشناس درخواست", "مالی و اداری", 11.5, "در انتظار اقدام", "عادی"),
+            ],
+            [
+                ("پویا کیانی", "کارشناس تدارکات", "فناوری اطلاعات", 10.0, "تکمیل‌شده", "عادی"),
+                ("سارا احمدی", "کارشناس بازرگانی", "بازرگانی", 12.5, "تکمیل‌شده", "متوسط"),
+            ],
+        ),
+        (
+            "step_budget",
+            "تأیید بودجه و مالی",
+            24.0,
+            [
+                ("مهسا کریمی", "رئیس اداره بودجه", "فنی و مهندسی", 64.5, "دارای تاخیر", "بحرانی"),
+                ("مهسا کریمی", "رئیس اداره بودجه", "عملیات و لجستیک", 58.0, "دارای تاخیر", "بالا"),
+                ("مهسا کریمی", "رئیس اداره بودجه", "فناوری اطلاعات", 49.0, "دارای تاخیر", "بالا"),
+                ("مهسا کریمی", "رئیس اداره بودجه", "بازرگانی", 38.5, "در انتظار اقدام", "متوسط"),
+                ("دکتر کاوه نوری", "معاون مالی و اقتصادی", "فنی و مهندسی", 72.0, "دارای تاخیر", "بحرانی"),
+                ("دکتر کاوه نوری", "معاون مالی و اقتصادی", "عملیات و لجستیک", 61.5, "دارای تاخیر", "بالا"),
+                ("دکتر کاوه نوری", "معاون مالی و اقتصادی", "مالی و اداری", 44.0, "دارای تاخیر", "متوسط"),
+                ("امیرحسین رضایی", "کارشناس کنترل بودجه", "فناوری اطلاعات", 52.0, "دارای تاخیر", "بالا"),
+                ("امیرحسین رضایی", "کارشناس کنترل بودجه", "بازرگانی", 41.0, "دارای تاخیر", "متوسط"),
+                ("مهدی تهرانی", "حسابرس داخلی", "فنی و مهندسی", 56.0, "دارای تاخیر", "بالا"),
+                ("مهدی تهرانی", "حسابرس داخلی", "مالی و اداری", 39.0, "در انتظار اقدام", "عادی"),
+            ],
+            [
+                ("مهسا کریمی", "رئیس اداره بودجه", "فنی و مهندسی", 28.0, "تکمیل‌شده", "بالا"),
+                ("دکتر کاوه نوری", "معاون مالی و اقتصادی", "فناوری اطلاعات", 34.0, "تکمیل‌شده", "متوسط"),
+                ("امیرحسین رضایی", "کارشناس کنترل بودجه", "بازرگانی", 22.0, "تکمیل‌شده", "عادی"),
+            ],
+        ),
+        (
+            "step_committee",
+            "کمیسیون معاملات و مناقصه",
+            36.0,
+            [
+                ("بهرام شریفی", "دبیر کمیسیون معاملات", "فنی و مهندسی", 118.0, "دارای تاخیر", "بحرانی"),
+                ("بهرام شریفی", "دبیر کمیسیون معاملات", "عملیات و لجستیک", 96.5, "دارای تاخیر", "بحرانی"),
+                ("بهرام شریفی", "دبیر کمیسیون معاملات", "فناوری اطلاعات", 84.0, "دارای تاخیر", "بالا"),
+                ("بهرام شریفی", "دبیر کمیسیون معاملات", "بازرگانی", 71.0, "دارای تاخیر", "بالا"),
+                ("دکتر کاوه نوری", "رئیس کمیسیون معاملات", "فنی و مهندسی", 104.0, "دارای تاخیر", "بحرانی"),
+                ("دکتر کاوه نوری", "رئیس کمیسیون معاملات", "عملیات و لجستیک", 88.0, "دارای تاخیر", "بالا"),
+                ("دکتر کاوه نوری", "رئیس کمیسیون معاملات", "مالی و اداری", 69.5, "دارای تاخیر", "بالا"),
+                ("حسین شفیعی", "عضو حقوقی کمیسیون", "فنی و مهندسی", 92.0, "دارای تاخیر", "بحرانی"),
+                ("حسین شفیعی", "عضو حقوقی کمیسیون", "بازرگانی", 78.5, "دارای تاخیر", "بالا"),
+                ("حسین شفیعی", "عضو حقوقی کمیسیون", "فناوری اطلاعات", 63.0, "دارای تاخیر", "متوسط"),
+                ("سارا احمدی", "کارشناس مناقصات", "عملیات و لجستیک", 76.0, "دارای تاخیر", "بالا"),
+                ("سارا احمدی", "کارشناس مناقصات", "بازرگانی", 54.5, "دارای تاخیر", "متوسط"),
+                ("مهدی تهرانی", "ناظر کمیسیون", "فنی و مهندسی", 82.0, "دارای تاخیر", "بالا"),
+                ("مهدی تهرانی", "ناظر کمیسیون", "مالی و اداری", 61.0, "دارای تاخیر", "متوسط"),
+            ],
+            [
+                ("بهرام شریفی", "دبیر کمیسیون معاملات", "فنی و مهندسی", 48.0, "تکمیل‌شده", "بالا"),
+                ("دکتر کاوه نوری", "رئیس کمیسیون معاملات", "عملیات و لجستیک", 42.0, "تکمیل‌شده", "متوسط"),
+                ("حسین شفیعی", "عضو حقوقی کمیسیون", "فناوری اطلاعات", 39.0, "تکمیل‌شده", "عادی"),
+            ],
+        ),
+        (
+            "step_po",
+            "صدور سفارش و پرداخت",
+            16.0,
+            [
+                ("مریم موسوی", "مسئول صدور حواله", "فناوری اطلاعات", 11.5, "در انتظار اقدام", "متوسط"),
+                ("مریم موسوی", "مسئول صدور حواله", "بازرگانی", 18.0, "دارای تاخیر", "بالا"),
+                ("فرهاد جلالی", "کارشناس پرداخت", "عملیات و لجستیک", 9.0, "در انتظار اقدام", "عادی"),
+                ("فرهاد جلالی", "کارشناس پرداخت", "فنی و مهندسی", 14.5, "در انتظار اقدام", "متوسط"),
+                ("امیرحسین رضایی", "کارشناس کنترل بودجه", "مالی و اداری", 12.0, "در انتظار اقدام", "عادی"),
+                ("مریم موسوی", "مسئول صدور حواله", "فنی و مهندسی", 15.0, "در انتظار اقدام", "متوسط"),
+            ],
+            [
+                ("مریم موسوی", "مسئول صدور حواله", "فناوری اطلاعات", 8.5, "تکمیل‌شده", "عادی"),
+                ("فرهاد جلالی", "کارشناس پرداخت", "بازرگانی", 7.0, "تکمیل‌شده", "متوسط"),
+                ("فرهاد جلالی", "کارشناس پرداخت", "عملیات و لجستیک", 10.0, "تکمیل‌شده", "عادی"),
+                ("مریم موسوی", "مسئول صدور حواله", "مالی و اداری", 9.2, "تکمیل‌شده", "عادی"),
+            ],
+        ),
+    ]
+
+    rows: list[dict[str, Any]] = []
+    idx = 1
+    for step_id, step_name, sla_hours, pending_list, done_list in templates:
+        for assignee, role, dept, wait_h, status, prio in pending_list + done_list:
+            day_num = 1 + ((idx * 3) % 15)
+            hour_num = 8 + (idx % 9)
+            rows.append(
+                {
+                    "event_id": idx,
+                    "request_code": f"PRQ-{1000 + idx}",
+                    "process_name": "فرآیند تأمین و خرید سازمانی",
+                    "step_id": step_id,
+                    "step_name": step_name,
+                    "assignee_name": assignee,
+                    "assignee_role": role,
+                    "department": dept,
+                    "wait_hours": round(float(wait_h), 1),
+                    "sla_hours": round(float(sla_hours), 1),
+                    "status": status,
+                    "priority": prio,
+                    "entered_at": f"2026-11-{day_num:02d}T{hour_num:02d}:30:00Z",
+                }
+            )
+            idx += 1
+    return rows
+
+
+DEFAULT_BPMN_GRAPH_PAYLOAD: dict[str, Any] = {
+    "process_name": "فرآیند تأمین و خرید سازمانی",
+    "step_field": "step_name",
+    "step_id_field": "step_id",
+    "wait_field": "wait_hours",
+    "sla_field": "sla_hours",
+    "assignee_field": "assignee_name",
+    "assignee_role_field": "assignee_role",
+    "request_id_field": "request_code",
+    "status_field": "status",
+    "department_field": "department",
+    "priority_field": "priority",
+    "heatmap_enabled": True,
+    "heatmap_metric": "avg_wait",
+    "nodes": [
+        {"id": "evt_start", "label": "شروع", "type": "startEvent", "x": 32, "y": 128, "width": 44, "height": 44, "stepKey": "__start__"},
+        {"id": "step_submit", "label": "ثبت درخواست خرید", "type": "userTask", "x": 112, "y": 102, "width": 178, "height": 96, "stepKey": "ثبت درخواست خرید"},
+        {"id": "step_tech", "label": "بررسی فنی و نیازسنجی", "type": "userTask", "x": 326, "y": 102, "width": 178, "height": 96, "stepKey": "بررسی فنی و نیازسنجی"},
+        {"id": "gw_valid", "label": "تأیید مدارک؟", "type": "exclusiveGateway", "x": 540, "y": 124, "width": 52, "height": 52, "stepKey": "__gw_valid__"},
+        {"id": "step_fix", "label": "اصلاح مستندات و پیوست", "type": "userTask", "x": 480, "y": 248, "width": 178, "height": 96, "stepKey": "اصلاح مستندات و پیوست"},
+        {"id": "step_budget", "label": "تأیید بودجه و مالی", "type": "userTask", "x": 634, "y": 102, "width": 178, "height": 96, "stepKey": "تأیید بودجه و مالی"},
+        {"id": "step_committee", "label": "کمیسیون معاملات و مناقصه", "type": "userTask", "x": 850, "y": 102, "width": 184, "height": 96, "stepKey": "کمیسیون معاملات و مناقصه"},
+        {"id": "step_po", "label": "صدور سفارش و پرداخت", "type": "serviceTask", "x": 1070, "y": 102, "width": 182, "height": 96, "stepKey": "صدور سفارش و پرداخت"},
+        {"id": "evt_end", "label": "پایان", "type": "endEvent", "x": 1288, "y": 128, "width": 44, "height": 44, "stepKey": "__end__"},
+    ],
+    "edges": [
+        {"id": "f1", "source": "evt_start", "target": "step_submit"},
+        {"id": "f2", "source": "step_submit", "target": "step_tech"},
+        {"id": "f3", "source": "step_tech", "target": "gw_valid"},
+        {"id": "f4", "source": "gw_valid", "target": "step_budget", "label": "تأیید"},
+        {"id": "f5", "source": "gw_valid", "target": "step_fix", "label": "نقص مدرک"},
+        {"id": "f6", "source": "step_fix", "target": "step_tech", "label": "ارسال مجدد"},
+        {"id": "f7", "source": "step_budget", "target": "step_committee"},
+        {"id": "f8", "source": "step_committee", "target": "step_po"},
+        {"id": "f9", "source": "step_po", "target": "evt_end"},
+    ],
+}
+
+
+def ensure_bpmn_process_sample_dataset(db: Session, org: Organization) -> None:
+    """Idempotently seeds BPMN process mining dataset ('wh_process_bpmn_events') & a full BPMN bottleneck dashboard."""
+    existing_ds = db.query(Dataset).filter(
+        Dataset.organization_id == org.id, Dataset.warehouse_table == "wh_process_bpmn_events"
+    ).first()
+    rows = _build_bpmn_sample_rows()
+    if not existing_ds or not warehouse.table_exists("wh_process_bpmn_events"):
+        df = pd.DataFrame(rows)
+        warehouse.load_dataframe("wh_process_bpmn_events", df, mode="replace")
+
+    if existing_ds:
+        existing_ds.row_count = len(rows)
+        existing_ds.freshness_status = "fresh"
+        existing_ds.last_refreshed_at = datetime.now(timezone.utc)
+        ds_bpmn = existing_ds
+    else:
+        src = db.query(DataSource).filter(DataSource.organization_id == org.id).first()
+        if not src:
+            src = DataSource(
+                organization_id=org.id,
+                name="Enterprise ERP Operational DB",
+                source_type="sqlite",
+                read_only=True,
+                config_json={"file_path": settings.SAMPLE_ERP_DB_PATH, "default_table": "erp_orders"},
+                refresh_policy="manual",
+                health_status="healthy",
+                last_tested_at=datetime.now(timezone.utc),
+            )
+            db.add(src)
+            db.flush()
+
+        ds_bpmn = Dataset(
+            organization_id=org.id,
+            data_source_id=src.id,
+            name="رویدادهای فرآیند BPMN و کارتابل",
+            description="سوابق جریان درخواست‌ها در مراحل BPMN، زمان انتظار در کارتابل افراد و کشف گلوگاه‌ها",
+            warehouse_table="wh_process_bpmn_events",
+            schema_type="fact",
+            refresh_policy="cached",
+            row_count=len(rows),
+            last_refreshed_at=datetime.now(timezone.utc),
+            freshness_status="fresh",
+        )
+        db.add(ds_bpmn)
+        db.flush()
+
+        fields_spec = [
+            ("request_code", "کد درخواست", "string", "dimension"),
+            ("process_name", "نام فرآیند", "string", "dimension"),
+            ("step_id", "شناسه گام BPMN", "string", "dimension"),
+            ("step_name", "نام گام / مرحله فرآیند", "string", "dimension"),
+            ("assignee_name", "مسئول کارتابل", "string", "dimension"),
+            ("assignee_role", "سمت مسئول", "string", "dimension"),
+            ("department", "واحد متقاضی", "string", "dimension"),
+            ("wait_hours", "زمان انتظار (ساعت)", "float", "measure"),
+            ("sla_hours", "سقف مجاز SLA (ساعت)", "float", "measure"),
+            ("status", "وضعیت درخواست", "string", "dimension"),
+            ("priority", "اولویت", "string", "dimension"),
+            ("entered_at", "تاریخ ورود به گام", "date", "time"),
+        ]
+        for fname, disp, dtype, srole in fields_spec:
+            db.add(
+                DatasetField(
+                    dataset_id=ds_bpmn.id,
+                    field_name=fname,
+                    display_name=disp,
+                    data_type=dtype,
+                    semantic_role=srole,
+                )
+            )
+        db.commit()
+
+    # Seed the BPMN Process Bottleneck Discovery dashboard if missing
+    ws = db.query(Workspace).filter(Workspace.organization_id == org.id).first()
+    if not ws:
+        return
+    dash_title = "تحلیل گلوگاه فرآیندهای BPMN (کارتابل و نقشه حرارتی)"
+    existing_dash = db.query(Dashboard).filter(
+        Dashboard.workspace_id == ws.id, Dashboard.title == dash_title
+    ).first()
+    if existing_dash:
+        return
+
+    owner = db.query(User).filter(User.organization_id == org.id).first()
+    theme = (
+        db.query(DashboardTheme)
+        .filter(DashboardTheme.organization_id == org.id, DashboardTheme.slug == "light-enterprise")
+        .first()
+        or db.query(DashboardTheme).filter(DashboardTheme.organization_id == org.id).first()
+    )
+
+    dash_bpmn = Dashboard(
+        workspace_id=ws.id,
+        title=dash_title,
+        description="پایش گلوگاه‌های فرآیند بر اساس BPMN، نقشه حرارتی زمان انتظار و دریل‌داون کارتابل افراد",
+        theme_id=theme.id if theme else None,
+        created_by=owner.id if owner else None,
+        is_public=False,
+        is_template=False,
+        embed_token=f"pub-bpmn-{org.id[:8]}",
+        refresh_interval_sec=0,
+    )
+    db.add(dash_bpmn)
+    db.flush()
+
+    page = DashboardPage(dashboard_id=dash_bpmn.id, title="نمای فرآیند و گلوگاه‌ها", page_order=0)
+    db.add(page)
+    db.flush()
+
+    created_bpmn_widgets = []
+
+    def _add_bpmn_widget(title: str, chart_type: str, x: int, y: int, w: int, h: int, vspec: dict[str, Any]):
+        wi = Widget(
+            dashboard_id=dash_bpmn.id,
+            page_id=page.id,
+            title=title,
+            description="",
+            chart_type=chart_type,
+            dataset_id=ds_bpmn.id,
+            layout_x=x,
+            layout_y=y,
+            layout_w=w,
+            layout_h=h,
+        )
+        db.add(wi)
+        db.flush()
+        db.add(
+            WidgetConfig(
+                widget_id=wi.id,
+                style_json={},
+                visualization_json={"show_legend": True, "show_tooltip": True, "data_labels": False},
+                interactions_json={"cross_filter": True},
+                advanced_json={},
+            )
+        )
+        db.add(
+            WidgetQuery(
+                widget_id=wi.id,
+                dataset_id=ds_bpmn.id,
+                query_mode="visual",
+                visual_spec_json=vspec,
+            )
+        )
+        db.add(WidgetDrillRule(widget_id=wi.id, hierarchy_json=[], level_rules_json=[]))
+        created_bpmn_widgets.append(wi)
+        return wi
+
+    _add_bpmn_widget("کل رویدادها و درخواست‌های فرآیند", "kpi", 0, 0, 3, 3, {"y_field": "*", "aggregation": "COUNT", "prefix": "", "suffix": ""})
+    _add_bpmn_widget("میانگین زمان انتظار در مراحل", "kpi", 3, 0, 3, 3, {"y_field": "wait_hours", "aggregation": "AVG", "prefix": "", "suffix": " ساعت"})
+    _add_bpmn_widget("بیشترین زمان توقف در کارتابل", "kpi", 6, 0, 3, 3, {"y_field": "wait_hours", "aggregation": "MAX", "prefix": "", "suffix": " ساعت"})
+    _add_bpmn_widget("میانگین سقف مجاز SLA", "kpi", 9, 0, 3, 3, {"y_field": "sla_hours", "aggregation": "AVG", "prefix": "", "suffix": " ساعت"})
+
+    _add_bpmn_widget(
+        "نقشه فرآیند BPMN، گلوگاه‌ها و نقشه حرارتی زمان انتظار",
+        "bpmn",
+        0,
+        3,
+        12,
+        10,
+        {
+            "x_field": "step_name",
+            "y_field": "wait_hours",
+            "aggregation": "AVG",
+            "bpmn_config": DEFAULT_BPMN_GRAPH_PAYLOAD,
+        },
+    )
+    _add_bpmn_widget(
+        "میانگین زمان انتظار به تفکیک گام (کشف گلوگاه)",
+        "horizontal_bar",
+        0,
+        13,
+        6,
+        7,
+        {"x_field": "step_name", "y_field": "wait_hours", "aggregation": "AVG", "sort_by": "value_desc", "limit": 20},
+    )
+    _add_bpmn_widget(
+        "میانگین زمان انتظار در کارتابل افراد",
+        "bar",
+        6,
+        13,
+        6,
+        7,
+        {"x_field": "assignee_name", "y_field": "wait_hours", "aggregation": "AVG", "sort_by": "value_desc", "limit": 20},
+    )
+    _add_bpmn_widget(
+        "فهرست درخواست‌ها و وضعیت کارتابل‌ها",
+        "table",
+        0,
+        20,
+        12,
+        7,
+        {"aggregation": "RAW", "limit": 50},
+    )
+
+    db.add(
+        DashboardLayout(
+            page_id=page.id,
+            columns_count=12,
+            layout_json=[
+                {"i": wi.id, "x": wi.layout_x, "y": wi.layout_y, "w": wi.layout_w, "h": wi.layout_h}
+                for wi in created_bpmn_widgets
+            ],
+        )
+    )
+
+    for fname, label in [
+        ("step_name", "گام فرآیند"),
+        ("status", "وضعیت درخواست"),
+        ("department", "واحد متقاضی"),
+        ("assignee_name", "مسئول کارتابل"),
+    ]:
+        db.add(
+            DashboardFilter(
+                dashboard_id=dash_bpmn.id,
+                page_id=page.id,
+                scope="global",
+                name=label,
+                field_name=fname,
+                dataset_id=ds_bpmn.id,
+                filter_type="multi_select",
+                operator="in",
+            )
+        )
+    db.commit()
+
+
 def seed_sample_bi_content(
     db: Session,
     org: Organization,
@@ -1015,6 +1435,7 @@ def seed_sample_bi_content(
         )
     db.commit()
     ensure_contractor_sample_dataset(db, org)
+    ensure_bpmn_process_sample_dataset(db, org)
 
 
 def seed_database(db: Session) -> None:
@@ -1034,6 +1455,7 @@ def seed_database(db: Session) -> None:
                     pass
         if db.query(Dataset).filter(Dataset.organization_id == existing_org.id, Dataset.warehouse_table == "wh_enterprise_sales").first():
             ensure_contractor_sample_dataset(db, existing_org)
+            ensure_bpmn_process_sample_dataset(db, existing_org)
         return
 
     org, roles, theme_objs = seed_core_catalog(db)

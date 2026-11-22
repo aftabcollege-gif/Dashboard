@@ -38,11 +38,13 @@ import { apiDownload, apiFetch } from "@/lib/api";
 import { CHART_REGISTRY } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
 import {
+  addDemoCustomWidget,
   applyDemoDashboardOverrides,
   getDemoCreatedDashboards,
   markDemoWidgetDeleted,
   mergeDemoDashboardList,
 } from "@/lib/demoStore";
+import { BpmnGraphModel, inferBpmnFieldMapping, parseBpmnXml } from "@/lib/bpmnParser";
 import {
   BiTheme,
   DashboardDetail,
@@ -108,6 +110,27 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [newWX, setNewWX] = useState("");
   const [newWY, setNewWY] = useState("");
   const [newWAgg, setNewWAgg] = useState("SUM");
+  const [newWBpmnAssignee, setNewWBpmnAssignee] = useState("");
+  const [newWBpmnReqId, setNewWBpmnReqId] = useState("");
+  const [newWBpmnStatus, setNewWBpmnStatus] = useState("");
+  const [newWBpmnHeatmap, setNewWBpmnHeatmap] = useState(true);
+  const [newWBpmnGraph, setNewWBpmnGraph] = useState<BpmnGraphModel | null>(null);
+  const [newWBpmnXml, setNewWBpmnXml] = useState<string>("");
+
+  useEffect(() => {
+    if (newWChart === "bpmn") {
+      const targetDs = datasets.find((d) => d.id === newWDs) || datasets[0];
+      if (!targetDs) return;
+      const cols = (targetDs.fields || []).map((f) => f.field_name);
+      const inferred = inferBpmnFieldMapping(cols);
+      if (inferred.step_field) setNewWX(inferred.step_field);
+      if (inferred.wait_field) setNewWY(inferred.wait_field);
+      if (inferred.assignee_field) setNewWBpmnAssignee(inferred.assignee_field);
+      if (inferred.request_id_field) setNewWBpmnReqId(inferred.request_id_field);
+      if (inferred.status_field) setNewWBpmnStatus(inferred.status_field);
+      setNewWAgg("AVG");
+    }
+  }, [newWChart, newWDs, datasets]);
 
   // AI Drawer State
   const [aiTab, setAiTab] = useState<"builder" | "nlq">("builder");
@@ -513,28 +536,83 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const handleAddWidgetSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!dash || !activePageId) return;
+    const isBpmn = newWChart === "bpmn";
+    const visualSpecPayload: Record<string, any> = {
+      x_field: newWX || undefined,
+      y_field: newWY || "*",
+      aggregation: isBpmn ? "AVG" : newWAgg,
+      ...(isBpmn
+        ? {
+            bpmn_config: {
+              process_name: newWBpmnGraph?.processName || newWTitle || "فرآیند BPMN",
+              step_field: newWX || "step_name",
+              wait_field: newWY && newWY !== "*" ? newWY : "wait_hours",
+              assignee_field: newWBpmnAssignee || undefined,
+              request_id_field: newWBpmnReqId || undefined,
+              status_field: newWBpmnStatus || undefined,
+              heatmap_enabled: newWBpmnHeatmap,
+              heatmap_metric: "avg_wait",
+              ...(newWBpmnXml ? { bpmn_xml: newWBpmnXml } : {}),
+              ...(newWBpmnGraph?.nodes?.length ? { nodes: newWBpmnGraph.nodes, edges: newWBpmnGraph.edges } : {}),
+            },
+          }
+        : {}),
+    };
+    const wTitle = newWTitle || (isBpmn ? "نمودار گردش فرآیند و کشف گلوگاه (BPMN)" : "New BI Widget");
+    const wLayout = {
+      x: 0,
+      y: 99,
+      w: newWChart === "kpi" ? 4 : isBpmn ? 12 : 6,
+      h: newWChart === "kpi" ? 3 : isBpmn ? 9 : 7,
+    };
     try {
-      await apiFetch(`/dashboards/${dash.id}/widgets`, {
+      const createdRes = await apiFetch<any>(`/dashboards/${dash.id}/widgets`, {
         method: "POST",
         body: JSON.stringify({
           page_id: activePageId,
-          title: newWTitle || "New BI Widget",
+          title: wTitle,
           chart_type: newWChart,
           dataset_id: newWDs || null,
-          layout_x: 0,
-          layout_y: 99,
-          layout_w: newWChart === "kpi" ? 4 : 6,
-          layout_h: newWChart === "kpi" ? 3 : 7,
-          visual_spec: {
-            x_field: newWX || undefined,
-            y_field: newWY || "*",
-            aggregation: newWAgg,
-          },
+          layout_x: wLayout.x,
+          layout_y: wLayout.y,
+          layout_w: wLayout.w,
+          layout_h: wLayout.h,
+          visual_spec: visualSpecPayload,
         }),
       });
+      if (typeof window !== "undefined" && authStatus?.environment === "vercel-preview-demo") {
+        const wid = createdRes?.id && !String(createdRes.id).startsWith("preview") ? createdRes.id : `w_custom_${Date.now()}`;
+        addDemoCustomWidget(dash.id, {
+          id: wid,
+          dashboard_id: dash.id,
+          page_id: activePageId,
+          title: wTitle,
+          description: isBpmn ? "BPMN Process & Bottleneck Map" : "",
+          chart_type: newWChart,
+          dataset_id: newWDs || null,
+          layout: wLayout,
+          config: {
+            style: {},
+            visualization: { show_legend: true, show_tooltip: true, heatmap_enabled: newWBpmnHeatmap },
+            interactions: { cross_filter: true },
+            advanced: {},
+          },
+          query: {
+            query_mode: "visual",
+            sql_text: null,
+            visual_spec: visualSpecPayload,
+            parameters: {},
+          },
+          drill_rule: { hierarchy: [], level_rules: [], drill_through_page_id: null },
+          widget_filters: [],
+          permissions: { view: true, edit: true, delete: true, drill_down: true },
+        });
+      }
       setShowAddWidget(false);
       setNewWTitle("");
-      showToast("Widget added");
+      setNewWBpmnGraph(null);
+      setNewWBpmnXml("");
+      showToast(locale === "fa" ? "ویجت اضافه شد" : "Widget added");
       loadDashboard();
     } catch (err: any) {
       showToast(err.message);
@@ -717,6 +795,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         "funnel",
         "treemap",
         "radar",
+        "bpmn",
         "table",
       ])
     );
@@ -724,6 +803,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     const mobileCardClass = mobileStack
       ? w.chart_type === "kpi"
         ? "col-span-1 h-36"
+        : effType === "bpmn"
+        ? "col-span-2 h-[440px]"
         : effType === "table" || effType === "pivot_table"
         ? "col-span-2 h-[350px]"
         : "col-span-2 h-[310px]"
@@ -1465,13 +1546,13 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block font-semibold mb-1">Chart Type (30 Supported)</label>
+                <label className="block font-semibold mb-1">{locale === "fa" ? "نوع نمودار" : "Chart Type (31 Supported)"}</label>
                 <select value={newWChart} onChange={(e) => setNewWChart(e.target.value)} className="w-full px-3 py-2 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
-                  {CHART_REGISTRY.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+                  {CHART_REGISTRY.map((c) => <option key={c.id} value={c.id}>{locale === "fa" ? `${c.labelFa} (${c.label})` : c.label}</option>)}
                 </select>
               </div>
               <div>
-                <label className="block font-semibold mb-1">Dataset</label>
+                <label className="block font-semibold mb-1">{locale === "fa" ? "منبع داده" : "Dataset"}</label>
                 <select value={newWDs} onChange={(e) => setNewWDs(e.target.value)} className="w-full px-3 py-2 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
                   {datasets.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
                 </select>
@@ -1479,17 +1560,21 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             </div>
             <div className="grid grid-cols-3 gap-2">
               <div>
-                <label className="block font-semibold mb-1">X Dimension</label>
+                <label className="block font-semibold mb-1">
+                  {newWChart === "bpmn" ? (locale === "fa" ? "ستون گام فرآیند" : "BPMN Step Field") : "X Dimension"}
+                </label>
                 <select value={newWX} onChange={(e) => setNewWX(e.target.value)} className="w-full px-2 py-2 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
                   <option value="">None</option>
-                  {(addDs?.fields || []).map((f) => <option key={f.field_name} value={f.field_name}>{f.field_name}</option>)}
+                  {(addDs?.fields || []).map((f) => <option key={f.field_name} value={f.field_name}>{f.display_name || f.field_name}</option>)}
                 </select>
               </div>
               <div>
-                <label className="block font-semibold mb-1">Y Measure</label>
+                <label className="block font-semibold mb-1">
+                  {newWChart === "bpmn" ? (locale === "fa" ? "ستون زمان انتظار" : "Wait Time Field") : "Y Measure"}
+                </label>
                 <select value={newWY} onChange={(e) => setNewWY(e.target.value)} className="w-full px-2 py-2 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
                   <option value="*">* (Count)</option>
-                  {(addDs?.fields || []).map((f) => <option key={f.field_name} value={f.field_name}>{f.field_name}</option>)}
+                  {(addDs?.fields || []).map((f) => <option key={f.field_name} value={f.field_name}>{f.display_name || f.field_name}</option>)}
                 </select>
               </div>
               <div>
@@ -1499,6 +1584,64 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                 </select>
               </div>
             </div>
+            {newWChart === "bpmn" && (
+              <div className="p-3 rounded-lg border space-y-2.5 bg-blue-500/5" style={{ borderColor: "var(--bi-border)" }}>
+                <div className="font-bold text-[11px] flex items-center justify-between">
+                  <span>{locale === "fa" ? "تنظیمات مدل BPMN، کارتابل و نقشه حرارتی" : "BPMN Model, Cartable & Heatmap Config"}</span>
+                  <label className="flex items-center gap-1.5 font-semibold cursor-pointer">
+                    <input type="checkbox" checked={newWBpmnHeatmap} onChange={(e) => setNewWBpmnHeatmap(e.target.checked)} />
+                    <span>{locale === "fa" ? "نقشه حرارتی" : "Wait Heatmap"}</span>
+                  </label>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="block text-[10px] font-semibold mb-0.5">{locale === "fa" ? "ستون فرد کارتابل" : "Assignee Field"}</label>
+                    <select value={newWBpmnAssignee} onChange={(e) => setNewWBpmnAssignee(e.target.value)} className="w-full px-2 py-1.5 rounded border bg-transparent text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
+                      <option value="">Auto</option>
+                      {(addDs?.fields || []).map((f) => <option key={f.field_name} value={f.field_name}>{f.display_name || f.field_name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold mb-0.5">{locale === "fa" ? "ستون کد درخواست" : "Request ID"}</label>
+                    <select value={newWBpmnReqId} onChange={(e) => setNewWBpmnReqId(e.target.value)} className="w-full px-2 py-1.5 rounded border bg-transparent text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
+                      <option value="">Auto</option>
+                      {(addDs?.fields || []).map((f) => <option key={f.field_name} value={f.field_name}>{f.display_name || f.field_name}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold mb-0.5">{locale === "fa" ? "ستون وضعیت" : "Status Field"}</label>
+                    <select value={newWBpmnStatus} onChange={(e) => setNewWBpmnStatus(e.target.value)} className="w-full px-2 py-1.5 rounded border bg-transparent text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
+                      <option value="">Auto</option>
+                      {(addDs?.fields || []).map((f) => <option key={f.field_name} value={f.field_name}>{f.display_name || f.field_name}</option>)}
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-semibold mb-1">
+                    {locale === "fa" ? "آپلود فایل استاندارد BPMN (.bpmn / .xml) — اختیاری (در غیر این صورت خودکار از گام‌های داده ساخته می‌شود)" : "Upload BPMN 2.0 XML (.bpmn / .xml) — optional (auto-generated from data if omitted)"}
+                  </label>
+                  <input
+                    type="file"
+                    accept=".bpmn,.xml"
+                    onChange={async (ev) => {
+                      const f = ev.target.files?.[0];
+                      if (!f) return;
+                      const xml = await f.text();
+                      const parsed = parseBpmnXml(xml);
+                      setNewWBpmnXml(xml);
+                      setNewWBpmnGraph(parsed);
+                      if (!newWTitle) setNewWTitle(parsed.processName);
+                    }}
+                    className="text-[11px]"
+                  />
+                  {newWBpmnGraph && (
+                    <div className="mt-1 text-[10px] text-emerald-500 font-semibold">
+                      ✅ {newWBpmnGraph.processName}: {newWBpmnGraph.nodes.length} nodes, {newWBpmnGraph.edges.length} flows
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
             <div className="flex justify-end gap-2 pt-2">
               <button type="button" onClick={() => setShowAddWidget(false)} className="px-4 py-2 rounded-lg border" style={{ borderColor: "var(--bi-border)" }}>Cancel</button>
               <button type="submit" className="px-4 py-2 rounded-lg text-white font-semibold" style={{ background: "var(--bi-primary)" }}>Create Widget</button>

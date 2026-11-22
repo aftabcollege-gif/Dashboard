@@ -30,6 +30,11 @@ interface AssistantPanelProps {
 
 const QUICK_IDEAS = [
   {
+    label: "کشف گلوگاه فرآیند (BPMN و کارتابل)",
+    mode: "create_dashboard" as const,
+    prompt: "یک داشبورد کامل کشف گلوگاه فرآیندهای BPMN و کارتابل بساز",
+  },
+  {
     label: "ساخت داشبورد کامل پیمانکاران",
     mode: "create_dashboard" as const,
     prompt: "می‌خواهم یک داشبورد کامل مدیریتی برای پیمانکاران بسازم",
@@ -40,9 +45,9 @@ const QUICK_IDEAS = [
     prompt: "یک داشبورد برای گزارش فروش بساز",
   },
   {
-    label: "افزودن نمودار با توضیح فارسی",
+    label: "افزودن نمودار BPMN یا میله‌ای",
     mode: "add_widget" as const,
-    prompt: "از روی منبع تعداد یک نمودار میله ای برای عملکرد پیمانکاران بر اساس نام پیمانکار بساز",
+    prompt: "از روی منبع فرآیند BPMN یک نمودار گلوگاه و نقشه حرارتی بساز",
   },
   {
     label: "ویرایش رنگ، نام یا نمودارها",
@@ -664,7 +669,10 @@ export function PersianAssistantPanel({
               )}
             </div>
             {result.preview_data && (
-              <div className="h-56 rounded-lg border p-2" style={{ backgroundColor: "var(--bi-surface)", borderColor: "var(--bi-border)" }}>
+              <div
+                className={`${result.widget_spec.chart_type === "bpmn" ? "h-[430px]" : "h-56"} rounded-lg border p-2`}
+                style={{ backgroundColor: "var(--bi-surface)", borderColor: "var(--bi-border)" }}
+              >
                 <WidgetRenderer
                   chartType={result.widget_spec.chart_type || "bar"}
                   columns={result.preview_data.columns || []}

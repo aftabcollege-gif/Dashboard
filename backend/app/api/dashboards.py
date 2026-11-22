@@ -41,7 +41,7 @@ ALL_30_CHART_TYPES = {
     "treemap", "sunburst", "heatmap", "waterfall", "funnel",
     "gauge", "kpi", "progress", "table", "pivot_table", "matrix",
     "calendar_heatmap", "histogram", "boxplot", "candlestick",
-    "geo_map", "sankey", "combo",
+    "geo_map", "sankey", "combo", "bpmn",
 }
 
 
@@ -307,7 +307,9 @@ def get_public_dashboard(embed_token: str, db: Session = Depends(get_db)):
                 if wq.query_mode == "sql" and wq.sql_text:
                     data = warehouse.execute_query(wq.sql_text)
                 else:
-                    sql, params, _ = build_visual_query_sql(db, ds, wq.visual_spec_json or {}, [], [], [])
+                    sql, params, _ = build_visual_query_sql(
+                        db, ds, wq.visual_spec_json or {}, [], [], [], raw_mode=(w.chart_type == "bpmn")
+                    )
                     data = warehouse.execute_query(sql, params)
             except Exception:
                 pass
@@ -405,7 +407,8 @@ def execute_public_dashboard_batch(
                     data = warehouse.execute_query(wq.sql_text)
                 else:
                     sql, params, _ = build_visual_query_sql(
-                        db, ds, wq.visual_spec_json or {}, eff_filters, [], [], override_dimension=eff_dim
+                        db, ds, wq.visual_spec_json or {}, eff_filters, [], [],
+                        override_dimension=eff_dim, raw_mode=(eff_chart == "bpmn"),
                     )
                     data = warehouse.execute_query(sql, params)
             except Exception as exc:
@@ -993,9 +996,10 @@ def _execute_single_widget(
         sec_ctx = build_data_security_context(db, user, ds.id)
         perm_hash = permission_resolver.get_permission_context_hash(db, user) + ":" + sec_ctx.context_hash
         visual_spec = dict(wq.visual_spec_json) if wq else {}
+        is_bpmn_raw = drill_info["effective_chart_type"] == "bpmn"
         q_hash = cache_manager.hash_dict({
             "spec": visual_spec, "dim": drill_info["effective_dimension"],
-            "raw": drill_info["is_raw_level"], "chart": drill_info["effective_chart_type"],
+            "raw": drill_info["is_raw_level"] or is_bpmn_raw, "chart": drill_info["effective_chart_type"],
         })
         f_hash = cache_manager.hash_dict(effective_filters)
         cache_key = cache_manager.build_key(
@@ -1010,7 +1014,7 @@ def _execute_single_widget(
             sql, params, _ = build_visual_query_sql(
                 db, ds, visual_spec, effective_filters, sec_ctx.rls_where_clauses, sec_ctx.rls_params,
                 override_dimension=drill_info["effective_dimension"],
-                raw_mode=drill_info["is_raw_level"],
+                raw_mode=drill_info["is_raw_level"] or is_bpmn_raw,
             )
             raw_res = warehouse.execute_query(sql, params)
             vis_cols, masked_rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], sec_ctx)

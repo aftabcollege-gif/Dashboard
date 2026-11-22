@@ -213,8 +213,8 @@ def convert_query_to_widget(
         dataset_id=body.dataset_id,
         layout_x=0,
         layout_y=99,
-        layout_w=6,
-        layout_h=7,
+        layout_w=12 if body.chart_type == "bpmn" else 6,
+        layout_h=9 if body.chart_type == "bpmn" else 7,
     )
     db.add(w)
     db.flush()

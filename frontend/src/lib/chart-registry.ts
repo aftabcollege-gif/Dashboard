@@ -32,6 +32,7 @@ export const CHART_REGISTRY: ChartTypeMeta[] = [
   { id: "candlestick", label: "Candlestick", labelFa: "نمودار شمعی", category: "Statistical" },
   { id: "geo_map", label: "Geographic Map", labelFa: "نقشه جغرافیایی", category: "Specialized" },
   { id: "sankey", label: "Sankey Diagram", labelFa: "نمودار جریان سنکی", category: "Specialized", requiresSeries: true },
+  { id: "bpmn", label: "BPMN Process & Bottlenecks", labelFa: "فرایند BPMN و گلوگاه‌ها", category: "Specialized" },
   { id: "gauge", label: "Gauge", labelFa: "عقربه‌ای (Gauge)", category: "KPI & Table" },
   { id: "kpi", label: "KPI Card", labelFa: "کارت شاخص KPI", category: "KPI & Table" },
   { id: "progress", label: "Progress Bar", labelFa: "نوار پیشرفت", category: "KPI & Table" },

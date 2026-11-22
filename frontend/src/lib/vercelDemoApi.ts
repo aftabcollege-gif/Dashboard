@@ -1,5 +1,6 @@
 import rawDemoData from "@/lib/vercelDemoData.json";
 import { parseSpreadsheetBuffer } from "@/lib/excelParser";
+import { DEFAULT_PROCUREMENT_BPMN_GRAPH, inferBpmnFieldMapping } from "@/lib/bpmnParser";
 
 const demoData = rawDemoData as any;
 
@@ -115,15 +116,15 @@ function executeVisualSpec(
   const { rows: allRows, columns: tableCols } = getTableForDataset(datasetId, extraDatasets);
   const filtered = applyRlsAndFilters(allRows, username, filters);
   const agg = String(spec?.aggregation || "SUM").toUpperCase();
-  const limit = Number(spec?.limit || 200);
+  const limit = Number(spec?.limit || (rawMode ? 1000 : 200));
 
   if (rawMode || agg === "RAW") {
     const cleanCols = tableCols.filter((c) => c !== "id" && !c.endsWith("_id"));
     const cols =
       Array.isArray(spec?.columns) && spec.columns.length > 0
         ? spec.columns
-        : (cleanCols.length > 0 ? cleanCols : tableCols).slice(0, 10);
-    const sliced = filtered.slice(0, limit).map((r) => {
+        : (cleanCols.length > 0 ? cleanCols : tableCols).slice(0, rawMode ? 24 : 10);
+    const sliced = filtered.slice(0, rawMode ? Math.max(limit, 1000) : limit).map((r) => {
       const item: Row = {};
       for (const c of cols) item[c] = r[c];
       return item;
@@ -232,7 +233,8 @@ function executeWidgetForDemo(
   ];
 
   const spec = widget.query?.visual_spec || {};
-  const res = executeVisualSpec(widget.dataset_id, spec, username, combinedFilters, effectiveDim, isRaw, extraDatasets);
+  const isBpmn = effectiveChartType === "bpmn";
+  const res = executeVisualSpec(widget.dataset_id, spec, username, combinedFilters, effectiveDim, isRaw || isBpmn, extraDatasets);
 
   return {
     widget_id: widget.id,
@@ -415,6 +417,7 @@ function normalizeFaText(text: string): string {
 
 function extractChartTypeFromText(normLow: string): string | null {
   const rules: [string[], string][] = [
+    [["bpmn", "گلوگاه", "گردش کار", "نقشه فرآیند", "نقشه فرایند", "نمودار فرآیند", "نمودار فرایند", "کارتابل فرآیند", "فرآیند خرید", "فرایند خرید"], "bpmn"],
     [["میله ای افقی", "نمودار افقی", "ستونی افقی", "horizontal bar", "horizontal_bar"], "horizontal_bar"],
     [["میله ای پشته", "ستونی پشته", "پشته ای", "stacked bar", "stacked_bar"], "stacked_bar"],
     [["میله ای", "ستونی", "نمودار میله", "ویجت میله", "bar chart", "bar"], "bar"],
@@ -441,6 +444,33 @@ function extractChartTypeFromText(normLow: string): string | null {
     if (kws.some((kw) => normLow.includes(kw))) return ct;
   }
   return null;
+}
+
+function inferDemoBpmnConfig(ds: any, colsInfo: any[]) {
+  if (!colsInfo?.length) return null;
+  const hasExplicitStep = colsInfo.some((c: any) => {
+    const hay = `${c.name || ""} ${c.label || ""}`.toLowerCase();
+    return ["step_name", "step", "stage", "activity", "task", "گام", "مرحله", "فعالیت"].some((k) => hay.includes(k));
+  });
+  if (!hasExplicitStep && !String(ds?.warehouse_table || "").toLowerCase().includes("bpmn")) {
+    return null;
+  }
+  const descriptors = colsInfo.map((c: any) => ({ name: String(c.name), label: String(c.label || c.name) }));
+  const mapping = inferBpmnFieldMapping(descriptors);
+  if (!mapping.step_field || (!mapping.wait_field && !mapping.assignee_field)) return null;
+  const isSeedBpmn = String(ds?.warehouse_table || "").toLowerCase().includes("bpmn");
+  return {
+    ...mapping,
+    heatmap_enabled: true,
+    heatmap_metric: "avg_wait",
+    process_name: ds?.name || "فرآیند سازمانی",
+    ...(isSeedBpmn
+      ? {
+          nodes: DEFAULT_PROCUREMENT_BPMN_GRAPH.nodes,
+          edges: DEFAULT_PROCUREMENT_BPMN_GRAPH.edges,
+        }
+      : {}),
+  };
 }
 
 function getDemoDatasetSchema(ds: any) {
@@ -567,6 +597,17 @@ function matchDemoColumn(mention: string, colsInfo: any[], roleFilter?: "measure
     "ماه": ["month", "month_name"],
     "روز": ["day"],
     "تاریخ": ["order_date", "transaction_date", "date"],
+    "گام": ["step_name", "step", "stage", "گام", "مرحله"],
+    "مرحله": ["step_name", "step", "stage", "گام", "مرحله"],
+    "فرآیند": ["process_name", "step_name", "فرآیند"],
+    "فرایند": ["process_name", "step_name", "فرآیند"],
+    "زمان انتظار": ["wait_hours", "wait_time", "wait", "انتظار"],
+    "انتظار": ["wait_hours", "wait_time", "wait", "انتظار"],
+    "تاخیر": ["wait_hours", "delay", "تاخیر"],
+    "کارتابل": ["assignee_name", "assignee", "کارتابل", "مسئول"],
+    "مسئول": ["assignee_name", "assignee", "owner", "مسئول"],
+    "وضعیت": ["status", "state", "وضعیت"],
+    "درخواست": ["request_code", "request_id", "درخواست"],
   };
   for (const [fk, list] of Object.entries(syn)) {
     if (mNorm.includes(fk) || fk.includes(mNorm)) {
@@ -648,6 +689,11 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
         "منابع انسانی": ["hr", "workforce", "employee"],
         "نیروی انسانی": ["hr", "workforce", "employee"],
         "کارکنان": ["hr", "workforce", "employee"],
+        "فرآیند": ["bpmn", "process", "فرآیند"],
+        "فرایند": ["bpmn", "process", "فرآیند"],
+        "bpmn": ["bpmn", "process", "فرآیند"],
+        "گلوگاه": ["bpmn", "process", "فرآیند"],
+        "کارتابل": ["bpmn", "process", "فرآیند"],
       };
       for (const [k, tgs] of Object.entries(srcSyn)) {
         if (smLow.includes(k)) {
@@ -672,6 +718,7 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
           : !!matchDemoColumn(semanticLow, colsInfo);
       });
       if (matches.length === 1) chosenDs = matches[0];
+      else if (!dimMention) chosenDs = matchDemoDatasetFromText(datasets, semanticLow);
     }
   }
 
@@ -709,6 +756,7 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
   }
 
   const { colsInfo, numCols, dimCols } = getDemoDatasetSchema(chosenDs);
+  const inferredBpmn = inferDemoBpmnConfig(chosenDs, colsInfo);
 
   if (!chartType) {
     questions.push({
@@ -716,6 +764,7 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
       question: "نوع ویجت / نمودار مشخص نیست. چه نوع نمایشی بسازم؟",
       options: [
         { value: "bar", label: "نمودار میله‌ای (Bar)" },
+        { value: "bpmn", label: "فرآیند BPMN و کشف گلوگاه‌ها" },
         { value: "kpi", label: "کارت شاخص عددی (KPI)" },
         { value: "line", label: "نمودار خطی (Line)" },
         { value: "pie", label: "نمودار دایره‌ای (Pie)" },
@@ -726,7 +775,9 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
 
   let xField: string | null = clar.x_field || null;
   if (xField === "__none__") xField = null;
-  else if (!xField && chartType !== "kpi" && chartType !== "gauge") {
+  else if (!xField && chartType === "bpmn") {
+    xField = inferredBpmn?.step_field || dimCols[0] || null;
+  } else if (!xField && chartType !== "kpi" && chartType !== "gauge") {
     if (dimMention) {
       xField = matchDemoColumn(dimMention, colsInfo, "dim") || matchDemoColumn(dimMention, colsInfo);
       if (!xField) {
@@ -754,6 +805,10 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
     yField = matchDemoColumn(probe, colsInfo, "measure");
   }
   if (agg === "COUNT" && !yField) yField = "*";
+  if (chartType === "bpmn" && !yField) {
+    yField = inferredBpmn?.wait_field || numCols[0] || "*";
+    if (yField !== "*" && !agg) agg = "AVG";
+  }
   if (!yField) {
     if (numCols.length === 1 && agg && ["SUM", "AVG", "MAX", "MIN"].includes(agg)) {
       yField = numCols[0];
@@ -821,10 +876,20 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
 
   const visualSpec: any = { y_field: effY, aggregation: effAgg, limit: 100 };
   if (xField && effChart !== "kpi" && effChart !== "gauge") visualSpec.x_field = xField;
+  if (effChart === "bpmn") {
+    visualSpec.bpmn_config = {
+      ...(inferredBpmn || {}),
+      ...(xField && !inferredBpmn?.step_field ? { step_field: xField } : {}),
+      ...(effY !== "*" && !inferredBpmn?.wait_field ? { wait_field: effY } : {}),
+      heatmap_enabled: true,
+      heatmap_metric: "avg_wait",
+      process_name: finalTitle,
+    };
+  }
   const isCurr = ["rev", "cost", "profit", "price", "amount", "salary", "budget"].some((k) => effY.toLowerCase().includes(k));
   const styleCfg = { number_format: isCurr && effAgg !== "COUNT" ? "currency" : "number" };
   const vizCfg = { show_legend: true, show_tooltip: true, data_labels: false };
-  const previewData = executeVisualSpec(chosenDs.id, visualSpec, username, [], null, false, extraDatasets);
+  const previewData = executeVisualSpec(chosenDs.id, visualSpec, username, [], null, effChart === "bpmn", extraDatasets);
 
   let createdWidget: any = null;
   if (body?.create_widget !== false && body?.dashboard_id) {
@@ -842,7 +907,12 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
       chart_type: effChart,
       dataset_id: chosenDs.id,
       dataset_freshness: { status: "fresh", last_refreshed_at: new Date().toISOString(), row_count: chosenDs.row_count || 0, data_version: 1 },
-      layout: { x: 0, y: nextY, w: effChart === "kpi" || effChart === "gauge" ? 4 : 6, h: effChart === "kpi" || effChart === "gauge" ? 3 : 7 },
+      layout: {
+        x: 0,
+        y: nextY,
+        w: effChart === "bpmn" ? 12 : effChart === "kpi" || effChart === "gauge" ? 4 : 6,
+        h: effChart === "bpmn" ? 10 : effChart === "kpi" || effChart === "gauge" ? 3 : 7,
+      },
       config: { style: styleCfg, visualization: vizCfg, interactions: { cross_filter: true }, advanced: { ai_text_prompt: `${rawPrompt} ${freeReply}`.trim() } },
       query: { query_mode: "visual", sql_text: null, visual_spec: visualSpec, parameters: {} },
       drill_rule: { hierarchy: [], level_rules: [], drill_through_page_id: null },
@@ -886,11 +956,15 @@ const DEMO_CHART_LABELS_FA: Record<string, string> = {
   gauge: "عقربه شاخص",
   table: "جدول اطلاعات",
   pivot_table: "جدول مقایسه‌ای",
+  bpmn: "فرآیند BPMN و گلوگاه‌ها",
 };
 
 function friendlyDemoDatasetLabel(ds: any): [string, string] {
   const wt = String(ds.warehouse_table || "").toLowerCase();
   const nm = String(ds.name || "").toLowerCase();
+  if (wt.includes("bpmn") || nm.includes("bpmn") || nm.includes("فرآیند")) {
+    return ["فرآیندهای BPMN و کارتابل درخواست‌ها (کشف گلوگاه)", `${ds.row_count || 67} رویداد فرآیندی`];
+  }
   if (wt.includes("contractor") || ds.name === "تعداد") {
     return ["گزارش عملکرد پیمانکاران و پروژه‌ها (تعداد)", `${ds.row_count || 12} رکورد آماده`];
   }
@@ -914,6 +988,7 @@ function matchDemoDatasetFromText(datasets: any[], textLow: string): any | null 
     }
   }
   const synGroups: Array<[string[], string[]]> = [
+    [["bpmn", "گلوگاه", "کارتابل", "فرآیند", "فرایند", "انتظار", "گردش کار", "process"], ["bpmn", "process", "فرآیند"]],
     [["پیمانکار", "تعداد پروژه", "پروژه", "contractor"], ["contractor", "تعداد"]],
     [["فروش", "درآمد", "سود", "سفارش", "محصول", "مناطق", "منطقه", "sales", "revenue"], ["sales", "revenue"]],
     [["هزینه", "بودجه", "خرج", "مالی", "expense", "budget", "cost"], ["expense", "cost", "budget"]],
@@ -1017,7 +1092,25 @@ function buildDemoFullDashboard(ds: any, title: string, layoutPreset: string, th
     }
   }
 
-  const chartTopY = specs.length ? 3 : 0;
+  let chartTopY = specs.length ? 3 : 0;
+  const bpmnInferred = inferDemoBpmnConfig(ds, colsInfo);
+  if (bpmnInferred) {
+    const wf = bpmnInferred.wait_field || primaryNum;
+    const sf = bpmnInferred.step_field || primaryDim;
+    specs.push({
+      title: `نقشه فرآیند BPMN و گلوگاه‌ها — ${ds.name}`,
+      chart_type: "bpmn",
+      layout: { x: 0, y: chartTopY, w: 12, h: 10 },
+      visual_spec: {
+        x_field: sf,
+        y_field: wf,
+        aggregation: wf === "*" ? "COUNT" : "AVG",
+        bpmn_config: { ...bpmnInferred, process_name: title, heatmap_enabled: true },
+      },
+      style: { number_format: "number" },
+    });
+    chartTopY += 10;
+  }
   if (primaryDim && (layoutPreset === "executive_full" || layoutPreset === "charts_only")) {
     specs.push({
       title: `مقایسه ${lbl(primaryNum)} بر اساس ${lbl(primaryDim)}`,
@@ -1465,13 +1558,19 @@ function handleEditDashboardOrWidgetDemo(body: any, username: string | null) {
 
   const effChart = newChartType || targetWidget.chart_type;
   const effTitle = newWTitle || targetWidget.title;
-  const visualSpec = {
+  const baseVisualSpec: any = {
     ...(targetWidget.query?.visual_spec || {}),
     ...(newX ? { x_field: newX } : {}),
     ...(newY ? { y_field: newY } : {}),
     ...(newAgg ? { aggregation: newAgg } : {}),
   };
-  const previewData = dsObj ? executeVisualSpec(dsObj.id, visualSpec, username, [], null, false, extraDatasets) : null;
+  if (effChart === "bpmn" && !baseVisualSpec.bpmn_config && dsObj) {
+    const { colsInfo: cInfoE } = getDemoDatasetSchema(dsObj);
+    const infE = inferDemoBpmnConfig(dsObj, cInfoE);
+    if (infE) baseVisualSpec.bpmn_config = { ...infE, heatmap_enabled: true };
+  }
+  const visualSpec = baseVisualSpec;
+  const previewData = dsObj ? executeVisualSpec(dsObj.id, visualSpec, username, [], null, effChart === "bpmn", extraDatasets) : null;
 
   return {
     status: "widget_updated",
@@ -1508,7 +1607,7 @@ function handleAssistantDemo(body: any, username: string | null) {
       "اسمش رو", "تم داشبورد", "ظاهر داشبورد", "رنگ داشبورد", "فیلتر", "تیره کن", "روشن کن",
     ].some((k) => normLow.includes(k));
     const hasDash = ["داشبورد", "dashboard", "صفحه گزارش"].some((k) => normLow.includes(k));
-    const hasWidget = ["ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget"].some((k) => normLow.includes(k));
+    const hasWidget = ["ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget", "bpmn", "گلوگاه", "گردش کار"].some((k) => normLow.includes(k));
 
     if (body?.widget_id || isEditKw) effMode = "edit";
     else if (hasDash && !hasWidget) effMode = "create_dashboard";
@@ -1761,8 +1860,51 @@ export async function handleVercelDemoApi(
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "switch-chart") {
     const found = findWidget(segments[2]);
-    if (!found) return { status: 404, body: { detail: "Widget not found" } };
-    return { status: 200, body: { ...found.widget, chart_type: body?.target_chart_type || found.widget.chart_type } };
+    const targetType = body?.target_chart_type || found?.widget?.chart_type || "bar";
+    if (!found) {
+      return { status: 200, body: { id: segments[2], chart_type: targetType } };
+    }
+    found.widget.chart_type = targetType;
+    if (targetType === "bpmn" && found.widget.dataset_id) {
+      const dsObj = getEffectiveDatasets(extraDatasets).find((d: any) => d.id === found.widget.dataset_id);
+      if (dsObj && !found.widget.query?.visual_spec?.bpmn_config) {
+        const { colsInfo } = getDemoDatasetSchema(dsObj);
+        const inf = inferDemoBpmnConfig(dsObj, colsInfo);
+        if (inf) {
+          found.widget.query = found.widget.query || {};
+          found.widget.query.visual_spec = { ...(found.widget.query.visual_spec || {}), bpmn_config: inf };
+        }
+      }
+    }
+    return { status: 200, body: { ...found.widget, chart_type: targetType } };
+  }
+  if (method === "POST" && segments[0] === "dashboards" && segments[2] === "widgets") {
+    const wid = `dw_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    return {
+      status: 200,
+      body: {
+        id: wid,
+        dashboard_id: segments[1],
+        page_id: body?.page_id || "page-1",
+        title: body?.title || "New Widget",
+        chart_type: body?.chart_type || "bar",
+        dataset_id: body?.dataset_id || null,
+        layout: {
+          x: body?.layout_x ?? 0,
+          y: body?.layout_y ?? 99,
+          w: body?.layout_w ?? (body?.chart_type === "bpmn" ? 12 : 6),
+          h: body?.layout_h ?? (body?.chart_type === "bpmn" ? 10 : 7),
+        },
+        visual_spec: body?.visual_spec || {},
+      },
+    };
+  }
+  if (method === "POST" && path === "/queries/convert-to-widget") {
+    const wid = `qw_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    return {
+      status: 200,
+      body: { widget_id: wid, title: body?.title || "Query Widget", chart_type: body?.chart_type || "bar" },
+    };
   }
   if (method === "GET" && segments[0] === "dashboards" && segments[2] === "state") {
     return { status: 200, body: { active_page_id: null, filter_state: {}, drill_state: {}, widget_overrides: {} } };

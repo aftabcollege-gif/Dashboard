@@ -80,6 +80,74 @@ class AiAnalyticsEngine:
         secondary_d = dims[1] if len(dims) > 1 else (geos[0] if geos else primary_d)
 
         specs: list[dict[str, Any]] = []
+        all_col_dicts = [{"name": k, "label": label_map.get(k, k)} for k in list(label_map.keys())]
+        bpmn_inferred = AiAnalyticsEngine._infer_bpmn_config_from_cols(all_col_dicts)
+        is_bpmn_ds = bool(bpmn_inferred and (bpmn_inferred.get("step_field") or "bpmn" in (dataset.warehouse_table or "").lower()))
+
+        if is_bpmn_ds and bpmn_inferred:
+            w_field = bpmn_inferred.get("wait_field") or primary_m
+            s_field = bpmn_inferred.get("step_field") or primary_d
+            a_field = bpmn_inferred.get("assignee_field") or secondary_d
+            specs.extend([
+                {
+                    "title": "تعداد رویدادها / درخواست‌ها",
+                    "chart_type": "kpi",
+                    "layout": {"x": 0, "y": 0, "w": 4, "h": 3},
+                    "visual_spec": {"y_field": "*", "aggregation": "COUNT"},
+                    "style": {"number_format": "number"},
+                },
+                {
+                    "title": f"میانگین {_lbl(w_field)}",
+                    "chart_type": "kpi",
+                    "layout": {"x": 4, "y": 0, "w": 4, "h": 3},
+                    "visual_spec": {"y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
+                    "style": {"number_format": "number"},
+                },
+                {
+                    "title": f"بیشترین {_lbl(w_field)}",
+                    "chart_type": "kpi",
+                    "layout": {"x": 8, "y": 0, "w": 4, "h": 3},
+                    "visual_spec": {"y_field": w_field, "aggregation": "MAX" if w_field != "*" else "COUNT"},
+                    "style": {"number_format": "number"},
+                },
+                {
+                    "title": f"نقشه فرآیند BPMN و گلوگاه‌ها — {dataset.name}",
+                    "chart_type": "bpmn",
+                    "layout": {"x": 0, "y": 3, "w": 12, "h": 10},
+                    "visual_spec": {
+                        "x_field": s_field,
+                        "y_field": w_field,
+                        "aggregation": "AVG" if w_field != "*" else "COUNT",
+                        "bpmn_config": {**bpmn_inferred, "process_name": dataset.name, "heatmap_enabled": True},
+                    },
+                    "style": {"number_format": "number"},
+                },
+            ])
+            if s_field:
+                specs.append({
+                    "title": f"مقایسه گلوگاه‌های {_lbl(s_field)}",
+                    "chart_type": "horizontal_bar",
+                    "layout": {"x": 0, "y": 13, "w": 6, "h": 7},
+                    "visual_spec": {"x_field": s_field, "y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
+                })
+            if a_field:
+                specs.append({
+                    "title": f"تراکم و زمان انتظار در کارتابل ({_lbl(a_field)})",
+                    "chart_type": "bar",
+                    "layout": {"x": 6, "y": 13, "w": 6, "h": 7},
+                    "visual_spec": {"x_field": a_field, "y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
+                })
+            suggested_filters = [
+                {"name": _lbl(d), "field_name": d, "filter_type": "multi_select"}
+                for d in [s_field, a_field, bpmn_inferred.get("status_field"), bpmn_inferred.get("department_field")]
+                if d
+            ][:4]
+            return {
+                "profile": DataProfiler.profile_table(dataset.warehouse_table),
+                "suggested_widgets": specs,
+                "suggested_filters": suggested_filters,
+            }
+
         # Up to 3 KPI cards
         for idx, m in enumerate(measures[:3]):
             m_lbl = _lbl(m)
@@ -477,8 +545,50 @@ class AiAnalyticsEngine:
         return s
 
     @staticmethod
+    def _infer_bpmn_config_from_cols(cols_info: list[dict[str, str]]) -> Optional[dict[str, Any]]:
+        """Detects BPMN process columns (step, wait time, SLA, assignee, status) from dataset columns."""
+        if not cols_info:
+            return None
+
+        def _pick(hints: tuple[str, ...]) -> Optional[str]:
+            for h in hints:
+                for c in cols_info:
+                    hay = f"{c.get('name', '')} {c.get('label', '')}".lower()
+                    if h in hay:
+                        return c["name"]
+            return None
+
+        step_col = _pick(("step_name", "step", "stage", "activity", "task", "گام", "مرحله", "فعالیت"))
+        wait_col = _pick(("wait_hours", "wait_time", "wait", "duration", "delay", "انتظار", "تاخیر", "توقف", "مدت"))
+        assignee_col = _pick(("assignee_name", "assignee", "owner", "person", "user", "کارتابل", "مسئول", "شخص", "کاربر"))
+        sla_col = _pick(("sla_hours", "sla", "target_hours", "سقف", "مجاز"))
+        status_col = _pick(("status", "state", "وضعیت"))
+        req_col = _pick(("request_code", "request_id", "case_id", "ticket", "کد درخواست", "درخواست", "شماره"))
+        dept_col = _pick(("department", "unit", "واحد", "بخش"))
+        role_col = _pick(("assignee_role", "role", "سمت"))
+
+        # Must at least look like a process dataset (step + wait or step + assignee)
+        if not step_col or (not wait_col and not assignee_col):
+            return None
+
+        return {
+            "step_field": step_col,
+            "step_id_field": _pick(("step_id", "node_id")),
+            "wait_field": wait_col,
+            "sla_field": sla_col,
+            "assignee_field": assignee_col,
+            "assignee_role_field": role_col,
+            "request_id_field": req_col,
+            "status_field": status_col,
+            "department_field": dept_col,
+            "heatmap_enabled": True,
+            "heatmap_metric": "avg_wait",
+        }
+
+    @staticmethod
     def _extract_chart_type(norm_low: str) -> Optional[str]:
         chart_rules: list[tuple[list[str], str]] = [
+            (["bpmn", "گلوگاه", "گردش کار", "نقشه فرآیند", "نقشه فرایند", "نمودار فرآیند", "نمودار فرایند", "کارتابل فرآیند", "فرآیند خرید", "فرایند خرید"], "bpmn"),
             (["میله ای افقی", "نمودار افقی", "ستونی افقی", "horizontal bar", "horizontal_bar"], "horizontal_bar"),
             (["میله ای پشته", "ستونی پشته", "پشته ای", "stacked bar", "stacked_bar"], "stacked_bar"),
             (["میله ای", "ستونی", "نمودار میله", "ویجت میله", "bar chart", "bar"], "bar"),
@@ -612,6 +722,17 @@ class AiAnalyticsEngine:
             "امتیاز": ["performance_score", "score", "امتیاز"],
             "مبلغ قرارداد": ["contract_value", "مبلغ قرارداد"],
             "عملکرد": ["performance_score", "performance", "score", "revenue", "efficiency"],
+            "گام": ["step_name", "step", "stage", "گام", "مرحله"],
+            "مرحله": ["step_name", "step", "stage", "گام", "مرحله"],
+            "فرآیند": ["process_name", "step_name", "فرآیند"],
+            "فرایند": ["process_name", "step_name", "فرآیند"],
+            "زمان انتظار": ["wait_hours", "wait_time", "wait", "انتظار"],
+            "انتظار": ["wait_hours", "wait_time", "wait", "انتظار"],
+            "تاخیر": ["wait_hours", "delay", "تاخیر"],
+            "کارتابل": ["assignee_name", "assignee", "کارتابل", "مسئول"],
+            "مسئول": ["assignee_name", "assignee", "owner", "مسئول"],
+            "وضعیت": ["status", "state", "وضعیت"],
+            "درخواست": ["request_code", "request_id", "درخواست"],
         }
         for fa_key, en_list in fa_en_synonyms.items():
             if fa_key in m_norm or m_norm in fa_key:
@@ -732,6 +853,11 @@ class AiAnalyticsEngine:
                     "منابع انسانی": ["hr", "workforce", "employee", "پرسنل"],
                     "نیروی انسانی": ["hr", "workforce", "employee", "پرسنل"],
                     "کارکنان": ["hr", "workforce", "employee"],
+                    "فرآیند": ["bpmn", "process", "فرآیند"],
+                    "فرایند": ["bpmn", "process", "فرآیند"],
+                    "bpmn": ["bpmn", "process", "فرآیند"],
+                    "گلوگاه": ["bpmn", "process", "فرآیند"],
+                    "کارتابل": ["bpmn", "process", "فرآیند"],
                 }
                 for sk, targets in src_synonyms.items():
                     if sk in sm_low:
@@ -760,6 +886,8 @@ class AiAnalyticsEngine:
                         matching_ds.append(d)
                 if len(matching_ds) == 1:
                     chosen_ds = matching_ds[0]
+                elif not dim_mention:
+                    chosen_ds = AiAnalyticsEngine._match_dataset_from_text(datasets, semantic_low)
 
         # 5. Detect chart type & aggregation from semantic body
         chart_type = clarifications.get("chart_type") or AiAnalyticsEngine._extract_chart_type(semantic_low)
@@ -823,6 +951,7 @@ class AiAnalyticsEngine:
                     "question": "نوع ویجت / نمودار مشخص نیست. چه نوع نمایشی بسازم؟",
                     "options": [
                         {"value": "bar", "label": "نمودار میله‌ای (Bar)"},
+                        {"value": "bpmn", "label": "فرآیند BPMN و کشف گلوگاه‌ها"},
                         {"value": "kpi", "label": "کارت شاخص عددی (KPI)"},
                         {"value": "line", "label": "نمودار خطی (Line)"},
                         {"value": "pie", "label": "نمودار دایره‌ای (Pie)"},
@@ -831,10 +960,14 @@ class AiAnalyticsEngine:
                 }
             )
 
+        inferred_bpmn = AiAnalyticsEngine._infer_bpmn_config_from_cols(cols_info)
+
         # 6. Resolve dimension (x_field) when chart is not single-value KPI/gauge
         x_field: Optional[str] = clarifications.get("x_field")
         if x_field == "__none__":
             x_field = None
+        elif not x_field and chart_type == "bpmn":
+            x_field = (inferred_bpmn or {}).get("step_field") or (dim_cols[0] if dim_cols else None)
         elif not x_field and chart_type not in ("kpi", "gauge"):
             if dim_mention:
                 x_field = AiAnalyticsEngine._match_column(dim_mention, cols_info, role_filter="dim")
@@ -892,6 +1025,11 @@ class AiAnalyticsEngine:
         # If user specified COUNT without a numeric field, COUNT(*) is completely clear!
         if agg == "COUNT" and not y_field:
             y_field = "*"
+
+        if chart_type == "bpmn" and not y_field:
+            y_field = (inferred_bpmn or {}).get("wait_field") or (num_cols[0] if num_cols else "*")
+            if y_field != "*" and not agg:
+                agg = "AVG"
 
         # If measure is still missing/ambiguous
         if not y_field:
@@ -965,6 +1103,20 @@ class AiAnalyticsEngine:
         }
         if x_field and eff_chart not in ("kpi", "gauge"):
             visual_spec["x_field"] = x_field
+        if eff_chart == "bpmn":
+            bpmn_cfg = dict(inferred_bpmn or {})
+            if x_field and not bpmn_cfg.get("step_field"):
+                bpmn_cfg["step_field"] = x_field
+            if eff_y != "*" and not bpmn_cfg.get("wait_field"):
+                bpmn_cfg["wait_field"] = eff_y
+            bpmn_cfg["heatmap_enabled"] = True
+            bpmn_cfg["heatmap_metric"] = "avg_wait"
+            bpmn_cfg["process_name"] = extracted_title
+            if "bpmn" in (chosen_ds.warehouse_table or "").lower():
+                from app.seed.bootstrap import DEFAULT_BPMN_GRAPH_PAYLOAD
+                bpmn_cfg["nodes"] = DEFAULT_BPMN_GRAPH_PAYLOAD["nodes"]
+                bpmn_cfg["edges"] = DEFAULT_BPMN_GRAPH_PAYLOAD["edges"]
+            visual_spec["bpmn_config"] = bpmn_cfg
 
         is_currency = any(k in eff_y.lower() for k in ("rev", "cost", "profit", "price", "amount", "salary", "budget"))
         style_cfg = {"number_format": "currency" if (is_currency and eff_agg != "COUNT") else "number"}
@@ -972,7 +1124,8 @@ class AiAnalyticsEngine:
 
         sec_ctx = build_data_security_context(db, user, chosen_ds.id)
         sql, params, _ = build_visual_query_sql(
-            db, chosen_ds, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params
+            db, chosen_ds, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
+            raw_mode=(eff_chart == "bpmn"),
         )
         raw_preview = warehouse.execute_query(sql, params)
         vis_cols, vis_rows = apply_cls_and_masking(raw_preview["columns"], raw_preview["rows"], sec_ctx)
@@ -999,8 +1152,8 @@ class AiAnalyticsEngine:
                     Widget.dashboard_id == dashboard_id, Widget.page_id == target_page_id
                 ).all()
                 next_y = max((w.layout_y + w.layout_h for w in existing_widgets), default=0)
-                lay_w = 4 if eff_chart in ("kpi", "gauge") else 6
-                lay_h = 3 if eff_chart in ("kpi", "gauge") else 7
+                lay_w = 12 if eff_chart == "bpmn" else (4 if eff_chart in ("kpi", "gauge") else 6)
+                lay_h = 10 if eff_chart == "bpmn" else (3 if eff_chart in ("kpi", "gauge") else 7)
                 w = Widget(
                     dashboard_id=dashboard_id,
                     page_id=target_page_id,
@@ -1090,12 +1243,15 @@ class AiAnalyticsEngine:
         "gauge": "عقربه شاخص",
         "table": "جدول اطلاعات",
         "pivot_table": "جدول مقایسه‌ای",
+        "bpmn": "فرآیند BPMN و گلوگاه‌ها",
     }
 
     @staticmethod
     def _friendly_dataset_label(ds: Dataset) -> tuple[str, str]:
         wt = (ds.warehouse_table or "").lower()
         nm = (ds.name or "").lower()
+        if "bpmn" in wt or "bpmn" in nm or "فرآیند" in nm:
+            return ("فرآیندهای BPMN و کارتابل درخواست‌ها (کشف گلوگاه)", f"{ds.row_count} رویداد فرآیندی")
         if "contractor" in wt or ds.name == "تعداد":
             return ("گزارش عملکرد پیمانکاران و پروژه‌ها (تعداد)", f"{ds.row_count} رکورد آماده")
         if "sales" in wt or "sales" in nm:
@@ -1114,6 +1270,7 @@ class AiAnalyticsEngine:
             if d.name.lower() in text_low or d.warehouse_table.lower() in text_low:
                 return d
         syn_groups: list[tuple[list[str], list[str]]] = [
+            (["bpmn", "گلوگاه", "کارتابل", "فرآیند", "فرایند", "انتظار", "گردش کار", "process"], ["bpmn", "process", "فرآیند"]),
             (["پیمانکار", "تعداد پروژه", "پروژه", "contractor"], ["contractor", "تعداد"]),
             (["فروش", "درآمد", "سود", "سفارش", "محصول", "مناطق", "منطقه", "sales", "revenue"], ["sales", "revenue"]),
             (["هزینه", "بودجه", "خرج", "مالی", "expense", "budget", "cost"], ["expense", "cost", "budget"]),
@@ -1247,6 +1404,31 @@ class AiAnalyticsEngine:
                 )
 
         chart_top_y = 3 if widget_specs else 0
+        bpmn_inferred = AiAnalyticsEngine._infer_bpmn_config_from_cols(cols_info)
+        if bpmn_inferred and (bpmn_inferred.get("step_field") or "bpmn" in (ds.warehouse_table or "").lower()):
+            bpmn_cfg = {**bpmn_inferred, "process_name": title, "heatmap_enabled": True}
+            if "bpmn" in (ds.warehouse_table or "").lower():
+                from app.seed.bootstrap import DEFAULT_BPMN_GRAPH_PAYLOAD
+                bpmn_cfg["nodes"] = DEFAULT_BPMN_GRAPH_PAYLOAD["nodes"]
+                bpmn_cfg["edges"] = DEFAULT_BPMN_GRAPH_PAYLOAD["edges"]
+            w_f = bpmn_cfg.get("wait_field") or primary_num
+            s_f = bpmn_cfg.get("step_field") or primary_dim
+            widget_specs.append(
+                {
+                    "title": f"نقشه فرآیند BPMN و گلوگاه‌ها — {ds.name}",
+                    "chart_type": "bpmn",
+                    "layout": {"x": 0, "y": chart_top_y, "w": 12, "h": 10},
+                    "visual_spec": {
+                        "x_field": s_f,
+                        "y_field": w_f,
+                        "aggregation": "AVG" if w_f != "*" else "COUNT",
+                        "bpmn_config": bpmn_cfg,
+                    },
+                    "style": {"number_format": "number"},
+                }
+            )
+            chart_top_y += 10
+
         if primary_dim and layout_preset in ("executive_full", "charts_only"):
             widget_specs.append(
                 {
@@ -1861,6 +2043,11 @@ class AiAnalyticsEngine:
             visual_spec["y_field"] = new_y
         if new_agg:
             visual_spec["aggregation"] = new_agg
+        if target_widget.chart_type == "bpmn" and not visual_spec.get("bpmn_config") and ds_obj:
+            cinfo_e, _, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj)
+            inferred_e = AiAnalyticsEngine._infer_bpmn_config_from_cols(cinfo_e)
+            if inferred_e:
+                visual_spec["bpmn_config"] = {**inferred_e, "heatmap_enabled": True}
         if wq:
             wq.visual_spec_json = visual_spec
 
@@ -1871,7 +2058,8 @@ class AiAnalyticsEngine:
         if ds_obj and visual_spec:
             sec_ctx = build_data_security_context(db, user, ds_obj.id)
             generated_sql, params, _ = build_visual_query_sql(
-                db, ds_obj, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params
+                db, ds_obj, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
+                raw_mode=(target_widget.chart_type == "bpmn"),
             )
             raw_prev = warehouse.execute_query(generated_sql, params)
             vis_cols, vis_rows = apply_cls_and_masking(raw_prev["columns"], raw_prev["rows"], sec_ctx)
@@ -1940,7 +2128,7 @@ class AiAnalyticsEngine:
                 )
             )
             has_dash_word = any(k in norm_low for k in ("داشبورد", "dashboard", "صفحه گزارش"))
-            has_widget_word = any(k in norm_low for k in ("ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget"))
+            has_widget_word = any(k in norm_low for k in ("ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget", "bpmn", "گلوگاه", "گردش کار"))
 
             if widget_id or is_edit_kw:
                 eff_mode = "edit"
