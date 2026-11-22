@@ -38,6 +38,15 @@ class TextToWidgetRequest(BaseModel):
     create_widget: bool = True
 
 
+class ConversationalAssistantRequest(BaseModel):
+    prompt: str
+    dashboard_id: Optional[str] = None
+    page_id: Optional[str] = None
+    widget_id: Optional[str] = None
+    mode: Optional[str] = None  # auto | create_dashboard | add_widget | edit
+    clarifications: dict = {}
+
+
 @router.get("/recommend/{dataset_id}")
 def recommend_dashboard(dataset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "dataset", dataset_id, "view")
@@ -94,4 +103,22 @@ def text_to_widget(
         dataset_id=body.dataset_id,
         clarifications=body.clarifications,
         create_widget=body.create_widget,
+    )
+
+
+@router.post("/assistant")
+def conversational_assistant(
+    body: ConversationalAssistantRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return AiAnalyticsEngine.handle_conversational_request(
+        db=db,
+        user=user,
+        prompt=body.prompt,
+        dashboard_id=body.dashboard_id,
+        page_id=body.page_id,
+        widget_id=body.widget_id,
+        mode=body.mode,
+        clarifications=body.clarifications,
     )

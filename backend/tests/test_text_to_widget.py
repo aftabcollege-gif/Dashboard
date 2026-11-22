@@ -140,3 +140,135 @@ def test_persian_csv_and_text_to_widget_with_clarification(client, admin_headers
     assert len(pj["preview_data"]["rows"]) == 2
     assert {r[pj["widget_spec"]["visual_spec"]["x_field"]] for r in pj["preview_data"]["rows"]} == {"نماینده تهران", "نماینده شیراز"}
     client.delete(f"/api/v1/dashboards/widgets/{pj['widget']['id']}", headers=admin_headers)
+
+
+def test_conversational_assistant_create_and_edit_dashboard(client, admin_headers):
+    # 1. Ambiguous non-technical request to build a dashboard -> asks friendly Persian questions
+    step1 = client.post(
+        "/api/v1/ai/assistant",
+        headers=admin_headers,
+        json={"prompt": "می‌خوام یک داشبورد جدید بسازم"},
+    )
+    assert step1.status_code == 200, step1.text
+    s1 = step1.json()
+    assert s1["status"] == "needs_clarification"
+    assert s1["action"] == "create_dashboard"
+    q_keys = {q["key"] for q in s1["questions"]}
+    assert {"dataset_id", "layout_preset", "theme_id"}.issubset(q_keys)
+
+    ds_q = next(q for q in s1["questions"] if q["key"] == "dataset_id")
+    contractor_opt = next(o for o in ds_q["options"] if "پیمانکار" in o["label"])
+    theme_q = next(q for q in s1["questions"] if q["key"] == "theme_id")
+    first_theme_id = theme_q["options"][0]["value"]
+
+    # 2. Complete Q&A -> builds a full multi-widget dashboard with filter and theme
+    step2 = client.post(
+        "/api/v1/ai/assistant",
+        headers=admin_headers,
+        json={
+            "prompt": "می‌خوام یک داشبورد جدید بسازم",
+            "mode": "create_dashboard",
+            "clarifications": {
+                "dataset_id": contractor_opt["value"],
+                "layout_preset": "executive_full",
+                "theme_id": first_theme_id,
+                "title": "داشبورد تست غیرفنی",
+            },
+        },
+    )
+    assert step2.status_code == 200, step2.text
+    s2 = step2.json()
+    assert s2["status"] == "dashboard_created", s2
+    new_dash_id = s2["created_dashboard"]["id"]
+    assert s2["created_dashboard"]["title"] == "داشبورد تست غیرفنی"
+    assert s2["created_dashboard"]["widget_count"] >= 4
+
+    # Verify newly created dashboard loads and executes properly
+    d_det = client.get(f"/api/v1/dashboards/{new_dash_id}", headers=admin_headers)
+    assert d_det.status_code == 200
+    det_json = d_det.json()
+    assert det_json["title"] == "داشبورد تست غیرفنی"
+    assert len(det_json["widgets"]) >= 4
+    assert len(det_json["filters"]) >= 1
+
+    # 3. Edit dashboard theme & title via plain Persian
+    ed_theme = client.post(
+        "/api/v1/ai/assistant",
+        headers=admin_headers,
+        json={
+            "prompt": "ظاهر داشبورد را شیشه‌ای کن",
+            "dashboard_id": new_dash_id,
+            "mode": "edit",
+        },
+    )
+    assert ed_theme.status_code == 200, ed_theme.text
+    et = ed_theme.json()
+    assert et["status"] == "dashboard_updated"
+    assert "Glass" in et["updated_dashboard"]["theme_name"]
+
+    ed_title = client.post(
+        "/api/v1/ai/assistant",
+        headers=admin_headers,
+        json={
+            "prompt": "نام داشبورد را بگذار گزارش جامع پیمانکاران",
+            "dashboard_id": new_dash_id,
+            "mode": "edit",
+        },
+    )
+    assert ed_title.status_code == 200, ed_title.text
+    assert ed_title.json()["updated_dashboard"]["title"] == "گزارش جامع پیمانکاران"
+
+    # 4. Ambiguous edit prompt -> asks which widget/scope to edit, then converts chart type & renames widget
+    ed_ask = client.post(
+        "/api/v1/ai/assistant",
+        headers=admin_headers,
+        json={
+            "prompt": "می‌خواهم این داشبورد را ویرایش کنم",
+            "dashboard_id": new_dash_id,
+            "mode": "edit",
+        },
+    )
+    assert ed_ask.status_code == 200, ed_ask.text
+    ea = ed_ask.json()
+    assert ea["status"] == "needs_clarification"
+    assert ea["questions"][0]["key"] == "target_widget_id"
+    bar_widget = next(w for w in det_json["widgets"] if w["chart_type"] == "bar")
+
+    ed_w = client.post(
+        "/api/v1/ai/assistant",
+        headers=admin_headers,
+        json={
+            "prompt": "می‌خواهم این داشبورد را ویرایش کنم",
+            "dashboard_id": new_dash_id,
+            "mode": "edit",
+            "clarifications": {
+                "target_widget_id": bar_widget["id"],
+                "free_text": "تبدیل به نمودار دایره‌ای کن و عنوانش را بگذار سهم پیمانکاران",
+            },
+        },
+    )
+    assert ed_w.status_code == 200, ed_w.text
+    ew = ed_w.json()
+    assert ew["status"] == "widget_updated", ew
+    assert ew["widget"]["chart_type"] == "pie"
+    assert ew["widget"]["title"] == "سهم پیمانکاران"
+    assert ew["preview_data"] is not None
+
+    # 5. Delete a widget via plain Persian
+    del_w = client.post(
+        "/api/v1/ai/assistant",
+        headers=admin_headers,
+        json={
+            "prompt": "این نمودار را حذف کن",
+            "dashboard_id": new_dash_id,
+            "widget_id": bar_widget["id"],
+            "mode": "edit",
+        },
+    )
+    assert del_w.status_code == 200, del_w.text
+    assert del_w.json()["status"] == "widget_deleted"
+
+    # Clean up test dashboard
+    del_d = client.delete(f"/api/v1/dashboards/{new_dash_id}", headers=admin_headers)
+    assert del_d.status_code in (200, 204)
+

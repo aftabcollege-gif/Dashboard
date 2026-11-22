@@ -827,6 +827,670 @@ function handleTextToWidgetDemo(body: any, username: string | null) {
   };
 }
 
+const DEMO_CHART_LABELS_FA: Record<string, string> = {
+  bar: "نمودار میله‌ای",
+  horizontal_bar: "نمودار میله‌ای افقی",
+  stacked_bar: "نمودار ستونی انباشته",
+  line: "نمودار خطی (روندی)",
+  area: "نمودار مساحتی",
+  pie: "نمودار دایره‌ای",
+  donut: "نمودار حلقوی",
+  kpi: "کارت عدد خلاصه",
+  gauge: "عقربه شاخص",
+  table: "جدول اطلاعات",
+  pivot_table: "جدول مقایسه‌ای",
+};
+
+function friendlyDemoDatasetLabel(ds: any): [string, string] {
+  const wt = String(ds.warehouse_table || "").toLowerCase();
+  const nm = String(ds.name || "").toLowerCase();
+  if (wt.includes("contractor") || ds.name === "تعداد") {
+    return ["گزارش عملکرد پیمانکاران و پروژه‌ها (تعداد)", `${ds.row_count || 12} رکورد آماده`];
+  }
+  if (wt.includes("sales") || nm.includes("sales")) {
+    return ["فروش، درآمد و سود مناطق", `${ds.row_count || 1200} سفارش`];
+  }
+  if (wt.includes("expense") || nm.includes("expense")) {
+    return ["هزینه‌ها و بودجه بخش‌ها", `${ds.row_count || 450} سند مالی`];
+  }
+  if (wt.includes("hr") || wt.includes("workforce")) {
+    return ["اطلاعات پرسنل و منابع انسانی", `${ds.row_count || 8} پرسنل`];
+  }
+  return [ds.name || "منبع داده", `${ds.row_count || 0} ردیف اطلاعات`];
+}
+
+function matchDemoDatasetFromText(datasets: any[], textLow: string): any | null {
+  if (!datasets.length || !textLow) return null;
+  for (const d of datasets) {
+    if (textLow.includes(String(d.name || "").toLowerCase()) || textLow.includes(String(d.warehouse_table || "").toLowerCase())) {
+      return d;
+    }
+  }
+  const synGroups: Array<[string[], string[]]> = [
+    [["پیمانکار", "تعداد پروژه", "پروژه", "contractor"], ["contractor", "تعداد"]],
+    [["فروش", "درآمد", "سود", "سفارش", "محصول", "مناطق", "منطقه", "sales", "revenue"], ["sales", "revenue"]],
+    [["هزینه", "بودجه", "خرج", "مالی", "expense", "budget", "cost"], ["expense", "cost", "budget"]],
+    [["پرسنل", "کارمند", "کارکنان", "حقوق", "منابع انسانی", "نیروی انسانی", "hr", "employee"], ["hr", "workforce"]],
+  ];
+  for (const [kws, targets] of synGroups) {
+    if (kws.some((k) => textLow.includes(k))) {
+      const hit = datasets.find((d) => {
+        const dn = String(d.name || "").toLowerCase();
+        const wt = String(d.warehouse_table || "").toLowerCase();
+        return targets.some((tg) => dn.includes(tg) || wt.includes(tg));
+      });
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+function resolveDemoThemeFromText(textLow: string): any | null {
+  const themes: any[] = demoData.themes || [];
+  if (!themes.length || !textLow) return null;
+  for (const th of themes) {
+    if (th.id === textLow || textLow.includes(String(th.slug || "").toLowerCase()) || textLow.includes(String(th.name || "").toLowerCase())) {
+      return th;
+    }
+  }
+  const themeHints: Array<[string[], string[]]> = [
+    [["شیشه", "glass", "بلور", "شیک"], ["glass"]],
+    [["نئون", "neon", "درخشان", "رنگی"], ["neon"]],
+    [["تیره", "مشکی", "دارک", "dark", "تم شب", "حالت شب"], ["dark"]],
+    [["اداری", "رسمی", "سازمانی", "corporate", "آبی"], ["corporate"]],
+    [["مینیمال", "ساده", "minimal"], ["minimal"]],
+    [["روشن", "سفید", "تم روز", "حالت روز", "light"], ["light", "corporate"]],
+    [["متریال", "material"], ["material"]],
+  ];
+  for (const [kws, slugs] of themeHints) {
+    if (kws.some((k) => textLow.includes(k))) {
+      for (const slug of slugs) {
+        const hit = themes.find((th) => String(th.slug || "").toLowerCase().includes(slug) || String(th.name || "").toLowerCase().includes(slug));
+        if (hit) return hit;
+      }
+    }
+  }
+  return null;
+}
+
+function buildDemoFullDashboard(ds: any, title: string, layoutPreset: string, theme: any | null) {
+  const { colsInfo, numCols, dimCols } = getDemoDatasetSchema(ds);
+  const labelMap = new Map<string, string>(colsInfo.map((c: any) => [c.name, c.label]));
+  const lbl = (col?: string | null) => (!col || col === "*" ? "رکوردها" : labelMap.get(col) || col.replace(/_/g, " "));
+
+  const prefDims = ["contractor_name", "region", "project_type", "category", "department", "product", "channel", "city"].filter((c) => dimCols.includes(c));
+  const restDims = dimCols.filter((c: string) => !prefDims.includes(c) && !c.endsWith("_code"));
+  const orderedDims = [...prefDims, ...restDims];
+  const primaryDim = orderedDims[0] || null;
+  const secondaryDim = orderedDims[1] || primaryDim;
+  const timeCol = colsInfo.find((c: any) => c.role === "time")?.name || null;
+
+  const prefNums = ["project_count", "revenue", "profit", "actual_amount", "performance_score", "contract_value", "salary"].filter((c) => numCols.includes(c));
+  const restNums = numCols.filter((c: string) => !prefNums.includes(c));
+  const orderedNums = [...prefNums, ...restNums];
+  const primaryNum = orderedNums[0] || "*";
+  const secondaryNum = orderedNums[1] || primaryNum;
+
+  const aggFor = (col: string) => {
+    if (col === "*") return "COUNT";
+    if (["score", "pct", "rate", "ratio", "margin"].some((k) => col.toLowerCase().includes(k))) return "AVG";
+    return "SUM";
+  };
+  const pAgg = aggFor(primaryNum);
+  const sAgg = aggFor(secondaryNum);
+  const isCurrP = ["rev", "cost", "profit", "price", "amount", "salary", "budget", "value"].some((k) => primaryNum.toLowerCase().includes(k));
+
+  const dashId = `dash_ai_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const pageId = `page_${dashId}_1`;
+  const specs: any[] = [];
+
+  if (layoutPreset === "executive_full" || layoutPreset === "kpi_and_pie") {
+    specs.push({
+      title: `تعداد کل ${primaryDim ? lbl(primaryDim) : "اطلاعات"}`,
+      chart_type: "kpi",
+      layout: { x: 0, y: 0, w: 4, h: 3 },
+      visual_spec: { y_field: "*", aggregation: "COUNT" },
+      style: { number_format: "number" },
+    });
+    specs.push({
+      title: `${pAgg === "AVG" ? "میانگین" : "مجموع"} ${lbl(primaryNum)}`,
+      chart_type: "kpi",
+      layout: { x: 4, y: 0, w: 4, h: 3 },
+      visual_spec: { y_field: primaryNum, aggregation: pAgg },
+      style: { number_format: isCurrP && pAgg !== "COUNT" ? "currency" : "number" },
+    });
+    if (secondaryNum !== primaryNum) {
+      specs.push({
+        title: `${sAgg === "AVG" ? "میانگین" : "مجموع"} ${lbl(secondaryNum)}`,
+        chart_type: "kpi",
+        layout: { x: 8, y: 0, w: 4, h: 3 },
+        visual_spec: { y_field: secondaryNum, aggregation: sAgg },
+        style: { number_format: "number" },
+      });
+    }
+  }
+
+  const chartTopY = specs.length ? 3 : 0;
+  if (primaryDim && (layoutPreset === "executive_full" || layoutPreset === "charts_only")) {
+    specs.push({
+      title: `مقایسه ${lbl(primaryNum)} بر اساس ${lbl(primaryDim)}`,
+      chart_type: "bar",
+      layout: { x: 0, y: chartTopY, w: 6, h: 7 },
+      visual_spec: { x_field: primaryDim, y_field: primaryNum, aggregation: pAgg, limit: 50 },
+      style: { number_format: isCurrP && pAgg !== "COUNT" ? "currency" : "number" },
+    });
+  }
+  if (secondaryDim && (layoutPreset === "executive_full" || layoutPreset === "kpi_and_pie")) {
+    specs.push({
+      title: `سهم بر اساس ${lbl(secondaryDim)}`,
+      chart_type: layoutPreset === "kpi_and_pie" ? "pie" : "donut",
+      layout: { x: primaryDim && layoutPreset === "executive_full" ? 6 : 0, y: chartTopY, w: 6, h: 7 },
+      visual_spec: { x_field: secondaryDim, y_field: primaryNum, aggregation: pAgg, limit: 30 },
+      style: { number_format: "number" },
+    });
+  }
+  if (layoutPreset === "charts_only" && (timeCol || secondaryDim)) {
+    const xt = timeCol || secondaryDim;
+    specs.push({
+      title: `روند ${lbl(secondaryNum)} بر اساس ${lbl(xt)}`,
+      chart_type: "line",
+      layout: { x: 6, y: chartTopY, w: 6, h: 7 },
+      visual_spec: { x_field: xt, y_field: secondaryNum, aggregation: sAgg, limit: 50 },
+      style: { number_format: "number" },
+    });
+  }
+  if (layoutPreset === "executive_full" && primaryDim) {
+    specs.push({
+      title: `جدول جزئیات ${lbl(primaryDim)}`,
+      chart_type: "table",
+      layout: { x: 0, y: chartTopY + 7, w: 12, h: 7 },
+      visual_spec: {
+        x_field: primaryDim,
+        y_field: primaryNum,
+        secondary_y_field: secondaryNum !== primaryNum ? secondaryNum : undefined,
+        aggregation: pAgg,
+        limit: 50,
+      },
+      style: { number_format: "number" },
+    });
+  }
+
+  const widgets = specs.map((sp, idx) => ({
+    id: `w_${dashId}_${idx + 1}`,
+    dashboard_id: dashId,
+    page_id: pageId,
+    title: sp.title,
+    description: `ساخته‌شده با دستیار فارسی`,
+    chart_type: sp.chart_type,
+    dataset_id: ds.id,
+    dataset_freshness: { status: "fresh", last_refreshed_at: new Date().toISOString(), row_count: ds.row_count || 0, data_version: 1 },
+    layout: sp.layout,
+    config: {
+      style: sp.style || {},
+      visualization: { show_legend: true, show_tooltip: true, data_labels: false },
+      interactions: { cross_filter: true },
+      advanced: { ai_generated: true },
+    },
+    query: { query_mode: "visual", sql_text: null, visual_spec: sp.visual_spec, parameters: {} },
+    drill_rule: { hierarchy: [], level_rules: [], drill_through_page_id: null },
+    widget_filters: [],
+    permissions: { view: true, edit: true, delete: true, drill_down: true },
+  }));
+
+  const filterCol = ["region", "project_type", "department", "category", "year"].find((c) => dimCols.includes(c)) || primaryDim;
+  const filters = filterCol
+    ? [
+        {
+          id: `flt_${dashId}_1`,
+          name: lbl(filterCol),
+          field_name: filterCol,
+          dataset_id: ds.id,
+          filter_type: "multi_select",
+          operator: "in",
+          scope: "dashboard",
+          default_value: [],
+        },
+      ]
+    : [];
+
+  const effTheme = theme || (demoData.themes || [])[0] || null;
+  const createdDashDetail = {
+    id: dashId,
+    title,
+    description: `ساخته‌شده با دستیار هوشمند فارسی از داده‌های «${ds.name}»`,
+    is_public: false,
+    embed_token: null,
+    is_template: false,
+    theme_id: effTheme?.id || null,
+    theme: effTheme,
+    can_edit: true,
+    can_manage: true,
+    permissions: { view: true, edit: true, add_widget: true, delete_widget: true, share: true, manage: true, comment: true },
+    pages: [{ id: pageId, title: "نمای کلی", page_order: 0, layout: { columns: 12, items: widgets.map((w) => ({ i: w.id, ...w.layout })) } }],
+    widgets,
+    filters,
+  };
+
+  return {
+    status: "dashboard_created",
+    action: "create_dashboard",
+    message_fa: `داشبورد «${title}» با ${widgets.length} گزارش و نمودار آماده با موفقیت ساخته شد!`,
+    created_dashboard: {
+      ...createdDashDetail,
+      theme_name: effTheme?.name || "پیش‌فرض",
+      dataset_id: ds.id,
+      dataset_name: ds.name,
+      widget_count: widgets.length,
+    },
+  };
+}
+
+function handleCreateDashboardDemo(body: any) {
+  const clar = { ...(body?.clarifications || {}) };
+  const freeReply = normalizeFaText(String(clar.free_text || "").trim());
+  const norm = normalizeFaText(String(body?.prompt || "").trim());
+  const combinedLow = normalizeFaText(`${norm} ${freeReply}`).toLowerCase();
+  const datasets: any[] = demoData.datasets || [];
+  const themes: any[] = demoData.themes || [];
+
+  let dashTitle: string | null = clar.title || null;
+  if (!dashTitle) {
+    const mt = norm.match(
+      /(?:با\s+عنوان|تحت\s+عنوان|به\s+نام|با\s+نام|اسمش\s+رو\s+بذار|عنوان)\s+["«']?([^"»'\n]+?)["»']?(?=\s*(?:بساز|ایجاد|تولید|درست|$))/i
+    );
+    if (mt) dashTitle = mt[1].replace(/^[،,.«»"'\s]+|[،,.«»"'\s]+$/g, "");
+  }
+
+  let chosenDs: any = null;
+  if (clar.dataset_id) chosenDs = datasets.find((d) => d.id === clar.dataset_id) || null;
+  if (!chosenDs) chosenDs = matchDemoDatasetFromText(datasets, combinedLow);
+
+  let chosenTheme: any = null;
+  if (clar.theme_id) {
+    chosenTheme = clar.theme_id === "__default__" ? themes[0] || null : themes.find((t) => t.id === clar.theme_id) || null;
+  }
+  if (!chosenTheme) chosenTheme = resolveDemoThemeFromText(combinedLow);
+
+  let layoutPreset: string | null = clar.layout_preset || null;
+  if (!layoutPreset) {
+    if (["کامل", "همه", "مدیریتی", "جامع", "executive", "full"].some((k) => combinedLow.includes(k))) layoutPreset = "executive_full";
+    else if (["روند", "خطی", "فقط نمودار", "charts"].some((k) => combinedLow.includes(k))) layoutPreset = "charts_only";
+    else if (["خلاصه", "سهم", "دایره", "سریع", "کارت"].some((k) => combinedLow.includes(k))) layoutPreset = "kpi_and_pie";
+  }
+
+  const questions: any[] = [];
+  if (!chosenDs) {
+    questions.push({
+      key: "dataset_id",
+      question: "این داشبورد قرار است گزارش‌های کدام بخش یا موضوع را نشان دهد؟",
+      options: datasets.map((d) => {
+        const [lbl, hint] = friendlyDemoDatasetLabel(d);
+        return { value: d.id, label: lbl, hint };
+      }),
+    });
+  }
+  if (!layoutPreset) {
+    questions.push({
+      key: "layout_preset",
+      question: "دوست دارید چه نوع گزارش‌هایی داخل داشبورد ساخته شود؟",
+      options: [
+        { value: "executive_full", label: "بسته کامل مدیریتی (توصیه‌شده)", hint: "کارت‌های خلاصه آمار + نمودار میله‌ای + دایره‌ای + جدول جزئیات" },
+        { value: "charts_only", label: "نمودارهای مقایسه‌ای و روندی", hint: "نمودار میله‌ای و خطی برای مقایسه و بررسی روند" },
+        { value: "kpi_and_pie", label: "نمای سریع و خلاصه", hint: "اعداد کلیدی و نمودار سهم دایره‌ای" },
+      ],
+    });
+  }
+  if (!chosenTheme && themes.length) {
+    const themeFa: Record<string, string> = {
+      light: "روشن و تمیز",
+      dark: "تیره و مدرن",
+      corporate: "اداری و رسمی (آبی)",
+      glass: "شیشه‌ای و حرفه‌ای",
+      neon: "مدرن و پرکنتراست",
+      minimal: "ساده و مینیمال",
+      material: "مدرن متریال",
+    };
+    questions.push({
+      key: "theme_id",
+      question: "ظاهر و رنگ داشبورد چطور باشد؟",
+      options: themes.slice(0, 5).map((th) => ({ value: th.id, label: themeFa[th.slug] || th.name })),
+    });
+  }
+
+  if (questions.length) {
+    return {
+      status: "needs_clarification",
+      action: "create_dashboard",
+      message_fa: "برای اینکه داشبورد دقیقاً مطابق سلیقه شما ساخته شود، لطفاً به این موارد پاسخ دهید:",
+      questions,
+      parsed: {
+        mode: "create_dashboard",
+        dataset_id: chosenDs?.id || null,
+        layout_preset: layoutPreset,
+        theme_id: chosenTheme?.id || null,
+        title: dashTitle,
+      },
+    };
+  }
+
+  if (!dashTitle) {
+    const [friendly] = friendlyDemoDatasetLabel(chosenDs);
+    dashTitle = `داشبورد ${friendly.split("(")[0].trim()}`;
+  }
+  return buildDemoFullDashboard(chosenDs, dashTitle, layoutPreset || "executive_full", chosenTheme);
+}
+
+function handleEditDashboardOrWidgetDemo(body: any, username: string | null) {
+  const clar = { ...(body?.clarifications || {}) };
+  const freeReply = normalizeFaText(String(clar.free_text || "").trim());
+  const norm = normalizeFaText(String(body?.prompt || "").trim());
+  const combinedText = normalizeFaText(`${norm} ${freeReply}`).trim();
+  const combinedLow = combinedText.toLowerCase();
+
+  // Merge built-in demo dashboards + client-side created dashboards from demo_context
+  const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
+  const allDetailsMap = new Map<string, any>();
+  for (const d of customDashes) {
+    if (d?.id) allDetailsMap.set(d.id, d);
+  }
+  for (const [k, v] of Object.entries(demoData.dashboards_detail || {})) {
+    if (!allDetailsMap.has(k)) allDetailsMap.set(k, v);
+  }
+  const allDashboards = Array.from(allDetailsMap.values());
+
+  const reqDashId = clar.dashboard_id || body?.dashboard_id;
+  let targetDash: any = reqDashId ? allDetailsMap.get(reqDashId) || null : null;
+  if (!targetDash) {
+    targetDash = allDashboards.find((d) => combinedLow.includes(String(d.title || "").toLowerCase())) || null;
+  }
+  if (!targetDash && allDashboards.length === 1) targetDash = allDashboards[0];
+
+  if (!targetDash) {
+    return {
+      status: "needs_clarification",
+      action: "edit",
+      message_fa: "لطفاً مشخص کنید کدام داشبورد را می‌خواهید تغییر دهید:",
+      questions: [
+        {
+          key: "dashboard_id",
+          question: "کدام داشبورد را ویرایش کنیم؟",
+          options: allDashboards.slice(0, 8).map((d) => ({ value: d.id, label: d.title })),
+        },
+      ],
+      parsed: { mode: "edit" },
+    };
+  }
+
+  // Merge client-side widget edits / deletions passed in demo_context if available
+  const ctxWidgets: any[] = Array.isArray(body?.demo_context?.widgets)
+    ? body.demo_context.widgets
+    : targetDash.widgets || [];
+  const widgets = ctxWidgets;
+
+  const targetScope = clar.target_widget_id || body?.widget_id;
+  let targetWidget: any = targetScope && targetScope !== "__dashboard__" ? widgets.find((w) => w.id === targetScope) || null : null;
+
+  if (!targetWidget && targetScope !== "__dashboard__") {
+    targetWidget = widgets.find((w) => combinedLow.includes(String(w.title || "").toLowerCase())) || null;
+    if (!targetWidget && widgets.length) {
+      if (["اول", "نخست"].some((k) => combinedLow.includes(k))) targetWidget = widgets[0];
+      else if (combinedLow.includes("دوم") && widgets.length >= 2) targetWidget = widgets[1];
+      else if (combinedLow.includes("سوم") && widgets.length >= 3) targetWidget = widgets[2];
+      else if (combinedLow.includes("آخر")) targetWidget = widgets[widgets.length - 1];
+    }
+  }
+
+  const isDashLevel =
+    targetScope === "__dashboard__" ||
+    (!targetWidget &&
+      (["تم داشبورد", "تم ", "ظاهر داشبورد", "ظاهرش", "رنگ داشبورد", "قالب داشبورد", "تیره کن", "روشن کن", "شیشه ای کن"].some((k) =>
+        combinedLow.includes(k)
+      ) ||
+        ["عنوان داشبورد", "اسم داشبورد", "نام داشبورد"].some((k) => combinedLow.includes(k)) ||
+        (combinedLow.includes("فیلتر") && ["اضافه", "بذار", "قرار بده"].some((k) => combinedLow.includes(k)))));
+
+  if (isDashLevel) {
+    const themes: any[] = demoData.themes || [];
+    let resolvedTheme = clar.theme_id ? themes.find((t) => t.id === clar.theme_id) || null : null;
+    if (!resolvedTheme) resolvedTheme = resolveDemoThemeFromText(combinedLow);
+    if (resolvedTheme) {
+      return {
+        status: "dashboard_updated",
+        action: "edit_dashboard",
+        message_fa: `ظاهر داشبورد «${targetDash.title}» با موفقیت به «${resolvedTheme.name}» تغییر یافت.`,
+        updated_dashboard: {
+          id: targetDash.id,
+          title: targetDash.title,
+          theme_id: resolvedTheme.id,
+          theme_name: resolvedTheme.name,
+        },
+      };
+    }
+
+    const mTitle = combinedText.match(
+      /(?:عنوان\s+داشبورد|اسم\s+داشبورد|نام\s+داشبورد|عنوانش|اسمش|نامش)\s*(?:را|رو)?\s*(?:تغییر\s+بده\s+به|عوض\s+کن\s+به|تغییر\s+بده|عوض\s+کن|بگذار|بذار|بکن|به)\s*["«']?([^"»'\n]+?)["»']?\s*$/i
+    );
+    const newDTitle = clar.new_title || (mTitle ? mTitle[1].replace(/^[،,.«»"'\s]+|[،,.«»"'\s]+$/g, "") : null);
+    if (newDTitle && newDTitle.length >= 2 && !["عوض کن", "تغییر بده"].some((k) => newDTitle.includes(k))) {
+      return {
+        status: "dashboard_updated",
+        action: "edit_dashboard",
+        message_fa: `نام داشبورد با موفقیت به «${newDTitle}» تغییر یافت.`,
+        updated_dashboard: { id: targetDash.id, title: newDTitle, theme_id: targetDash.theme_id },
+      };
+    }
+
+    if (combinedLow.includes("فیلتر")) {
+      const datasets: any[] = demoData.datasets || [];
+      for (const w of widgets) {
+        const dObj = datasets.find((d) => d.id === w.dataset_id);
+        if (dObj) {
+          const { colsInfo } = getDemoDatasetSchema(dObj);
+          const col = matchDemoColumn(combinedLow, colsInfo, "dim");
+          if (col) {
+            const lbl = colsInfo.find((c: any) => c.name === col)?.label || col;
+            const newFilter = {
+              id: `flt_${Date.now()}`,
+              name: lbl,
+              field_name: col,
+              dataset_id: dObj.id,
+              filter_type: "multi_select",
+              operator: "in",
+              scope: "dashboard",
+              default_value: [],
+            };
+            return {
+              status: "dashboard_updated",
+              action: "edit_dashboard",
+              message_fa: `فیلتر «${lbl}» به داشبورد «${targetDash.title}» اضافه شد.`,
+              updated_dashboard: { id: targetDash.id, title: targetDash.title, add_filter: newFilter },
+            };
+          }
+        }
+      }
+    }
+
+    return {
+      status: "needs_clarification",
+      action: "edit",
+      message_fa: `چه تغییری روی تنظیمات کلی داشبورد «${targetDash.title}» انجام شود؟`,
+      questions: [
+        {
+          key: "theme_id",
+          question: "می‌توانید یکی از ظاهرهای زیر را انتخاب کنید یا نام جدید داشبورد را بنویسید:",
+          options: themes.slice(0, 5).map((th) => ({ value: th.id, label: `تغییر ظاهر به: ${th.name}` })),
+        },
+      ],
+      parsed: { mode: "edit", dashboard_id: targetDash.id, target_widget_id: "__dashboard__" },
+    };
+  }
+
+  if (!targetWidget) {
+    const opts: any[] = [{ value: "__dashboard__", label: "تغییر کلی داشبورد (نام، رنگ/تم، یا فیلتر)" }];
+    for (const w of widgets.slice(0, 9)) {
+      opts.push({ value: w.id, label: w.title, hint: DEMO_CHART_LABELS_FA[w.chart_type] || w.chart_type });
+    }
+    return {
+      status: "needs_clarification",
+      action: "edit",
+      message_fa: `در داشبورد «${targetDash.title}»، کدام بخش یا نمودار را می‌خواهید تغییر دهید؟`,
+      questions: [{ key: "target_widget_id", question: "مورد نظر را انتخاب کنید:", options: opts }],
+      parsed: { mode: "edit", dashboard_id: targetDash.id },
+    };
+  }
+
+  const editAction = clar.edit_action;
+  let newChartType: string | null = clar.chart_type || extractChartTypeFromText(combinedLow);
+  if (typeof editAction === "string" && editAction.startsWith("chart:")) {
+    newChartType = editAction.split(":")[1];
+  }
+  const isDelete = editAction === "delete" || ["حذف", "پاک کن", "بردار", "delete", "remove"].some((k) => combinedLow.includes(k));
+  if (isDelete) {
+    return {
+      status: "widget_deleted",
+      action: "delete_widget",
+      message_fa: `نمودار «${targetWidget.title}» با موفقیت از داشبورد حذف شد.`,
+      deleted_widget_id: targetWidget.id,
+      dashboard_id: targetDash.id,
+    };
+  }
+
+  let newWTitle: string | null = clar.new_title || null;
+  if (!newWTitle) {
+    const mwt = combinedText.match(
+      /(?:عنوان|اسم|نام)ش?\s*(?:ویجت|نمودار|کارت)?\s*(?:را|رو)?\s*(?:تغییر\s+بده\s+به|عوض\s+کن\s+به|تغییر\s+بده|عوض\s+کن|بگذار|بذار|بکن|به)\s*["«']?([^"»'\n]+?)["»']?(?=\s*(?:و\s+(?:نوعش|تبدیل)|$))/i
+    );
+    if (mwt) {
+      const cand = mwt[1].replace(/^[،,.«»"'\s]+|[،,.«»"'\s]+$/g, "");
+      if (cand.length >= 2 && !["عوض کن", "تغییر بده", "نمودار را"].some((k) => cand.includes(k))) {
+        newWTitle = cand;
+      }
+    }
+  }
+
+  const datasets: any[] = demoData.datasets || [];
+  const dsObj = datasets.find((d) => d.id === targetWidget.dataset_id) || null;
+  let newX: string | null = null;
+  let newY: string | null = null;
+  let newAgg: string | null = null;
+  if (dsObj) {
+    const { colsInfo } = getDemoDatasetSchema(dsObj);
+    const mDim = combinedText.match(/(?:بر\s+اساس|به\s+تفکیک|بر\s+حسب|روی\s+محور)\s+["«']?([^"»'\n]+?)["»']?(?=\s*(?:نشان|نمایش|تبدیل|کن|بده|$))/i);
+    if (mDim) newX = matchDemoColumn(mDim[1], colsInfo, "dim");
+    const mHit = matchDemoColumn(combinedLow, colsInfo, "measure");
+    if (mHit && mHit !== targetWidget.query?.visual_spec?.y_field) {
+      newY = mHit;
+      if (["میانگین", "avg"].some((k) => combinedLow.includes(k)) || ["score", "pct", "rate"].some((k) => mHit.toLowerCase().includes(k))) {
+        newAgg = "AVG";
+      } else if (["تعداد رکورد", "شمارش", "count"].some((k) => combinedLow.includes(k))) {
+        newAgg = "COUNT";
+        newY = "*";
+      } else {
+        newAgg = "SUM";
+      }
+    }
+  }
+
+  if (!newChartType && !newWTitle && !newX && !newY) {
+    return {
+      status: "needs_clarification",
+      action: "edit",
+      message_fa: `چه تغییری می‌خواهید روی «${targetWidget.title}» انجام شود؟`,
+      questions: [
+        {
+          key: "edit_action",
+          question: "می‌توانید یکی از گزینه‌ها را بزنید یا تغییر دلخواه خود را به فارسی تایپ کنید (مثلاً: عنوانش را بگذار آمار جدید):",
+          options: [
+            { value: "chart:bar", label: "تبدیل به نمودار میله‌ای" },
+            { value: "chart:line", label: "تبدیل به نمودار خطی (روندی)" },
+            { value: "chart:pie", label: "تبدیل به نمودار دایره‌ای" },
+            { value: "chart:table", label: "نمایش به صورت جدول" },
+            { value: "chart:kpi", label: "نمایش به شکل کارت عدد خلاصه" },
+            { value: "delete", label: "حذف این نمودار از داشبورد" },
+          ],
+        },
+      ],
+      parsed: { mode: "edit", dashboard_id: targetDash.id, target_widget_id: targetWidget.id },
+    };
+  }
+
+  const effChart = newChartType || targetWidget.chart_type;
+  const effTitle = newWTitle || targetWidget.title;
+  const visualSpec = {
+    ...(targetWidget.query?.visual_spec || {}),
+    ...(newX ? { x_field: newX } : {}),
+    ...(newY ? { y_field: newY } : {}),
+    ...(newAgg ? { aggregation: newAgg } : {}),
+  };
+  const previewData = dsObj ? executeVisualSpec(dsObj.id, visualSpec, username, []) : null;
+
+  return {
+    status: "widget_updated",
+    action: "edit_widget",
+    message_fa: `«${effTitle}» با موفقیت به‌روزرسانی شد (${DEMO_CHART_LABELS_FA[effChart] || effChart}).`,
+    widget: {
+      id: targetWidget.id,
+      dashboard_id: targetDash.id,
+      page_id: targetWidget.page_id,
+      title: effTitle,
+      chart_type: effChart,
+      dataset_id: targetWidget.dataset_id,
+      visual_spec: visualSpec,
+    },
+    widget_spec: {
+      title: effTitle,
+      chart_type: effChart,
+      visual_spec: visualSpec,
+      style: {},
+      visualization: { show_legend: true, show_tooltip: true },
+    },
+    preview_data: previewData,
+  };
+}
+
+function handleAssistantDemo(body: any, username: string | null) {
+  const clar = { ...(body?.clarifications || {}) };
+  let effMode = clar.mode || (body?.mode && body.mode !== "auto" ? body.mode : null);
+  const normLow = normalizeFaText(String(body?.prompt || "")).toLowerCase();
+
+  if (!effMode) {
+    const isEditKw = [
+      "ویرایش", "تغییر", "عوض کن", "تبدیل کن", "تبدیل به", "بکن ", "حذف", "پاک کن", "بردار",
+      "اسمش رو", "تم داشبورد", "ظاهر داشبورد", "رنگ داشبورد", "فیلتر", "تیره کن", "روشن کن",
+    ].some((k) => normLow.includes(k));
+    const hasDash = ["داشبورد", "dashboard", "صفحه گزارش"].some((k) => normLow.includes(k));
+    const hasWidget = ["ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget"].some((k) => normLow.includes(k));
+
+    if (body?.widget_id || isEditKw) effMode = "edit";
+    else if (hasDash && !hasWidget) effMode = "create_dashboard";
+    else if (hasWidget || ["از روی منبع", "بر اساس", "به تفکیک"].some((k) => normLow.includes(k))) effMode = "add_widget";
+  }
+
+  if (!effMode) {
+    return {
+      status: "needs_clarification",
+      action: "choose_mode",
+      message_fa: "خوش آمدید! می‌خواهید با هم چه کاری انجام دهیم؟",
+      questions: [
+        {
+          key: "mode",
+          question: "یکی از کارهای زیر را انتخاب کنید:",
+          options: [
+            { value: "create_dashboard", label: "ساخت یک داشبورد کامل جدید", hint: "با چند نمودار و کارت خلاصه آماده" },
+            { value: "add_widget", label: "افزودن یک نمودار یا عدد آماری جدید", hint: "به داشبورد فعلی یا دلخواه" },
+            { value: "edit", label: "ویرایش داشبورد یا نمودارهای موجود", hint: "تغییر رنگ/ظاهر، نام، نوع نمودار یا حذف" },
+          ],
+        },
+      ],
+      parsed: {},
+    };
+  }
+
+  if (effMode === "create_dashboard") return handleCreateDashboardDemo(body);
+  if (effMode === "edit") return handleEditDashboardOrWidgetDemo(body, username);
+  return { action: "add_widget", ...handleTextToWidgetDemo(body, username) };
+}
+
 export async function handleVercelDemoApi(
   method: string,
   segments: string[],
@@ -1244,6 +1908,9 @@ export async function handleVercelDemoApi(
   }
   if (method === "POST" && path === "/ai/text-to-widget") {
     return { status: 200, body: handleTextToWidgetDemo(body, username) };
+  }
+  if (method === "POST" && path === "/ai/assistant") {
+    return { status: 200, body: handleAssistantDemo(body, username) };
   }
 
   // Fallback for preview demo mutations (read-only preview note)

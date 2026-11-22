@@ -10,10 +10,12 @@ from app.models.dashboard import (
     DashboardFilter,
     DashboardLayout,
     DashboardPage,
+    DashboardTheme,
     Widget,
     WidgetConfig,
     WidgetDrillRule,
     WidgetQuery,
+    Workspace,
 )
 from app.models.data import Dataset, DatasetField, SemanticMetric
 from app.models.identity import User
@@ -1038,10 +1040,11 @@ class AiAnalyticsEngine:
 
         return {
             "status": "created" if created_widget else "ready",
+            "action": "add_widget",
             "message_fa": (
-                f"ویجت «{extracted_title}» از منبع «{chosen_ds.name}» با موفقیت ساخته شد و به داشبورد اضافه گردید."
+                f"نمودار «{extracted_title}» با موفقیت ساخته شد و به داشبورد اضافه گردید."
                 if created_widget
-                else f"پیکربندی ویجت «{extracted_title}» از منبع «{chosen_ds.name}» آماده شد."
+                else f"پیکربندی نمودار «{extracted_title}» آماده شد."
             ),
             "widget": created_widget,
             "widget_spec": {
@@ -1056,4 +1059,912 @@ class AiAnalyticsEngine:
             "generated_sql": sql,
             "preview_data": preview_data,
         }
+
+    CHART_LABELS_FA: dict[str, str] = {
+        "bar": "نمودار میله‌ای",
+        "horizontal_bar": "نمودار میله‌ای افقی",
+        "stacked_bar": "نمودار ستونی انباشته",
+        "line": "نمودار خطی (روندی)",
+        "area": "نمودار مساحتی",
+        "pie": "نمودار دایره‌ای",
+        "donut": "نمودار حلقوی",
+        "kpi": "کارت عدد خلاصه",
+        "gauge": "عقربه شاخص",
+        "table": "جدول اطلاعات",
+        "pivot_table": "جدول مقایسه‌ای",
+    }
+
+    @staticmethod
+    def _friendly_dataset_label(ds: Dataset) -> tuple[str, str]:
+        wt = (ds.warehouse_table or "").lower()
+        nm = (ds.name or "").lower()
+        if "contractor" in wt or ds.name == "تعداد":
+            return ("گزارش عملکرد پیمانکاران و پروژه‌ها (تعداد)", f"{ds.row_count} رکورد آماده")
+        if "sales" in wt or "sales" in nm:
+            return ("فروش، درآمد و سود مناطق", f"{ds.row_count} سفارش")
+        if "expense" in wt or "expense" in nm:
+            return ("هزینه‌ها و بودجه بخش‌ها", f"{ds.row_count} سند مالی")
+        if "hr" in wt or "workforce" in nm:
+            return ("اطلاعات پرسنل و منابع انسانی", f"{ds.row_count} پرسنل")
+        return (ds.name, f"{ds.row_count} ردیف اطلاعات")
+
+    @staticmethod
+    def _match_dataset_from_text(datasets: list[Dataset], text_low: str) -> Optional[Dataset]:
+        if not datasets or not text_low:
+            return None
+        for d in datasets:
+            if d.name.lower() in text_low or d.warehouse_table.lower() in text_low:
+                return d
+        syn_groups: list[tuple[list[str], list[str]]] = [
+            (["پیمانکار", "تعداد پروژه", "پروژه", "contractor"], ["contractor", "تعداد"]),
+            (["فروش", "درآمد", "سود", "سفارش", "محصول", "مناطق", "منطقه", "sales", "revenue"], ["sales", "revenue"]),
+            (["هزینه", "بودجه", "خرج", "مالی", "expense", "budget", "cost"], ["expense", "cost", "budget"]),
+            (["پرسنل", "کارمند", "کارکنان", "حقوق", "منابع انسانی", "نیروی انسانی", "hr", "employee"], ["hr", "workforce"]),
+        ]
+        for kws, targets in syn_groups:
+            if any(k in text_low for k in kws):
+                for d in datasets:
+                    dn = d.name.lower()
+                    wt = d.warehouse_table.lower()
+                    if any(tg in dn or tg in wt for tg in targets):
+                        return d
+        return None
+
+    @staticmethod
+    def _resolve_theme_from_text(db: Session, org_id: str, text_low: str) -> Optional[DashboardTheme]:
+        themes = db.query(DashboardTheme).filter(DashboardTheme.organization_id == org_id).all()
+        if not themes:
+            return None
+        for th in themes:
+            if th.id == text_low or th.slug.lower() in text_low or th.name.lower() in text_low:
+                return th
+        theme_hints = [
+            (["شیشه", "glass", "بلور", "شیک"], ["glass"]),
+            (["نئون", "neon", "درخشان", "رنگی"], ["neon"]),
+            (["تیره", "مشکی", "دارک", "dark", "تم شب", "حالت شب"], ["dark"]),
+            (["اداری", "رسمی", "سازمانی", "corporate", "آبی"], ["corporate"]),
+            (["مینیمال", "ساده", "minimal"], ["minimal"]),
+            (["روشن", "سفید", "تم روز", "حالت روز", "light"], ["light", "corporate"]),
+            (["متریال", "material"], ["material"]),
+        ]
+        for kws, slugs in theme_hints:
+            if any(k in text_low for k in kws):
+                for slug in slugs:
+                    hit = next((th for th in themes if slug in th.slug.lower() or slug in th.name.lower()), None)
+                    if hit:
+                        return hit
+        return None
+
+    @staticmethod
+    def _build_full_dashboard_from_intent(
+        db: Session,
+        user: User,
+        ds: Dataset,
+        title: str,
+        layout_preset: str,
+        theme: Optional[DashboardTheme],
+    ) -> dict[str, Any]:
+        ws = db.query(Workspace).filter(Workspace.organization_id == user.organization_id).first()
+        if not ws:
+            ws = Workspace(organization_id=user.organization_id, name="Primary Analytics Workspace")
+            db.add(ws)
+            db.flush()
+
+        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, ds)
+        col_label_map = {c["name"]: c["label"] for c in cols_info}
+
+        def _lbl(col: Optional[str]) -> str:
+            if not col or col == "*":
+                return "رکوردها"
+            return col_label_map.get(col, col.replace("_", " ").title())
+
+        # Prioritize meaningful dimensions & measures
+        pref_dims = [c for c in ("contractor_name", "region", "project_type", "category", "department", "product", "channel", "city") if c in dim_cols]
+        rest_dims = [c for c in dim_cols if c not in pref_dims and not c.endswith("_code")]
+        ordered_dims = pref_dims + rest_dims
+        primary_dim = ordered_dims[0] if ordered_dims else None
+        secondary_dim = ordered_dims[1] if len(ordered_dims) > 1 else primary_dim
+        time_col = next((c["name"] for c in cols_info if c.get("role") == "time"), None)
+
+        pref_nums = [c for c in ("project_count", "revenue", "profit", "actual_amount", "performance_score", "contract_value", "salary") if c in num_cols]
+        rest_nums = [c for c in num_cols if c not in pref_nums]
+        ordered_nums = pref_nums + rest_nums
+        primary_num = ordered_nums[0] if ordered_nums else "*"
+        secondary_num = ordered_nums[1] if len(ordered_nums) > 1 else primary_num
+
+        def _agg_for(col: str) -> str:
+            if col == "*":
+                return "COUNT"
+            if any(k in col.lower() for k in ("score", "pct", "rate", "ratio", "margin")):
+                return "AVG"
+            return "SUM"
+
+        p_agg = _agg_for(primary_num)
+        s_agg = _agg_for(secondary_num)
+        is_curr_p = any(k in primary_num.lower() for k in ("rev", "cost", "profit", "price", "amount", "salary", "budget", "value"))
+
+        dash = Dashboard(
+            workspace_id=ws.id,
+            title=title,
+            description=f"ساخته‌شده با دستیار هوشمند فارسی از داده‌های «{ds.name}»",
+            theme_id=theme.id if theme else None,
+            created_by=user.id,
+        )
+        db.add(dash)
+        db.flush()
+
+        page = DashboardPage(dashboard_id=dash.id, title="نمای کلی", page_order=0)
+        db.add(page)
+        db.flush()
+
+        widget_specs: list[dict[str, Any]] = []
+        if layout_preset in ("executive_full", "kpi_and_pie"):
+            widget_specs.append(
+                {
+                    "title": f"تعداد کل {_lbl(primary_dim) if primary_dim else 'اطلاعات'}",
+                    "chart_type": "kpi",
+                    "layout": {"x": 0, "y": 0, "w": 4, "h": 3},
+                    "visual_spec": {"y_field": "*", "aggregation": "COUNT"},
+                    "style": {"number_format": "number"},
+                }
+            )
+            widget_specs.append(
+                {
+                    "title": f"{'میانگین' if p_agg == 'AVG' else 'مجموع'} {_lbl(primary_num)}",
+                    "chart_type": "kpi",
+                    "layout": {"x": 4, "y": 0, "w": 4, "h": 3},
+                    "visual_spec": {"y_field": primary_num, "aggregation": p_agg},
+                    "style": {"number_format": "currency" if is_curr_p and p_agg != "COUNT" else "number"},
+                }
+            )
+            if secondary_num != primary_num:
+                widget_specs.append(
+                    {
+                        "title": f"{'میانگین' if s_agg == 'AVG' else 'مجموع'} {_lbl(secondary_num)}",
+                        "chart_type": "kpi",
+                        "layout": {"x": 8, "y": 0, "w": 4, "h": 3},
+                        "visual_spec": {"y_field": secondary_num, "aggregation": s_agg},
+                        "style": {"number_format": "number"},
+                    }
+                )
+
+        chart_top_y = 3 if widget_specs else 0
+        if primary_dim and layout_preset in ("executive_full", "charts_only"):
+            widget_specs.append(
+                {
+                    "title": f"مقایسه {_lbl(primary_num)} بر اساس {_lbl(primary_dim)}",
+                    "chart_type": "bar",
+                    "layout": {"x": 0, "y": chart_top_y, "w": 6, "h": 7},
+                    "visual_spec": {"x_field": primary_dim, "y_field": primary_num, "aggregation": p_agg, "limit": 50},
+                    "style": {"number_format": "currency" if is_curr_p and p_agg != "COUNT" else "number"},
+                }
+            )
+
+        if secondary_dim and layout_preset in ("executive_full", "kpi_and_pie"):
+            widget_specs.append(
+                {
+                    "title": f"سهم بر اساس {_lbl(secondary_dim)}",
+                    "chart_type": "pie" if layout_preset == "kpi_and_pie" else "donut",
+                    "layout": {"x": 6 if (primary_dim and layout_preset == "executive_full") else 0, "y": chart_top_y, "w": 6, "h": 7},
+                    "visual_spec": {"x_field": secondary_dim, "y_field": primary_num, "aggregation": p_agg, "limit": 30},
+                    "style": {"number_format": "number"},
+                }
+            )
+
+        if layout_preset == "charts_only" and (time_col or secondary_dim):
+            x_t = time_col or secondary_dim
+            widget_specs.append(
+                {
+                    "title": f"روند {_lbl(secondary_num)} بر اساس {_lbl(x_t)}",
+                    "chart_type": "line",
+                    "layout": {"x": 6, "y": chart_top_y, "w": 6, "h": 7},
+                    "visual_spec": {"x_field": x_t, "y_field": secondary_num, "aggregation": s_agg, "limit": 50},
+                    "style": {"number_format": "number"},
+                }
+            )
+
+        if layout_preset == "executive_full" and primary_dim:
+            widget_specs.append(
+                {
+                    "title": f"جدول جزئیات {_lbl(primary_dim)}",
+                    "chart_type": "table",
+                    "layout": {"x": 0, "y": chart_top_y + 7, "w": 12, "h": 7},
+                    "visual_spec": {
+                        "x_field": primary_dim,
+                        "y_field": primary_num,
+                        "secondary_y_field": secondary_num if secondary_num != primary_num else None,
+                        "aggregation": p_agg,
+                        "limit": 50,
+                    },
+                    "style": {"number_format": "number"},
+                }
+            )
+
+        created_widgets = []
+        layout_items = []
+        for sp in widget_specs:
+            lay = sp["layout"]
+            w = Widget(
+                dashboard_id=dash.id,
+                page_id=page.id,
+                title=sp["title"],
+                chart_type=sp["chart_type"],
+                dataset_id=ds.id,
+                layout_x=lay["x"],
+                layout_y=lay["y"],
+                layout_w=lay["w"],
+                layout_h=lay["h"],
+            )
+            db.add(w)
+            db.flush()
+            layout_items.append({"i": w.id, **lay})
+            db.add(
+                WidgetConfig(
+                    widget_id=w.id,
+                    style_json=sp.get("style", {}),
+                    visualization_json={"show_legend": True, "show_tooltip": True, "data_labels": False},
+                    interactions_json={"cross_filter": True},
+                    advanced_json={"ai_generated": True},
+                )
+            )
+            db.add(
+                WidgetQuery(
+                    widget_id=w.id,
+                    dataset_id=ds.id,
+                    query_mode="visual",
+                    visual_spec_json=sp["visual_spec"],
+                )
+            )
+            created_widgets.append(
+                {
+                    "id": w.id,
+                    "title": w.title,
+                    "chart_type": w.chart_type,
+                    "chart_label_fa": AiAnalyticsEngine.CHART_LABELS_FA.get(w.chart_type, w.chart_type),
+                }
+            )
+
+        db.add(DashboardLayout(page_id=page.id, columns_count=12, layout_json=layout_items))
+
+        # Add automatic friendly filter
+        filter_col = next((c for c in ("region", "project_type", "department", "category", "year") if c in dim_cols), primary_dim)
+        if filter_col:
+            db.add(
+                DashboardFilter(
+                    dashboard_id=dash.id,
+                    name=_lbl(filter_col),
+                    field_name=filter_col,
+                    dataset_id=ds.id,
+                    filter_type="multi_select",
+                    operator="in",
+                    scope="dashboard",
+                    default_value_json=[],
+                )
+            )
+
+        from app.models.data import DataLineage
+
+        db.add(DataLineage(source_type="dataset", source_id=ds.id, target_type="dashboard", target_id=dash.id))
+        db.commit()
+
+        return {
+            "status": "dashboard_created",
+            "action": "create_dashboard",
+            "message_fa": f"داشبورد «{dash.title}» با {len(created_widgets)} گزارش و نمودار آماده با موفقیت ساخته شد!",
+            "created_dashboard": {
+                "id": dash.id,
+                "title": dash.title,
+                "description": dash.description,
+                "theme_id": dash.theme_id,
+                "theme_name": theme.name if theme else "پیش‌فرض",
+                "dataset_id": ds.id,
+                "dataset_name": ds.name,
+                "widget_count": len(created_widgets),
+                "widgets": created_widgets,
+            },
+        }
+
+    @staticmethod
+    def _handle_create_dashboard_chat(
+        db: Session,
+        user: User,
+        prompt: str,
+        clarifications: dict[str, Any],
+    ) -> dict[str, Any]:
+        from app.api.deps import enforce_permission
+
+        enforce_permission(db, user, "dashboard", "*", "add")
+        free_reply = AiAnalyticsEngine._normalize_text(str(clarifications.get("free_text") or ""))
+        norm = AiAnalyticsEngine._normalize_text(prompt)
+        combined_low = AiAnalyticsEngine._normalize_text(f"{norm} {free_reply}").lower()
+
+        datasets = db.query(Dataset).filter(Dataset.organization_id == user.organization_id).all()
+        if not datasets:
+            return {
+                "status": "needs_clarification",
+                "action": "create_dashboard",
+                "message_fa": "هنوز هیچ منبع داده یا فایل اکسل در سیستم ثبت نشده است. لطفاً ابتدا یک فایل اکسل از بخش «منابع داده» بارگذاری کنید.",
+                "questions": [],
+                "parsed": {"mode": "create_dashboard"},
+            }
+
+        # Extract custom dashboard title
+        dash_title: Optional[str] = clarifications.get("title")
+        if not dash_title:
+            m_t = re.search(
+                r"(?:با\s+عنوان|تحت\s+عنوان|به\s+نام|با\s+نام|اسمش\s+رو\s+بذار|عنوان)\s+[\"«']?([^\"»'\n]+?)[\"»']?(?=\s*(?:بساز|ایجاد|تولید|درست|$))",
+                norm,
+                flags=re.IGNORECASE,
+            )
+            if m_t:
+                dash_title = m_t.group(1).strip(" ،,.«»\"'")
+
+        # Resolve dataset
+        chosen_ds: Optional[Dataset] = None
+        if clarifications.get("dataset_id"):
+            chosen_ds = next((d for d in datasets if d.id == clarifications["dataset_id"]), None)
+        if not chosen_ds:
+            chosen_ds = AiAnalyticsEngine._match_dataset_from_text(datasets, combined_low)
+
+        # Resolve theme
+        chosen_theme: Optional[DashboardTheme] = None
+        themes = db.query(DashboardTheme).filter(DashboardTheme.organization_id == user.organization_id).all()
+        if clarifications.get("theme_id"):
+            if clarifications["theme_id"] == "__default__":
+                chosen_theme = themes[0] if themes else None
+            else:
+                chosen_theme = next((t for t in themes if t.id == clarifications["theme_id"]), None)
+        if not chosen_theme:
+            chosen_theme = AiAnalyticsEngine._resolve_theme_from_text(db, user.organization_id, combined_low)
+
+        # Resolve layout preset
+        layout_preset: Optional[str] = clarifications.get("layout_preset")
+        if not layout_preset:
+            if any(k in combined_low for k in ("کامل", "همه", "مدیریتی", "جامع", "executive", "full")):
+                layout_preset = "executive_full"
+            elif any(k in combined_low for k in ("روند", "خطی", "فقط نمودار", "charts")):
+                layout_preset = "charts_only"
+            elif any(k in combined_low for k in ("خلاصه", "سهم", "دایره", "سریع", "کارت")):
+                layout_preset = "kpi_and_pie"
+
+        questions: list[dict[str, Any]] = []
+        if not chosen_ds:
+            ds_opts = []
+            for d in datasets:
+                lbl, hint = AiAnalyticsEngine._friendly_dataset_label(d)
+                ds_opts.append({"value": d.id, "label": lbl, "hint": hint})
+            questions.append(
+                {
+                    "key": "dataset_id",
+                    "question": "این داشبورد قرار است گزارش‌های کدام بخش یا موضوع را نشان دهد؟",
+                    "options": ds_opts,
+                }
+            )
+
+        if not layout_preset:
+            questions.append(
+                {
+                    "key": "layout_preset",
+                    "question": "دوست دارید چه نوع گزارش‌هایی داخل داشبورد ساخته شود؟",
+                    "options": [
+                        {
+                            "value": "executive_full",
+                            "label": "بسته کامل مدیریتی (توصیه‌شده)",
+                            "hint": "کارت‌های خلاصه آمار + نمودار میله‌ای + دایره‌ای + جدول جزئیات",
+                        },
+                        {
+                            "value": "charts_only",
+                            "label": "نمودارهای مقایسه‌ای و روندی",
+                            "hint": "نمودار میله‌ای و خطی برای مقایسه و بررسی روند",
+                        },
+                        {
+                            "value": "kpi_and_pie",
+                            "label": "نمای سریع و خلاصه",
+                            "hint": "اعداد کلیدی و نمودار سهم دایره‌ای",
+                        },
+                    ],
+                }
+            )
+
+        if not chosen_theme and themes:
+            theme_name_fa = {
+                "light": "روشن و تمیز",
+                "dark": "تیره و مدرن",
+                "corporate": "اداری و رسمی (آبی)",
+                "glass": "شیشه‌ای و حرفه‌ای",
+                "neon": "مدرن و پرکنتراست",
+                "minimal": "ساده و مینیمال",
+                "material": "مدرن متریال",
+            }
+            questions.append(
+                {
+                    "key": "theme_id",
+                    "question": "ظاهر و رنگ داشبورد چطور باشد؟",
+                    "options": [
+                        {"value": th.id, "label": theme_name_fa.get(th.slug, th.name)}
+                        for th in themes[:5]
+                    ],
+                }
+            )
+
+        if questions:
+            return {
+                "status": "needs_clarification",
+                "action": "create_dashboard",
+                "message_fa": "برای اینکه داشبورد دقیقاً مطابق سلیقه شما ساخته شود، لطفاً به این موارد پاسخ دهید:",
+                "questions": questions,
+                "parsed": {
+                    "mode": "create_dashboard",
+                    "dataset_id": chosen_ds.id if chosen_ds else None,
+                    "layout_preset": layout_preset,
+                    "theme_id": chosen_theme.id if chosen_theme else None,
+                    "title": dash_title,
+                },
+            }
+
+        if not dash_title:
+            if chosen_ds:
+                friendly, _ = AiAnalyticsEngine._friendly_dataset_label(chosen_ds)
+                dash_title = f"داشبورد {friendly.split('(')[0].strip()}"
+            else:
+                dash_title = "داشبورد هوشمند جدید"
+
+        return AiAnalyticsEngine._build_full_dashboard_from_intent(
+            db=db,
+            user=user,
+            ds=chosen_ds,
+            title=dash_title,
+            layout_preset=layout_preset or "executive_full",
+            theme=chosen_theme,
+        )
+
+    @staticmethod
+    def _handle_edit_chat(
+        db: Session,
+        user: User,
+        prompt: str,
+        dashboard_id: Optional[str],
+        widget_id: Optional[str],
+        clarifications: dict[str, Any],
+    ) -> dict[str, Any]:
+        from app.api.deps import enforce_permission
+        from app.core.rls_cls import apply_cls_and_masking, build_data_security_context
+        from app.engines.query_engine import build_visual_query_sql
+
+        free_reply = AiAnalyticsEngine._normalize_text(str(clarifications.get("free_text") or ""))
+        norm = AiAnalyticsEngine._normalize_text(prompt)
+        combined_text = AiAnalyticsEngine._normalize_text(f"{norm} {free_reply}")
+        combined_low = combined_text.lower()
+
+        dashboards = (
+            db.query(Dashboard)
+            .join(Workspace, Dashboard.workspace_id == Workspace.id)
+            .filter(Workspace.organization_id == user.organization_id, Dashboard.is_template == False)
+            .order_by(Dashboard.updated_at.desc())
+            .all()
+        )
+        if not dashboards:
+            dashboards = (
+                db.query(Dashboard)
+                .join(Workspace, Dashboard.workspace_id == Workspace.id)
+                .filter(Workspace.organization_id == user.organization_id)
+                .all()
+            )
+        if not dashboards:
+            return {
+                "status": "needs_clarification",
+                "action": "edit",
+                "message_fa": "هنوز داشبوردی در سیستم وجود ندارد که ویرایش شود. آیا می‌خواهید یک داشبورد جدید بسازیم؟",
+                "questions": [
+                    {
+                        "key": "mode",
+                        "question": "چطور شروع کنیم؟",
+                        "options": [{"value": "create_dashboard", "label": "ساخت داشبورد جدید با راهنمای فارسی"}],
+                    }
+                ],
+                "parsed": {"mode": "edit"},
+            }
+
+        target_dash: Optional[Dashboard] = None
+        ds_id_val = clarifications.get("dashboard_id") or dashboard_id
+        if ds_id_val:
+            target_dash = next((d for d in dashboards if d.id == ds_id_val), None)
+        if not target_dash:
+            for d in dashboards:
+                if d.title.lower() in combined_low:
+                    target_dash = d
+                    break
+        if not target_dash and len(dashboards) == 1:
+            target_dash = dashboards[0]
+
+        if not target_dash:
+            return {
+                "status": "needs_clarification",
+                "action": "edit",
+                "message_fa": "لطفاً مشخص کنید کدام داشبورد را می‌خواهید تغییر دهید:",
+                "questions": [
+                    {
+                        "key": "dashboard_id",
+                        "question": "کدام داشبورد را ویرایش کنیم؟",
+                        "options": [{"value": d.id, "label": d.title} for d in dashboards[:8]],
+                    }
+                ],
+                "parsed": {"mode": "edit"},
+            }
+
+        enforce_permission(db, user, "dashboard", target_dash.id, "edit")
+        widgets = db.query(Widget).filter(Widget.dashboard_id == target_dash.id).all()
+
+        # Check explicit target widget or dashboard-level scope
+        target_scope: Optional[str] = clarifications.get("target_widget_id") or widget_id
+        target_widget: Optional[Widget] = None
+
+        if target_scope and target_scope != "__dashboard__":
+            target_widget = next((w for w in widgets if w.id == target_scope), None)
+
+        if not target_widget and target_scope != "__dashboard__":
+            # Match widget by title or ordinal or chart type
+            for w in widgets:
+                if w.title.lower() in combined_low:
+                    target_widget = w
+                    break
+            if not target_widget and widgets:
+                if any(k in combined_low for k in ("اول", "نخست")):
+                    target_widget = widgets[0]
+                elif "دوم" in combined_low and len(widgets) >= 2:
+                    target_widget = widgets[1]
+                elif "سوم" in combined_low and len(widgets) >= 3:
+                    target_widget = widgets[2]
+                elif "آخر" in combined_low:
+                    target_widget = widgets[-1]
+
+        # Check if request clearly refers to dashboard-level settings (theme, dashboard title, adding filter)
+        is_dash_level_intent = target_scope == "__dashboard__" or (
+            not target_widget
+            and (
+                any(k in combined_low for k in ("تم داشبورد", "تم ", "ظاهر داشبورد", "ظاهرش", "رنگ داشبورد", "قالب داشبورد", "تیره کن", "روشن کن", "شیشه ای کن"))
+                or any(k in combined_low for k in ("عنوان داشبورد", "اسم داشبورد", "نام داشبورد"))
+                or ("فیلتر" in combined_low and any(k in combined_low for k in ("اضافه", "بذار", "قرار بده")))
+            )
+        )
+
+        if is_dash_level_intent:
+            # 1) Theme change
+            resolved_theme = None
+            if clarifications.get("theme_id"):
+                resolved_theme = db.query(DashboardTheme).filter(DashboardTheme.id == clarifications["theme_id"]).first()
+            if not resolved_theme:
+                resolved_theme = AiAnalyticsEngine._resolve_theme_from_text(db, user.organization_id, combined_low)
+
+            if resolved_theme:
+                target_dash.theme_id = resolved_theme.id
+                db.commit()
+                return {
+                    "status": "dashboard_updated",
+                    "action": "edit_dashboard",
+                    "message_fa": f"ظاهر داشبورد «{target_dash.title}» با موفقیت به «{resolved_theme.name}» تغییر یافت.",
+                    "updated_dashboard": {
+                        "id": target_dash.id,
+                        "title": target_dash.title,
+                        "theme_id": resolved_theme.id,
+                        "theme_name": resolved_theme.name,
+                    },
+                }
+
+            # 2) Dashboard title change
+            m_dtitle = re.search(
+                r"(?:عنوان\s+داشبورد|اسم\s+داشبورد|نام\s+داشبورد|عنوانش|اسمش|نامش)\s*(?:را|رو)?\s*(?:تغییر\s+بده\s+به|عوض\s+کن\s+به|تغییر\s+بده|عوض\s+کن|بگذار|بذار|بکن|به)\s*[\"«']?([^\"»'\n]+?)[\"»']?(?=\s*$)",
+                combined_text,
+                flags=re.IGNORECASE,
+            )
+            new_dtitle = clarifications.get("new_title") or (m_dtitle.group(1).strip(" ،,.«»\"'") if m_dtitle else None)
+            if new_dtitle and len(new_dtitle) >= 2 and not any(k in new_dtitle for k in ("عوض کن", "تغییر بده")):
+                target_dash.title = new_dtitle
+                db.commit()
+                return {
+                    "status": "dashboard_updated",
+                    "action": "edit_dashboard",
+                    "message_fa": f"نام داشبورد با موفقیت به «{new_dtitle}» تغییر یافت.",
+                    "updated_dashboard": {"id": target_dash.id, "title": target_dash.title, "theme_id": target_dash.theme_id},
+                }
+
+            # 3) Add dashboard filter
+            if "فیلتر" in combined_low:
+                ds_candidates = db.query(Dataset).filter(Dataset.organization_id == user.organization_id).all()
+                matched_col = None
+                matched_ds = None
+                for w in widgets:
+                    if w.dataset_id:
+                        d_obj = next((x for x in ds_candidates if x.id == w.dataset_id), None)
+                        if d_obj:
+                            cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d_obj)
+                            col = AiAnalyticsEngine._match_column(combined_low, cinfo, role_filter="dim")
+                            if col:
+                                matched_col = col
+                                matched_ds = d_obj
+                                break
+                if matched_col and matched_ds:
+                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, matched_ds)
+                    lbl = next((c["label"] for c in cinfo if c["name"] == matched_col), matched_col)
+                    db.add(
+                        DashboardFilter(
+                            dashboard_id=target_dash.id,
+                            name=lbl,
+                            field_name=matched_col,
+                            dataset_id=matched_ds.id,
+                            filter_type="multi_select",
+                            operator="in",
+                            scope="dashboard",
+                            default_value_json=[],
+                        )
+                    )
+                    db.commit()
+                    return {
+                        "status": "dashboard_updated",
+                        "action": "edit_dashboard",
+                        "message_fa": f"فیلتر «{lbl}» به داشبورد «{target_dash.title}» اضافه شد.",
+                        "updated_dashboard": {"id": target_dash.id, "title": target_dash.title, "theme_id": target_dash.theme_id},
+                    }
+
+            # Ask which dashboard-level setting to change
+            themes = db.query(DashboardTheme).filter(DashboardTheme.organization_id == user.organization_id).all()
+            return {
+                "status": "needs_clarification",
+                "action": "edit",
+                "message_fa": f"چه تغییری روی تنظیمات کلی داشبورد «{target_dash.title}» انجام شود؟",
+                "questions": [
+                    {
+                        "key": "theme_id",
+                        "question": "می‌توانید یکی از ظاهرهای زیر را انتخاب کنید یا نام جدید داشبورد را بنویسید:",
+                        "options": [{"value": th.id, "label": f"تغییر ظاهر به: {th.name}"} for th in themes[:5]],
+                    }
+                ],
+                "parsed": {"mode": "edit", "dashboard_id": target_dash.id, "target_widget_id": "__dashboard__"},
+            }
+
+        # Widget-level edit: if widget is not yet identified
+        if not target_widget:
+            opts = [{"value": "__dashboard__", "label": "تغییر کلی داشبورد (نام، رنگ/تم، یا فیلتر)"}]
+            for w in widgets[:9]:
+                ct_fa = AiAnalyticsEngine.CHART_LABELS_FA.get(w.chart_type, w.chart_type)
+                opts.append({"value": w.id, "label": f"{w.title}", "hint": ct_fa})
+            return {
+                "status": "needs_clarification",
+                "action": "edit",
+                "message_fa": f"در داشبورد «{target_dash.title}»، کدام بخش یا نمودار را می‌خواهید تغییر دهید؟",
+                "questions": [
+                    {
+                        "key": "target_widget_id",
+                        "question": "مورد نظر را انتخاب کنید:",
+                        "options": opts,
+                    }
+                ],
+                "parsed": {"mode": "edit", "dashboard_id": target_dash.id},
+            }
+
+        # We have target_widget! Check what modification the user asked for.
+        edit_action = clarifications.get("edit_action")
+        new_chart_type = clarifications.get("chart_type") or AiAnalyticsEngine._extract_chart_type(combined_low)
+        if isinstance(edit_action, str) and edit_action.startswith("chart:"):
+            new_chart_type = edit_action.split(":", 1)[1]
+
+        is_delete = edit_action == "delete" or any(k in combined_low for k in ("حذف", "پاک کن", "بردار", "delete", "remove"))
+        if is_delete:
+            enforce_permission(db, user, "dashboard", target_dash.id, "delete_widget")
+            w_title = target_widget.title
+            w_id = target_widget.id
+            db.delete(target_widget)
+            db.commit()
+            return {
+                "status": "widget_deleted",
+                "action": "delete_widget",
+                "message_fa": f"نمودار «{w_title}» با موفقیت از داشبورد حذف شد.",
+                "deleted_widget_id": w_id,
+                "dashboard_id": target_dash.id,
+            }
+
+        # Extract new widget title if requested
+        new_w_title: Optional[str] = clarifications.get("new_title")
+        if not new_w_title:
+            m_wt = re.search(
+                r"(?:عنوان|اسم|نام)ش?\s*(?:ویجت|نمودار|کارت)?\s*(?:را|رو)?\s*(?:تغییر\s+بده\s+به|عوض\s+کن\s+به|تغییر\s+بده|عوض\s+کن|بگذار|بذار|بکن|به)\s*[\"«']?([^\"»'\n]+?)[\"»']?(?=\s*(?:و\s+(?:نوعش|تبدیل)|$))",
+                combined_text,
+                flags=re.IGNORECASE,
+            )
+            if m_wt:
+                cand_t = m_wt.group(1).strip(" ،,.«»\"'")
+                if len(cand_t) >= 2 and not any(k in cand_t for k in ("عوض کن", "تغییر بده", "نمودار را")):
+                    new_w_title = cand_t
+
+        # Extract updated dimension or measure if mentioned
+        wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == target_widget.id).first()
+        ds_obj = db.query(Dataset).filter(Dataset.id == target_widget.dataset_id).first() if target_widget.dataset_id else None
+        new_x: Optional[str] = None
+        new_y: Optional[str] = None
+        new_agg: Optional[str] = None
+        if ds_obj:
+            cinfo, num_cols, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj)
+            m_dim = re.search(
+                r"(?:بر\s+اساس|به\s+تفکیک|بر\s+حسب|روی\s+محور)\s+[\"«']?([^\"»'\n]+?)[\"»']?(?=\s*(?:نشان|نمایش|تبدیل|کن|بده|$))",
+                combined_text,
+                flags=re.IGNORECASE,
+            )
+            if m_dim:
+                new_x = AiAnalyticsEngine._match_column(m_dim.group(1), cinfo, role_filter="dim")
+            # Check if user mentioned a specific new metric in reply
+            measure_hit = AiAnalyticsEngine._match_column(combined_low, cinfo, role_filter="measure")
+            if measure_hit and measure_hit != (wq.visual_spec_json or {}).get("y_field"):
+                new_y = measure_hit
+                if any(k in combined_low for k in ("میانگین", "avg")) or any(k in measure_hit.lower() for k in ("score", "pct", "rate")):
+                    new_agg = "AVG"
+                elif any(k in combined_low for k in ("تعداد رکورد", "شمارش", "count")):
+                    new_agg = "COUNT"
+                    new_y = "*"
+                else:
+                    new_agg = "SUM"
+
+        has_any_change = bool(new_chart_type or new_w_title or new_x or new_y)
+        if not has_any_change:
+            return {
+                "status": "needs_clarification",
+                "action": "edit",
+                "message_fa": f"چه تغییری می‌خواهید روی «{target_widget.title}» انجام شود؟",
+                "questions": [
+                    {
+                        "key": "edit_action",
+                        "question": "می‌توانید یکی از گزینه‌ها را بزنید یا تغییر دلخواه خود را به فارسی تایپ کنید (مثلاً: عنوانش را بگذار آمار جدید):",
+                        "options": [
+                            {"value": "chart:bar", "label": "تبدیل به نمودار میله‌ای"},
+                            {"value": "chart:line", "label": "تبدیل به نمودار خطی (روندی)"},
+                            {"value": "chart:pie", "label": "تبدیل به نمودار دایره‌ای"},
+                            {"value": "chart:table", "label": "نمایش به صورت جدول"},
+                            {"value": "chart:kpi", "label": "نمایش به شکل کارت عدد خلاصه"},
+                            {"value": "delete", "label": "حذف این نمودار از داشبورد"},
+                        ],
+                    }
+                ],
+                "parsed": {
+                    "mode": "edit",
+                    "dashboard_id": target_dash.id,
+                    "target_widget_id": target_widget.id,
+                },
+            }
+
+        # Apply widget edits
+        if new_chart_type:
+            target_widget.chart_type = new_chart_type
+        if new_w_title:
+            target_widget.title = new_w_title
+
+        visual_spec = dict((wq.visual_spec_json or {}) if wq else {})
+        if new_x:
+            visual_spec["x_field"] = new_x
+        if new_y:
+            visual_spec["y_field"] = new_y
+        if new_agg:
+            visual_spec["aggregation"] = new_agg
+        if wq:
+            wq.visual_spec_json = visual_spec
+
+        db.commit()
+
+        preview_data = None
+        generated_sql = None
+        if ds_obj and visual_spec:
+            sec_ctx = build_data_security_context(db, user, ds_obj.id)
+            generated_sql, params, _ = build_visual_query_sql(
+                db, ds_obj, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params
+            )
+            raw_prev = warehouse.execute_query(generated_sql, params)
+            vis_cols, vis_rows = apply_cls_and_masking(raw_prev["columns"], raw_prev["rows"], sec_ctx)
+            preview_data = {"columns": vis_cols, "rows": vis_rows, "row_count": len(vis_rows)}
+
+        ct_fa = AiAnalyticsEngine.CHART_LABELS_FA.get(target_widget.chart_type, target_widget.chart_type)
+        return {
+            "status": "widget_updated",
+            "action": "edit_widget",
+            "message_fa": f"«{target_widget.title}» با موفقیت به‌روزرسانی شد ({ct_fa}).",
+            "widget": {
+                "id": target_widget.id,
+                "dashboard_id": target_dash.id,
+                "page_id": target_widget.page_id,
+                "title": target_widget.title,
+                "chart_type": target_widget.chart_type,
+                "dataset_id": target_widget.dataset_id,
+                "visual_spec": visual_spec,
+            },
+            "widget_spec": {
+                "title": target_widget.title,
+                "chart_type": target_widget.chart_type,
+                "visual_spec": visual_spec,
+                "style": {},
+                "visualization": {"show_legend": True, "show_tooltip": True},
+            },
+            "generated_sql": generated_sql,
+            "preview_data": preview_data,
+        }
+
+    @staticmethod
+    def handle_conversational_request(
+        db: Session,
+        user: User,
+        prompt: str,
+        dashboard_id: Optional[str] = None,
+        page_id: Optional[str] = None,
+        widget_id: Optional[str] = None,
+        mode: Optional[str] = None,
+        clarifications: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        clar = dict(clarifications or {})
+        eff_mode = clar.get("mode") or (mode if mode and mode != "auto" else None)
+        norm_low = AiAnalyticsEngine._normalize_text(prompt).lower()
+
+        if not eff_mode:
+            is_edit_kw = any(
+                k in norm_low
+                for k in (
+                    "ویرایش",
+                    "تغییر",
+                    "عوض کن",
+                    "تبدیل کن",
+                    "تبدیل به",
+                    "بکن ",
+                    "حذف",
+                    "پاک کن",
+                    "بردار",
+                    "اسمش رو",
+                    "تم داشبورد",
+                    "ظاهر داشبورد",
+                    "رنگ داشبورد",
+                    "فیلتر",
+                    "تیره کن",
+                    "روشن کن",
+                )
+            )
+            has_dash_word = any(k in norm_low for k in ("داشبورد", "dashboard", "صفحه گزارش"))
+            has_widget_word = any(k in norm_low for k in ("ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget"))
+
+            if widget_id or is_edit_kw:
+                eff_mode = "edit"
+            elif has_dash_word and not has_widget_word:
+                eff_mode = "create_dashboard"
+            elif has_widget_word or any(k in norm_low for k in ("از روی منبع", "بر اساس", "به تفکیک")):
+                eff_mode = "add_widget"
+
+        if not eff_mode:
+            return {
+                "status": "needs_clarification",
+                "action": "choose_mode",
+                "message_fa": "خوش آمدید! می‌خواهید با هم چه کاری انجام دهیم؟",
+                "questions": [
+                    {
+                        "key": "mode",
+                        "question": "یکی از کارهای زیر را انتخاب کنید:",
+                        "options": [
+                            {"value": "create_dashboard", "label": "ساخت یک داشبورد کامل جدید", "hint": "با چند نمودار و کارت خلاصه آماده"},
+                            {"value": "add_widget", "label": "افزودن یک نمودار یا عدد آماری جدید", "hint": "به داشبورد فعلی یا دلخواه"},
+                            {"value": "edit", "label": "ویرایش داشبورد یا نمودارهای موجود", "hint": "تغییر رنگ/ظاهر، نام، نوع نمودار یا حذف"},
+                        ],
+                    }
+                ],
+                "parsed": {},
+            }
+
+        if eff_mode == "create_dashboard":
+            return AiAnalyticsEngine._handle_create_dashboard_chat(db, user, prompt, clar)
+        if eff_mode == "edit":
+            return AiAnalyticsEngine._handle_edit_chat(db, user, prompt, dashboard_id, widget_id, clar)
+
+        # Default: add_widget
+        return AiAnalyticsEngine.plan_or_create_widget_from_text(
+            db=db,
+            user=user,
+            prompt=prompt,
+            dashboard_id=dashboard_id,
+            page_id=page_id,
+            dataset_id=clar.get("dataset_id"),
+            clarifications=clar,
+            create_widget=True,
+        )
+
 

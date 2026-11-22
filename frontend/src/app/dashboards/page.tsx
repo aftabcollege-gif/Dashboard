@@ -1,29 +1,37 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, Bot, FolderKanban, Plus, Trash2 } from "lucide-react";
+import { ArrowRight, Bot, FolderKanban, Plus, Trash2, Wand2 } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { PersianAssistantPanel } from "@/components/ai/PersianAssistantPanel";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
+import { deleteDemoCreatedDashboard, mergeDemoDashboardList } from "@/lib/demoStore";
 
 export default function DashboardsListPage() {
-  const { user, locale, showToast } = useBi();
+  const { user, locale, showToast, authStatus } = useBi();
   const isFa = locale === "fa";
   const [dashboards, setDashboards] = useState<any[]>([]);
   const [datasets, setDatasets] = useState<any[]>([]);
   const [showCreate, setShowCreate] = useState(false);
+  const [showAssistant, setShowAssistant] = useState(true);
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
 
-  const load = () => {
-    apiFetch("/dashboards").then(setDashboards).catch(() => {});
-    apiFetch("/datasets").then(setDatasets).catch(() => {});
-  };
+  const load = useCallback(() => {
+    apiFetch<any[]>("/dashboards")
+      .then((list) => {
+        const merged = authStatus?.environment === "vercel-preview-demo" ? mergeDemoDashboardList(list) : list;
+        setDashboards(merged);
+      })
+      .catch(() => {});
+    apiFetch<any[]>("/datasets").then(setDatasets).catch(() => {});
+  }, [authStatus?.environment]);
 
   useEffect(() => {
     if (user) load();
-  }, [user]);
+  }, [user, load]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -41,7 +49,8 @@ export default function DashboardsListPage() {
   const handleDelete = async (id: string) => {
     try {
       await apiFetch(`/dashboards/${id}`, { method: "DELETE" });
-      showToast("Dashboard deleted");
+      deleteDemoCreatedDashboard(id);
+      showToast(isFa ? "داشبورد حذف شد" : "Dashboard deleted");
       load();
     } catch (err: any) {
       showToast(err.message);
@@ -71,11 +80,19 @@ export default function DashboardsListPage() {
             </h1>
             <p className="text-xs mt-1" style={{ color: "var(--bi-muted)" }}>
               {isFa
-                ? "تنها داشبوردهای مجاز بر اساس سیاست دسترسی RBAC نمایش داده می‌شوند."
-                : "Only dashboards permitted by your RBAC & Resource Permission policy appear here."}
+                ? "می‌توانید با دستیار فارسی داشبورد جدید بسازید یا داشبوردهای موجود را ویرایش کنید."
+                : "Create or edit dashboards effortlessly with the Persian assistant or manage existing workspaces."}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowAssistant((s) => !s)}
+              className="px-3.5 py-2 rounded-lg text-xs font-semibold text-white bg-violet-600 hover:bg-violet-700 flex items-center gap-1.5"
+            >
+              <Wand2 className="w-4 h-4" />
+              {showAssistant ? "بستن دستیار فارسی" : "ساخت و ویرایش با دستیار فارسی"}
+            </button>
             <Link
               href="/reports"
               className="px-3.5 py-2 rounded-lg border text-xs font-semibold flex items-center gap-1.5"
@@ -88,10 +105,17 @@ export default function DashboardsListPage() {
               className="px-4 py-2 rounded-lg text-xs font-semibold text-white flex items-center gap-1.5"
               style={{ background: "var(--bi-primary)" }}
             >
-              <Plus className="w-4 h-4" /> {isFa ? "داشبورد جدید" : "New Dashboard"}
+              <Plus className="w-4 h-4" /> {isFa ? "ساخت دستی داشبورد" : "New Dashboard"}
             </button>
           </div>
         </div>
+
+        {showAssistant && (
+          <PersianAssistantPanel
+            initialMode="create_dashboard"
+            onApplied={() => load()}
+          />
+        )}
 
         {showCreate && (
           <form onSubmit={handleCreate} className="bi-card p-4 sm:p-5 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
@@ -150,7 +174,7 @@ export default function DashboardsListPage() {
         {datasets.length > 0 && (
           <div className="bi-card p-5 space-y-3">
             <div className="flex items-center gap-2 text-sm font-bold">
-              <Bot className="w-4 h-4 text-violet-500" /> Generate AI Dashboard from Dataset
+              <Bot className="w-4 h-4 text-violet-500" /> {isFa ? "ساخت سریع ۱-کلیکی داشبورد از منبع داده" : "Generate AI Dashboard from Dataset"}
             </div>
             <div className="flex flex-wrap gap-2">
               {datasets.map((ds) => (
@@ -160,7 +184,7 @@ export default function DashboardsListPage() {
                   className="px-3 py-1.5 rounded-lg border text-xs font-semibold hover:bg-violet-500/10"
                   style={{ borderColor: "var(--bi-border)" }}
                 >
-                  + AI Dashboard from &ldquo;{ds.name}&rdquo;
+                  + {ds.name}
                 </button>
               ))}
             </div>

@@ -26,15 +26,23 @@ import {
   Sparkles,
   Trash2,
   Undo2,
+  Wand2,
   X,
 } from "lucide-react";
 import Link from "next/link";
 import WidgetRenderer from "@/components/charts/WidgetRenderer";
 import GlobalFilterBar from "@/components/dashboard/GlobalFilterBar";
 import PropertiesPanel from "@/components/dashboard/PropertiesPanel";
+import { PersianAssistantPanel } from "@/components/ai/PersianAssistantPanel";
 import { apiDownload, apiFetch } from "@/lib/api";
 import { CHART_REGISTRY } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
+import {
+  applyDemoDashboardOverrides,
+  getDemoCreatedDashboards,
+  markDemoWidgetDeleted,
+  mergeDemoDashboardList,
+} from "@/lib/demoStore";
 import {
   BiTheme,
   DashboardDetail,
@@ -103,12 +111,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
 
   // AI Drawer State
   const [aiTab, setAiTab] = useState<"builder" | "nlq">("builder");
-  const [twPrompt, setTwPrompt] = useState("");
-  const [twClarifications, setTwClarifications] = useState<Record<string, any>>({});
-  const [twAnswerDraft, setTwAnswerDraft] = useState("");
-  const [twResponse, setTwResponse] = useState<any>(null);
-  const [twHistory, setTwHistory] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
-  const [twLoading, setTwLoading] = useState(false);
+  const [assistantEditWidgetId, setAssistantEditWidgetId] = useState<string | null>(null);
+  const [assistantMode, setAssistantMode] = useState<"auto" | "create_dashboard" | "add_widget" | "edit">("auto");
   const [nlqQuestion, setNlqQuestion] = useState("");
   const [nlqResult, setNlqResult] = useState<any>(null);
   const [aiInsights, setAiInsights] = useState<any>(null);
@@ -122,41 +126,25 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
 
   const loadDashboard = useCallback(async () => {
     try {
+      const localCreated = getDemoCreatedDashboards().find((x) => x.id === dashboardId) || null;
       const [d, dsList, savedState, dashList] = await Promise.all([
-        apiFetch<DashboardDetail>(`/dashboards/${dashboardId}`),
+        localCreated
+          ? Promise.resolve(localCreated)
+          : apiFetch<DashboardDetail>(`/dashboards/${dashboardId}`).catch((e) => {
+              const fallback = getDemoCreatedDashboards().find((x) => x.id === dashboardId);
+              if (fallback) return fallback;
+              throw e;
+            }),
         apiFetch<DatasetInfo[]>("/datasets").catch(() => []),
         apiFetch<any>(`/dashboards/${dashboardId}/state`).catch(() => null),
         apiFetch<any[]>("/dashboards").catch(() => []),
       ]);
-      setAllDashboards(dashList || []);
-      let resolvedDash = d;
-      if (typeof window !== "undefined" && authStatus?.environment === "vercel-preview-demo") {
-        const storedThemeId = localStorage.getItem(`bi_demo_theme_${dashboardId}`);
-        const overrideTh = storedThemeId ? themes.find((x) => x.id === storedThemeId) : null;
-        if (overrideTh) {
-          resolvedDash = {
-            ...d,
-            theme_id: overrideTh.id,
-            theme: overrideTh,
-          };
-        }
-        try {
-          const rawCustom = localStorage.getItem(`bi_demo_custom_widgets_${dashboardId}`);
-          const customWidgets: DashboardWidget[] = rawCustom ? JSON.parse(rawCustom) : [];
-          if (customWidgets.length > 0) {
-            const existingIds = new Set((resolvedDash.widgets || []).map((w) => w.id));
-            resolvedDash = {
-              ...resolvedDash,
-              widgets: [
-                ...(resolvedDash.widgets || []),
-                ...customWidgets.filter((cw) => !existingIds.has(cw.id)),
-              ],
-            };
-          }
-        } catch {
-          // ignore malformed localStorage
-        }
-      }
+      const mergedList = authStatus?.environment === "vercel-preview-demo" ? mergeDemoDashboardList(dashList || []) : (dashList || []);
+      setAllDashboards(mergedList);
+      const resolvedDash =
+        typeof window !== "undefined" && authStatus?.environment === "vercel-preview-demo"
+          ? applyDemoDashboardOverrides(d, themes)
+          : d;
       setDash(resolvedDash);
       setDatasets(dsList);
       if (resolvedDash.theme) {
@@ -242,7 +230,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             drill_states: drillStates,
             use_cache: useCache,
           }),
-        });
+        }).catch(() => ({ widgets: {}, load_ms: 1 }));
         const mergedWidgets: Record<string, any> = { ...(res.widgets || {}) };
         const missingCustom = pageWidgets.filter(
           (w) => !(w.id in mergedWidgets) && w.dataset_id && w.query?.visual_spec
@@ -568,15 +556,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       await apiFetch(`/dashboards/widgets/${wId}`, { method: "DELETE" });
       if (selectedWidgetId === wId) setSelectedWidgetId(null);
       if (dash && typeof window !== "undefined" && authStatus?.environment === "vercel-preview-demo") {
-        try {
-          const rawCustom = localStorage.getItem(`bi_demo_custom_widgets_${dash.id}`);
-          const list: DashboardWidget[] = rawCustom ? JSON.parse(rawCustom) : [];
-          const next = list.filter((x) => x.id !== wId);
-          localStorage.setItem(`bi_demo_custom_widgets_${dash.id}`, JSON.stringify(next));
-          setDash((prev) => (prev ? { ...prev, widgets: prev.widgets.filter((x) => x.id !== wId) } : prev));
-        } catch {
-          // ignore
-        }
+        markDemoWidgetDeleted(dash.id, wId);
+        setDash((prev) => (prev ? { ...prev, widgets: prev.widgets.filter((x) => x.id !== wId) } : prev));
       } else {
         loadDashboard();
       }
@@ -600,96 +581,6 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     } catch (err: any) {
       showToast(err.message);
     }
-  };
-
-  const submitTextToWidget = async (
-    overridePrompt?: string,
-    overrideClar?: Record<string, any>,
-    userMessageForLog?: string
-  ) => {
-    if (!dash) return;
-    const activePrompt = (overridePrompt !== undefined ? overridePrompt : twPrompt).trim();
-    const activeClar = overrideClar !== undefined ? overrideClar : twClarifications;
-    if (!activePrompt) return;
-
-    if (userMessageForLog || overridePrompt !== undefined) {
-      const msg = userMessageForLog || activePrompt;
-      setTwHistory((prev) => [...prev, { role: "user", text: msg }]);
-    }
-
-    setTwLoading(true);
-    try {
-      const res = await apiFetch<any>("/ai/text-to-widget", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt: activePrompt,
-          dashboard_id: dash.id,
-          page_id: activePageId,
-          clarifications: activeClar,
-          create_widget: Boolean(dash.permissions.add_widget),
-        }),
-      });
-      setTwResponse(res);
-      if (res.parsed) {
-        setTwClarifications((prev) => ({
-          ...prev,
-          ...(res.parsed.dataset_id ? { dataset_id: res.parsed.dataset_id } : {}),
-          ...(res.parsed.chart_type ? { chart_type: res.parsed.chart_type } : {}),
-          ...(res.parsed.x_field ? { x_field: res.parsed.x_field } : {}),
-          ...(res.parsed.y_field ? { y_field: res.parsed.y_field } : {}),
-          ...(res.parsed.aggregation ? { aggregation: res.parsed.aggregation } : {}),
-          ...(res.parsed.title ? { title: res.parsed.title } : {}),
-        }));
-      }
-      if (res.message_fa) {
-        setTwHistory((prev) => [...prev, { role: "assistant", text: res.message_fa }]);
-      }
-
-      if (res.status === "created" || res.status === "ready") {
-        if (res.widget) {
-          if (authStatus?.environment === "vercel-preview-demo") {
-            try {
-              const rawCustom = localStorage.getItem(`bi_demo_custom_widgets_${dash.id}`);
-              const list: DashboardWidget[] = rawCustom ? JSON.parse(rawCustom) : [];
-              localStorage.setItem(`bi_demo_custom_widgets_${dash.id}`, JSON.stringify([...list, res.widget]));
-            } catch {
-              // ignore
-            }
-            setDash((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    widgets: prev.widgets.some((x) => x.id === res.widget.id)
-                      ? prev.widgets
-                      : [...prev.widgets, res.widget],
-                  }
-                : prev
-            );
-            if (res.preview_data) {
-              setWidgetData((prev) => ({
-                ...prev,
-                [res.widget.id]: { ...res.preview_data, effective_chart_type: res.widget.chart_type },
-              }));
-            }
-          } else {
-            await loadDashboard();
-          }
-          showToast(res.message_fa || (locale === "fa" ? "ویجت جدید به داشبورد اضافه شد" : "Widget added to dashboard"));
-        }
-      }
-    } catch (err: any) {
-      showToast(err.message);
-    } finally {
-      setTwLoading(false);
-    }
-  };
-
-  const resetTextToWidget = () => {
-    setTwPrompt("");
-    setTwClarifications({});
-    setTwAnswerDraft("");
-    setTwResponse(null);
-    setTwHistory([]);
   };
 
   const handleNlq = async (e: React.FormEvent) => {
@@ -1016,6 +907,22 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                 {locale === "fa" ? "جزئیات" : "Details →"}
               </button>
             )}
+            {dash.permissions.edit && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setAssistantEditWidgetId(w.id);
+                  setAssistantMode("edit");
+                  setAiTab("builder");
+                  setShowAiDrawer(true);
+                }}
+                className="p-1.5 sm:p-1 rounded text-violet-500 hover:bg-violet-500/10"
+                title={locale === "fa" ? "ویرایش این نمودار با دستیار فارسی" : "Edit with Persian AI Assistant"}
+              >
+                <Wand2 className="w-3.5 h-3.5" />
+              </button>
+            )}
             <button
               onClick={(e) => {
                 e.stopPropagation();
@@ -1222,13 +1129,15 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           </button>
           <button
             onClick={() => {
+              setAssistantEditWidgetId(null);
+              setAssistantMode("auto");
               setAiTab("builder");
               setShowAiDrawer((s) => !s);
             }}
             className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1 text-violet-500"
             style={{ borderColor: "var(--bi-border)" }}
           >
-            <Bot className="w-3.5 h-3.5" /> {locale === "fa" ? "ساخت ویجت با متن / AI" : "AI / Text KPI"}
+            <Wand2 className="w-3.5 h-3.5" /> {locale === "fa" ? "دستیار فارسی ساخت و ویرایش" : "Persian AI Assistant"}
           </button>
           <button onClick={openVersions} className="p-1.5 rounded-lg border" style={{ borderColor: "var(--bi-border)" }} title={t("versions")}>
             <History className="w-3.5 h-3.5" />
@@ -1422,7 +1331,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               <div className="flex items-center justify-between border-b pb-2" style={{ borderColor: "var(--bi-border)" }}>
                 <div className="flex items-center gap-2 font-bold text-sm">
                   <Sparkles className="w-4 h-4 text-violet-500" />
-                  {locale === "fa" ? "دستیار هوشمند ساخت ویجت و KPI" : "AI KPI & Widget Copilot"}
+                  {locale === "fa" ? "دستیار هوشمند ساخت و ویرایش" : "AI Dashboard & Widget Copilot"}
                 </div>
                 <button onClick={() => setShowAiDrawer(false)} aria-label="Close AI Copilot">
                   <X className="w-4 h-4" />
@@ -1456,216 +1365,26 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               </div>
 
               {aiTab === "builder" ? (
-                <div className="space-y-3 text-xs">
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      setTwClarifications({});
-                      setTwHistory([]);
-                      setTwResponse(null);
-                      submitTextToWidget(twPrompt, {}, twPrompt);
-                    }}
-                    className="space-y-2"
-                  >
-                    <label className="block font-semibold">
-                      {locale === "fa"
-                        ? "ویجت یا KPI مورد نظرتان را به فارسی بنویسید:"
-                        : "Describe the KPI or chart widget to create (FA / EN):"}
-                    </label>
-                    <textarea
-                      dir="auto"
-                      rows={3}
-                      value={twPrompt}
-                      onChange={(e) => setTwPrompt(e.target.value)}
-                      placeholder="مثال: از روی منبع فروش یک ویجت میله‌ای بر اساس منطقه بساز تحت عنوان عملکرد مناطق"
-                      className="w-full px-3 py-2 rounded-lg border text-xs bg-transparent leading-relaxed"
-                      style={{ borderColor: "var(--bi-border)" }}
-                    />
-                    <div className="flex flex-wrap gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setTwPrompt("از روی منبع تعداد یک ویجت میله ای بر اساس نام پیمانکار بساز تحت عنوان عملکرد پیمانکار")
-                        }
-                        className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
-                        style={{ borderColor: "var(--bi-border)" }}
-                      >
-                        مثال نمونه تستی: عملکرد پیمانکار
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setTwPrompt("از روی منبع فروش یک ویجت میله ای از مجموع فروش بر اساس منطقه بساز تحت عنوان عملکرد مناطق")
-                        }
-                        className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
-                        style={{ borderColor: "var(--bi-border)" }}
-                      >
-                        مثال مستقیم: عملکرد مناطق
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setTwPrompt("یک ویجت بساز برای مقایسه وضعیت شعب")
-                        }
-                        className="text-[10px] px-2 py-1 rounded-full border hover:bg-violet-500/10"
-                        style={{ borderColor: "var(--bi-border)" }}
-                      >
-                        مثال رفع ابهام کامل
-                      </button>
-                    </div>
-                    <div className="flex gap-2">
-                      <button
-                        type="submit"
-                        disabled={twLoading || !twPrompt.trim()}
-                        className="flex-1 py-2 rounded-lg text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 disabled:opacity-50"
-                      >
-                        {twLoading
-                          ? locale === "fa"
-                            ? "در حال تحلیل..."
-                            : "Analyzing..."
-                          : locale === "fa"
-                          ? "تولید خودکار ویجت"
-                          : "Build Widget"}
-                      </button>
-                      {(twResponse || twHistory.length > 0) && (
-                        <button
-                          type="button"
-                          onClick={resetTextToWidget}
-                          className="px-2.5 py-2 rounded-lg border text-[11px]"
-                          style={{ borderColor: "var(--bi-border)" }}
-                        >
-                          {locale === "fa" ? "جدید" : "Reset"}
-                        </button>
-                      )}
-                    </div>
-                  </form>
-
-                  {/* Conversational Q&A History */}
-                  {twHistory.length > 0 && (
-                    <div dir="rtl" className="space-y-1.5 max-h-40 overflow-y-auto pt-2 border-t" style={{ borderColor: "var(--bi-border)" }}>
-                      {twHistory.map((item, idx) => (
-                        <div
-                          key={idx}
-                          className={`p-2 rounded-lg text-[11px] leading-relaxed ${
-                            item.role === "user"
-                              ? "bg-blue-500/10 text-blue-600 dark:text-blue-300 ms-4"
-                              : "bg-violet-500/10 me-4"
-                          }`}
-                        >
-                          <span className="font-bold me-1">
-                            {item.role === "user" ? "شما:" : "دستیار:"}
-                          </span>
-                          {item.text}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Ambiguity Resolution Questions in Persian */}
-                  {twResponse?.status === "needs_clarification" && twResponse.questions?.length > 0 && (
-                    <div dir="rtl" className="p-3 rounded-xl border space-y-3 bg-amber-500/5 border-amber-500/30">
-                      <div className="text-[11px] font-bold text-amber-600 dark:text-amber-400">
-                        {twResponse.message_fa}
-                      </div>
-                      {twResponse.questions.map((q: any) => (
-                        <div key={q.key} className="space-y-1.5">
-                          <div className="text-xs font-semibold">{q.question}</div>
-                          <div className="flex flex-wrap gap-1.5">
-                            {(q.options || []).map((opt: any) => {
-                              const selected = twClarifications[q.key] === opt.value;
-                              return (
-                                <button
-                                  key={opt.value}
-                                  type="button"
-                                  disabled={twLoading}
-                                  onClick={() => {
-                                    const nextClar = { ...twClarifications, [q.key]: opt.value };
-                                    setTwClarifications(nextClar);
-                                    const allAnswered = twResponse.questions.every((item: any) => nextClar[item.key]);
-                                    if (allAnswered) {
-                                      submitTextToWidget(twPrompt, nextClar, opt.label);
-                                    }
-                                  }}
-                                  className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-medium transition flex items-center gap-1 ${
-                                    selected ? "bg-violet-600 text-white border-violet-600" : "hover:bg-violet-500/10"
-                                  }`}
-                                  style={{ borderColor: selected ? undefined : "var(--bi-border)" }}
-                                >
-                                  <span>{opt.label}</span>
-                                  {opt.hint && (
-                                    <span className="opacity-70 text-[10px]">({opt.hint})</span>
-                                  )}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      ))}
-
-                      {/* Free-text Persian answer + Continue button */}
-                      <div className="pt-2 border-t space-y-2" style={{ borderColor: "var(--bi-border)" }}>
-                        <input
-                          dir="rtl"
-                          value={twAnswerDraft}
-                          onChange={(e) => setTwAnswerDraft(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" && !e.shiftKey) {
-                              e.preventDefault();
-                              const draft = twAnswerDraft.trim();
-                              const nextClar = draft
-                                ? { ...twClarifications, free_text: `${twClarifications.free_text || ""} ${draft}`.trim() }
-                                : twClarifications;
-                              setTwClarifications(nextClar);
-                              setTwAnswerDraft("");
-                              submitTextToWidget(twPrompt, nextClar, draft || "ادامه با گزینه‌های انتخاب‌شده");
-                            }
-                          }}
-                          placeholder="یا پاسخ خود را به فارسی تایپ کنید..."
-                          className="w-full px-2.5 py-1.5 rounded-lg border text-xs bg-transparent"
-                          style={{ borderColor: "var(--bi-border)" }}
-                        />
-                        <button
-                          type="button"
-                          disabled={twLoading}
-                          onClick={() => {
-                            const draft = twAnswerDraft.trim();
-                            const nextClar = draft
-                              ? { ...twClarifications, free_text: `${twClarifications.free_text || ""} ${draft}`.trim() }
-                              : twClarifications;
-                            setTwClarifications(nextClar);
-                            setTwAnswerDraft("");
-                            submitTextToWidget(twPrompt, nextClar, draft || "ادامه با گزینه‌های انتخاب‌شده");
-                          }}
-                          className="w-full py-1.5 rounded-lg text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-50"
-                        >
-                          {twLoading ? "در حال بررسی..." : "ارسال پاسخ و ادامه ساخت ویجت"}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Success Preview */}
-                  {(twResponse?.status === "created" || twResponse?.status === "ready") && twResponse.preview_data && (
-                    <div dir="rtl" className="space-y-2 p-3 rounded-xl border border-emerald-500/40 bg-emerald-500/5">
-                      <div className="text-xs font-bold text-emerald-600 dark:text-emerald-400">
-                        {twResponse.message_fa}
-                      </div>
-                      <div dir="ltr" className="font-mono text-[10px] p-2 rounded bg-slate-900/80 text-emerald-400 overflow-x-auto">
-                        {twResponse.generated_sql}
-                      </div>
-                      <div className="h-44">
-                        <WidgetRenderer
-                          chartType={twResponse.widget_spec?.chart_type || "bar"}
-                          columns={twResponse.preview_data.columns || []}
-                          rows={twResponse.preview_data.rows || []}
-                          styleConfig={twResponse.widget_spec?.style || {}}
-                          vizConfig={twResponse.widget_spec?.visualization || {}}
-                          visualSpec={twResponse.widget_spec?.visual_spec}
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
+                <PersianAssistantPanel
+                  compact
+                  dashboardId={dash.id}
+                  pageId={activePageId}
+                  initialWidgetId={assistantEditWidgetId}
+                  initialMode={assistantMode}
+                  currentWidgets={dash.widgets}
+                  onApplied={async (res) => {
+                    await loadDashboard();
+                    if (res?.status === "widget_updated" && res.widget && res.preview_data) {
+                      setWidgetData((prev) => ({
+                        ...prev,
+                        [res.widget.id]: {
+                          ...res.preview_data,
+                          effective_chart_type: res.widget.chart_type,
+                        },
+                      }));
+                    }
+                  }}
+                />
               ) : (
                 <>
                   <form onSubmit={handleNlq} className="space-y-2">
