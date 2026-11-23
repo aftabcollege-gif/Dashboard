@@ -2074,7 +2074,10 @@ export async function handleVercelDemoApi(
     return { status: 200, body: demoData.rbac_users || [] };
   }
   if (method === "GET" && path === "/rbac/roles") {
-    return { status: 200, body: demoData.rbac_roles || { roles: [], catalog: {} } };
+    return { status: 200, body: demoData.rbac_roles || { roles: [], catalog: [] } };
+  }
+  if (method === "GET" && path === "/rbac/groups") {
+    return { status: 200, body: demoData.rbac_groups || [] };
   }
   if (method === "GET" && path === "/rbac/permissions/matrix") {
     return { status: 200, body: demoData.rbac_matrix || { rules: [], dashboards: [], widgets: [] } };

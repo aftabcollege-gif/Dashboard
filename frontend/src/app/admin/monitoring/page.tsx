@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
-import { Activity, Cpu, Download, Search, Trash2 } from "lucide-react";
+import React, { useCallback, useEffect, useState } from "react";
+import { Activity, Cpu, Download, Search, ShieldAlert, Trash2 } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
 import { apiDownload, apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
@@ -12,20 +12,47 @@ export default function MonitoringAdminPage() {
   const [perf, setPerf] = useState<any>(null);
   const [search, setSearch] = useState("");
   const [selectedDiff, setSelectedDiff] = useState<any>(null);
+  const [loadErrors, setLoadErrors] = useState<string[]>([]);
 
-  const load = () => {
-    apiFetch(`/monitoring/audit-logs?search=${encodeURIComponent(search)}&limit=100`).then(setAuditLogs).catch(() => {});
-    apiFetch("/monitoring/performance").then(setPerf).catch(() => {});
-  };
+  const load = useCallback(async () => {
+    const errs: string[] = [];
+    const [logsRes, perfRes] = await Promise.allSettled([
+      apiFetch(`/monitoring/audit-logs?search=${encodeURIComponent(search)}&limit=100`),
+      apiFetch("/monitoring/performance"),
+    ]);
+    if (logsRes.status === "fulfilled") {
+      setAuditLogs(Array.isArray(logsRes.value) ? logsRes.value : []);
+    } else {
+      errs.push(`Audit Logs: ${logsRes.reason?.message || "Failed to load"}`);
+    }
+    if (perfRes.status === "fulfilled") {
+      setPerf(perfRes.value || null);
+    } else {
+      errs.push(`Performance Telemetry: ${perfRes.reason?.message || "Failed to load"}`);
+    }
+    setLoadErrors(errs);
+  }, [search]);
 
   useEffect(() => {
     if (user) load();
-  }, [user]);
+  }, [user, load]);
 
   const handleInvalidateCache = async () => {
-    await apiFetch("/monitoring/cache/invalidate", { method: "POST" });
-    showToast("Layer 3 Cache invalidated");
-    load();
+    try {
+      await apiFetch("/monitoring/cache/invalidate", { method: "POST" });
+      showToast("Layer 3 Cache invalidated");
+      await load();
+    } catch (err: any) {
+      showToast(err?.message || "Failed to invalidate cache");
+    }
+  };
+
+  const handleExportAudit = async () => {
+    try {
+      await apiDownload("/monitoring/audit-logs/export", "audit_logs.csv");
+    } catch (err: any) {
+      showToast(err?.message || "Failed to export audit logs");
+    }
   };
 
   return (
@@ -44,11 +71,23 @@ export default function MonitoringAdminPage() {
             <button onClick={handleInvalidateCache} className="px-3 py-2 rounded-lg border text-xs font-semibold flex items-center gap-1" style={{ borderColor: "var(--bi-border)", background: "var(--bi-card)" }}>
               <Trash2 className="w-3.5 h-3.5 text-amber-500" /> Clear Cache
             </button>
-            <button onClick={() => apiDownload("/monitoring/audit-logs/export", "audit_logs.csv")} className="px-3 py-2 rounded-lg text-xs font-semibold text-white flex items-center gap-1" style={{ background: "var(--bi-primary)" }}>
+            <button onClick={handleExportAudit} className="px-3 py-2 rounded-lg text-xs font-semibold text-white flex items-center gap-1" style={{ background: "var(--bi-primary)" }}>
               <Download className="w-3.5 h-3.5" /> Export Audit CSV
             </button>
           </div>
         </div>
+
+        {loadErrors.length > 0 && (
+          <div className="p-3 rounded-xl border border-red-500/40 bg-red-500/10 text-xs space-y-1 text-red-400">
+            <div className="font-bold text-red-500 flex items-center gap-1.5">
+              <ShieldAlert className="w-4 h-4 shrink-0" />
+              Failed to load monitoring data:
+            </div>
+            {loadErrors.map((e, i) => (
+              <div key={i}>{e}</div>
+            ))}
+          </div>
+        )}
 
         {/* Performance Telemetry */}
         {perf && (

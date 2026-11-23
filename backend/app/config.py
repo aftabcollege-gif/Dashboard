@@ -105,6 +105,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_FAIL_CLOSED_PROD: bool = _env_bool("RATE_LIMIT_FAIL_CLOSED_PROD", True)
     RATE_LIMIT_LOGIN_PER_MIN: int = int(os.environ.get("RATE_LIMIT_LOGIN_PER_MIN", "30"))
     RATE_LIMIT_SQL_PER_MIN: int = int(os.environ.get("RATE_LIMIT_SQL_PER_MIN", "120"))
+    RATE_LIMIT_WIDGET_PER_MIN: int = int(os.environ.get("RATE_LIMIT_WIDGET_PER_MIN", "180"))
     RATE_LIMIT_PUBLIC_PER_MIN: int = int(os.environ.get("RATE_LIMIT_PUBLIC_PER_MIN", "240"))
 
     TRUST_PROXY_HEADERS: bool = _env_bool("TRUST_PROXY_HEADERS", False)
@@ -139,6 +140,9 @@ class Settings(BaseSettings):
     # Optional LLM Key for AI enhancements (deterministic BI AI works out of box without it)
     OPENAI_API_KEY: str | None = os.environ.get("OPENAI_API_KEY") or None
 
+    def is_desktop_mode(self) -> bool:
+        return bool(os.environ.get("BI_DESKTOP_CONTROL_TOKEN"))
+
     def get_cors_origins(self) -> list[str]:
         origins = [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip() and o.strip() != "*"]
         if not origins:
@@ -149,8 +153,18 @@ class Settings(BaseSettings):
         Path(self.UPLOADS_DIR).mkdir(parents=True, exist_ok=True)
         Path(self.EXPORTS_DIR).mkdir(parents=True, exist_ok=True)
         Path(self.WAREHOUSE_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+        def _looks_like_placeholder(val: str) -> bool:
+            low = (val or "").strip().lower()
+            return any(p in low for p in ("replace_with", "changeme", "change-in-prod", "dev-only", "example"))
+
         if self.ENVIRONMENT == "production" or self.BI_REQUIRE_GENERATED_SECRETS:
-            if not self.JWT_SECRET_KEY or self.JWT_SECRET_KEY == DEV_JWT_FALLBACK or len(self.JWT_SECRET_KEY) < 32:
+            if (
+                not self.JWT_SECRET_KEY
+                or self.JWT_SECRET_KEY == DEV_JWT_FALLBACK
+                or len(self.JWT_SECRET_KEY) < 32
+                or _looks_like_placeholder(self.JWT_SECRET_KEY)
+            ):
                 raise RuntimeError(
                     "Security policy violation: refusing to start with default/weak BI_JWT_SECRET in production."
                 )
@@ -158,9 +172,41 @@ class Settings(BaseSettings):
                 not self.CREDENTIAL_ENCRYPTION_KEY
                 or self.CREDENTIAL_ENCRYPTION_KEY == DEV_CRED_FALLBACK
                 or len(self.CREDENTIAL_ENCRYPTION_KEY) < 32
+                or _looks_like_placeholder(self.CREDENTIAL_ENCRYPTION_KEY)
             ):
                 raise RuntimeError(
                     "Security policy violation: refusing to start with default/weak BI_CRED_KEY in production."
+                )
+
+        if self.ENVIRONMENT == "production":
+            if self.BI_SEED_DEMO_USERS:
+                raise RuntimeError(
+                    "Security policy violation: BI_SEED_DEMO_USERS must be disabled in production."
+                )
+            if not self.RATE_LIMIT_ENABLED:
+                raise RuntimeError(
+                    "Security policy violation: RATE_LIMIT_ENABLED must remain true in production."
+                )
+            if self.AUTO_CREATE_SCHEMA:
+                raise RuntimeError(
+                    "Security policy violation: BI_AUTO_CREATE_SCHEMA must be disabled in production; run Alembic migrations explicitly."
+                )
+            if self.BI_INITIAL_SETUP_TOKEN and (
+                len(self.BI_INITIAL_SETUP_TOKEN.strip()) < 20
+                or _looks_like_placeholder(self.BI_INITIAL_SETUP_TOKEN)
+            ):
+                raise RuntimeError(
+                    "Security policy violation: BI_INITIAL_SETUP_TOKEN is too weak or contains placeholder text."
+                )
+            if self.REDIS_URL and _looks_like_placeholder(self.REDIS_URL):
+                raise RuntimeError(
+                    "Security policy violation: REDIS_URL contains placeholder credentials."
+                )
+            if self.TRUST_PROXY_HEADERS and any(
+                tok.strip() in ("*", "0.0.0.0/0", "::/0") for tok in (self.TRUSTED_PROXY_IPS or "").split(",")
+            ):
+                raise RuntimeError(
+                    "Security policy violation: TRUSTED_PROXY_IPS cannot contain wildcard/all-internet CIDR in production."
                 )
 
 

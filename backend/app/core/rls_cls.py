@@ -207,37 +207,43 @@ def build_public_data_security_context(
 def inspect_dataset_public_safety(db: Session, organization_id: str, dataset) -> tuple[bool, str]:
     """
     Determines whether a dataset is eligible for unauthenticated public dashboard publication.
-    Datasets with explicit restricted/PII flags, sensitive HR/PII prefixes, active CLS/masking
-    policies, or global ('all') RLS policies are blocked unless explicitly opted-in via
-    dataset.profile_json['allow_public_access'] == True.
+    Fails closed on cross-organization datasets, restricted/PII flags, sensitive HR/PII prefixes,
+    ANY active AccessPolicy (RLS, CLS, or masking), or policy-evaluation errors.
     """
-    profile = getattr(dataset, "profile_json", None) or {}
-    if profile.get("allow_public_access") is True:
-        return True, "explicitly_allowed"
+    try:
+        if dataset is None:
+            return False, "Dataset not found"
+        ds_org = getattr(dataset, "organization_id", None)
+        if not ds_org or ds_org != organization_id:
+            return False, "Cross-organization dataset cannot be exposed publicly"
 
-    if profile.get("is_restricted") or profile.get("contains_pii"):
-        return False, f"Dataset '{dataset.name}' is marked restricted/PII-sensitive"
+        profile = getattr(dataset, "profile_json", None) or {}
+        if profile.get("is_restricted") or profile.get("contains_pii"):
+            return False, f"Dataset '{dataset.name}' is marked restricted/PII-sensitive"
 
-    tlow = (getattr(dataset, "warehouse_table", "") or "").lower()
-    if any(k in tlow for k in ("hr_", "payroll", "pii", "secret", "confidential")):
-        return False, f"Dataset '{dataset.name}' contains sensitive HR/PII data"
+        tlow = (getattr(dataset, "warehouse_table", "") or "").lower()
+        if any(k in tlow for k in ("hr_", "payroll", "pii", "secret", "confidential")):
+            return False, f"Dataset '{dataset.name}' contains sensitive HR/PII data"
 
-    policies = (
-        db.query(AccessPolicy)
-        .filter(
-            AccessPolicy.organization_id == organization_id,
-            AccessPolicy.is_active == True,
-            (AccessPolicy.dataset_id == dataset.id) | (AccessPolicy.dataset_id == None),
+        policies = (
+            db.query(AccessPolicy)
+            .filter(
+                AccessPolicy.organization_id == organization_id,
+                AccessPolicy.is_active == True,
+                (AccessPolicy.dataset_id == dataset.id) | (AccessPolicy.dataset_id == None),
+            )
+            .all()
         )
-        .all()
-    )
-    for pol in policies:
-        if pol.policy_type in ("cls", "masking"):
-            return False, f"Dataset '{dataset.name}' has active {pol.policy_type.upper()} security policy '{pol.name}'"
-        if pol.policy_type == "rls" and pol.target_type == "all":
-            return False, f"Dataset '{dataset.name}' has active organization-wide RLS policy '{pol.name}'"
+        for pol in policies:
+            if pol.policy_type in ("cls", "masking", "rls"):
+                return (
+                    False,
+                    f"Dataset '{dataset.name}' has active {pol.policy_type.upper()} security policy '{pol.name}'",
+                )
 
-    return True, "public_safe"
+        return True, "public_safe"
+    except Exception as exc:
+        return False, f"Public safety policy evaluation failed ({type(exc).__name__})"
 
 
 def build_masked_column_sql(col_name: str, strategy: str) -> str:

@@ -267,6 +267,13 @@ CREATE TABLE IF NOT EXISTS audit_logs_default PARTITION OF audit_logs DEFAULT;
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action_time ON audit_logs(action, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_time ON audit_logs(user_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS system_bootstrap_state (
+    id              VARCHAR(32) PRIMARY KEY,
+    completed       BOOLEAN NOT NULL DEFAULT FALSE,
+    bootstrapped_by VARCHAR(64),
+    completed_at    TIMESTAMPTZ
+);
+
 -- =============================================================================
 -- 2. DASHBOARD MANAGEMENT
 -- =============================================================================
@@ -306,6 +313,10 @@ CREATE TABLE IF NOT EXISTS dashboards (
     embed_token         VARCHAR(128) UNIQUE,
     refresh_interval_sec INTEGER NOT NULL DEFAULT 0,
     settings_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    allow_public_restricted BOOLEAN NOT NULL DEFAULT FALSE,
+    public_restricted_reason TEXT,
+    public_restricted_by VARCHAR(64),
+    public_restricted_at TIMESTAMPTZ,
     created_by          VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -625,6 +636,10 @@ CREATE TABLE IF NOT EXISTS etl_pipelines (
     priority            INTEGER NOT NULL DEFAULT 5,
     is_active           BOOLEAN NOT NULL DEFAULT TRUE,
     is_running          BOOLEAN NOT NULL DEFAULT FALSE,
+    fence_token         BIGINT NOT NULL DEFAULT 0,
+    active_worker_id    VARCHAR(128),
+    heartbeat_at        TIMESTAMPTZ,
+    lease_expires_at    TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -670,6 +685,10 @@ CREATE TABLE IF NOT EXISTS etl_job_runs (
     job_id              VARCHAR(64) NOT NULL REFERENCES etl_jobs(id) ON DELETE CASCADE,
     pipeline_id         VARCHAR(64) NOT NULL REFERENCES etl_pipelines(id) ON DELETE CASCADE,
     status              VARCHAR(32) NOT NULL,
+    fence_token         BIGINT NOT NULL DEFAULT 0,
+    worker_id           VARCHAR(128),
+    heartbeat_at        TIMESTAMPTZ,
+    lease_expires_at    TIMESTAMPTZ,
     rows_extracted      BIGINT NOT NULL DEFAULT 0,
     rows_inserted       BIGINT NOT NULL DEFAULT 0,
     rows_updated        BIGINT NOT NULL DEFAULT 0,

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.api.dashboards import _execute_single_widget
-from app.api.deps import enforce_permission, get_client_ip, get_current_user
+from app.api.deps import enforce_permission, enforce_scoped_rate_limit, get_client_ip, get_current_user
 from app.config import settings
 from app.core.audit import record_audit
 from app.core.permissions import permission_resolver
@@ -43,6 +43,16 @@ def export_dashboard(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "export_dash",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN // 2 or 30,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 3,
+    )
     dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
 
     fmt_low = fmt.lower()
@@ -103,6 +113,16 @@ def export_widget(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "export_widget",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN // 2 or 30,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 3,
+    )
     w, dash = get_widget_for_org(db, widget_id, user.organization_id)
     parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
     if not permission_resolver.resolve(db, user, "widget", w.id, "export", parent_chain).allowed:
@@ -160,6 +180,16 @@ def create_scheduled_report(
 def run_scheduled_report_now(
     report_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "run_report",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN // 2 or 30,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 3,
+    )
     sr = get_scheduled_report_for_org(db, report_id, user.organization_id)
     dash = get_dashboard_for_org(db, sr.dashboard_id, user.organization_id)
     enforce_permission(db, user, "dashboard", dash.id, "export", ip_address=get_client_ip(request))

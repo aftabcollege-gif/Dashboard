@@ -1,11 +1,18 @@
+import logging
 import os
 import secrets
 import signal
 import threading
+import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
+from alembic.config import Config as AlembicConfig
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import inspect as sa_inspect
+from fastapi.responses import JSONResponse
+from sqlalchemy import inspect as sa_inspect, text
 from app.api import (
     ai,
     auth,
@@ -26,6 +33,28 @@ from app.engines.scheduler import start_scheduler, stop_scheduler
 from app.engines.warehouse import warehouse
 from app.seed.bootstrap import seed_database
 
+logger = logging.getLogger(__name__)
+
+
+def _verify_production_schema_at_head() -> None:
+    inspector = sa_inspect(engine)
+    if not inspector.has_table("organizations") or not inspector.has_table("alembic_version"):
+        raise RuntimeError(
+            "Database schema is not initialized for production startup. "
+            "Run 'alembic upgrade head' before starting the server."
+        )
+    backend_root = Path(__file__).resolve().parents[1]
+    alembic_cfg = AlembicConfig(str(backend_root / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(backend_root / "alembic"))
+    expected_heads = set(ScriptDirectory.from_config(alembic_cfg).get_heads())
+    with engine.connect() as conn:
+        current_heads = set(MigrationContext.configure(conn).get_current_heads())
+    if not current_heads or current_heads != expected_heads:
+        raise RuntimeError(
+            f"Database schema revision mismatch (current={sorted(current_heads)}, "
+            f"expected={sorted(expected_heads)}). Run 'alembic upgrade head' before starting the server."
+        )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -35,11 +64,12 @@ async def lifespan(app: FastAPI):
     # Production deployments must run `alembic upgrade head` prior to booting workers.
     if settings.AUTO_CREATE_SCHEMA:
         Base.metadata.create_all(bind=engine)
-    elif not sa_inspect(engine).has_table("organizations"):
-        raise RuntimeError(
-            "Database schema is not initialized for production startup. "
-            "Run 'alembic upgrade head' before starting the server."
-        )
+    else:
+        _verify_production_schema_at_head()
+
+    # Verify analytical DuckDB warehouse security lock & readiness before accepting traffic
+    warehouse.check_readiness()
+
     # Seed enterprise roles, themes & (in dev/demo mode) demo accounts + dashboards
     with db_session_scope() as db:
         seed_database(db)
@@ -56,8 +86,28 @@ app = FastAPI(
     title=settings.APP_NAME,
     version="1.0.0",
     description="Enterprise BI & Dynamic Dashboard Builder Platform (Data Engine, RBAC, Active Directory, Automated ETL, Analytical Warehouse & Smart Cache)",
+    docs_url=None if settings.ENVIRONMENT == "production" else "/docs",
+    redoc_url=None if settings.ENVIRONMENT == "production" else "/redoc",
+    openapi_url=None if settings.ENVIRONMENT == "production" else "/openapi.json",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(Exception)
+async def sanitized_unhandled_exception_handler(request: Request, exc: Exception):
+    error_id = uuid.uuid4().hex[:12]
+    logger.exception(
+        "Unhandled server error [%s] on %s %s",
+        error_id,
+        request.method,
+        request.url.path,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error_id": error_id},
+    )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,7 +139,10 @@ async def security_headers_middleware(request: Request, call_next):
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     else:
         response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+        )
 
     if is_https_request(request):
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
@@ -106,11 +159,23 @@ async def security_headers_middleware(request: Request, call_next):
 
 @app.get("/health")
 def health_check():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        warehouse.check_readiness()
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "service": settings.APP_NAME})
     return {"status": "healthy", "service": settings.APP_NAME}
 
 
 @app.get(f"{settings.API_PREFIX}/health")
 def api_health_check():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        warehouse.check_readiness()
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "api_version": "1.0.0"})
     return {"status": "healthy", "api_version": "1.0.0"}
 
 

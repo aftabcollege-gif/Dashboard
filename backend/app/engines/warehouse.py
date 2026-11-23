@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import threading
@@ -7,6 +8,7 @@ import duckdb
 import pandas as pd
 from app.config import settings
 
+logger = logging.getLogger("app.warehouse")
 SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -95,24 +97,77 @@ class AnalyticalWarehouse:
         self._conn = self._open_connection(db_path)
 
     @staticmethod
+    def _verify_connection_security_unlocked(conn: duckdb.DuckDBPyConnection) -> None:
+        ext_row = conn.execute("SELECT current_setting('enable_external_access')").fetchone()
+        if not ext_row or ext_row[0] is not False:
+            raise RuntimeError("DuckDB security verification failed: enable_external_access is not false")
+        lock_row = conn.execute("SELECT current_setting('lock_configuration')").fetchone()
+        if not lock_row or lock_row[0] is not True:
+            raise RuntimeError("DuckDB security verification failed: lock_configuration is not true")
+
+    @staticmethod
     def _open_connection(db_path: str) -> duckdb.DuckDBPyConnection:
         conn = duckdb.connect(db_path)
         try:
             threads = max(1, min(int(settings.DUCKDB_THREADS), 32))
-            conn.execute(f"SET threads = {threads}")
             mem = re.sub(r"[^A-Za-z0-9]", "", str(settings.DUCKDB_MEMORY_LIMIT)) or "1GB"
+
+            # Apply each mandatory hardening directive individually and verify fail-closed
+            conn.execute(f"SET threads = {threads}")
             conn.execute(f"SET memory_limit = '{mem}'")
             # Defense-in-depth: block read_csv/read_parquet/httpfs/filesystem access inside DuckDB engine
             conn.execute("SET enable_external_access = false")
-        except Exception:
-            pass
-        return conn
+            # Lock configuration so SQL cannot re-enable external access on the connection
+            conn.execute("SET lock_configuration = true")
+
+            AnalyticalWarehouse._verify_connection_security_unlocked(conn)
+            return conn
+        except Exception as exc:
+            logger.error("DuckDB connection rejected due to security hardening failure (%s)", type(exc).__name__)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise RuntimeError("DuckDB security configuration failed; connection rejected") from exc
 
     def _ensure_conn_unlocked(self) -> duckdb.DuckDBPyConnection:
         if self._conn is None:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             self._conn = self._open_connection(self.db_path)
+        else:
+            try:
+                self._verify_connection_security_unlocked(self._conn)
+            except Exception as exc:
+                logger.error("Reused DuckDB connection failed security verification (%s)", type(exc).__name__)
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                raise RuntimeError("DuckDB reused connection failed security check; rejected") from exc
         return self._conn
+
+    def check_readiness(self) -> dict[str, Any]:
+        with _WriteGuard(self._rw):
+            conn = self._ensure_conn_unlocked()
+            cur = conn.cursor()
+            try:
+                one = cur.execute("SELECT 1").fetchone()
+                ext = cur.execute("SELECT current_setting('enable_external_access')").fetchone()
+                locked = cur.execute("SELECT current_setting('lock_configuration')").fetchone()
+                threads = cur.execute("SELECT current_setting('threads')").fetchone()
+                mem = cur.execute("SELECT current_setting('memory_limit')").fetchone()
+                if not one or one[0] != 1 or not ext or ext[0] is not False or not locked or locked[0] is not True:
+                    raise RuntimeError("DuckDB readiness check failed security invariants")
+                return {
+                    "ok": True,
+                    "enable_external_access": False,
+                    "lock_configuration": True,
+                    "threads": int(threads[0]) if threads else None,
+                    "memory_limit": str(mem[0]) if mem else None,
+                }
+            finally:
+                cur.close()
 
     def _cursor_for_read(self):
         if self._conn is None:
@@ -186,6 +241,7 @@ class AnalyticalWarehouse:
                 timer.daemon = True
                 timer.start()
                 try:
+                    self._verify_connection_security_unlocked(cur)
                     cur.execute(sql, params or [])
                     desc = cur.description or []
                     cols = [d[0] for d in desc]
@@ -227,6 +283,7 @@ class AnalyticalWarehouse:
         with _ReadGuard(self._rw):
             cur = self._conn.cursor()
             try:
+                self._verify_connection_security_unlocked(cur)
                 cur.execute(f"EXPLAIN {sql}", params or [])
                 rows = cur.fetchmany(200)
                 return "\n".join(str(r[-1]) for r in rows)

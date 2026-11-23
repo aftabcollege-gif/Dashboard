@@ -155,10 +155,21 @@ def main() -> None:
                 print(f"[ok] Services healthy via web_gateway.mjs on {base_url} -> backend :{backend_port}")
 
                 # 3. Verify frontend pages load through gateway
-                for route in ("/", "/dashboards", "/data-sources", "/datasets", "/settings"):
+                for route in (
+                    "/",
+                    "/dashboards",
+                    "/data-sources",
+                    "/datasets",
+                    "/query-builder",
+                    "/etl",
+                    "/reports",
+                    "/admin/security",
+                    "/admin/monitoring",
+                    "/settings",
+                ):
                     resp = client.get(f"{base_url}{route}")
                     assert resp.status_code == 200, f"Frontend route {route} returned {resp.status_code}"
-                print("[ok] All Next.js standalone routes served 200 OK through web_gateway.mjs.")
+                print("[ok] All Next.js standalone routes (including /admin/security) served 200 OK through web_gateway.mjs.")
 
                 # 4. Verify initial setup status & zero default active admin accounts
                 st = client.get(f"{base_url}/api/v1/auth/status").json()
@@ -196,7 +207,7 @@ def main() -> None:
                 )
                 assert weak_pw.status_code == 400
 
-                # Valid initial setup
+                # Valid initial setup using browser cookie mode (matches Windows desktop browser)
                 boot = client.post(
                     f"{base_url}/api/v1/auth/bootstrap-admin",
                     json={
@@ -208,11 +219,14 @@ def main() -> None:
                         "include_sample_data": True,
                         "setup_token": setup_token,
                     },
-                    headers={"X-Auth-Mode": "bearer"},
                 )
                 assert boot.status_code == 200, boot.text
-                token = boot.json()["access_token"]
-                headers = {"Authorization": f"Bearer {token}"}
+                boot_data = boot.json()
+                assert boot_data["auth_mode"] == "cookie"
+                csrf_tok = client.cookies.get("bi_csrf_token") or boot_data.get("csrf_token")
+                assert client.cookies.get("bi_access_token"), "bi_access_token cookie missing over http://127.0.0.1"
+                assert csrf_tok, "bi_csrf_token cookie missing over http://127.0.0.1"
+                csrf_headers = {"X-CSRF-Token": csrf_tok}
 
                 # Second bootstrap attempt MUST be blocked
                 second = client.post(
@@ -228,14 +242,86 @@ def main() -> None:
 
                 st_after = client.get(f"{base_url}/api/v1/auth/status").json()
                 assert st_after["needs_initial_setup"] is False
-                print("[ok] Secure initial admin bootstrap & one-time lock verified.")
+                print("[ok] Secure initial admin bootstrap, HTTP loopback cookies, & one-time lock verified.")
+
+                # 4b. Verify Users & Permission Matrix + Monitoring endpoints via browser cookies & CSRF
+                rbac_users = client.get(f"{base_url}/api/v1/rbac/users")
+                assert rbac_users.status_code == 200, rbac_users.text
+                users_list = rbac_users.json()
+                assert isinstance(users_list, list) and len(users_list) == 1
+                assert "Super Administrator" in users_list[0].get("roles", [])
+
+                rbac_roles = client.get(f"{base_url}/api/v1/rbac/roles")
+                assert rbac_roles.status_code == 200, rbac_roles.text
+                roles_payload = rbac_roles.json()
+                assert isinstance(roles_payload.get("roles"), list) and len(roles_payload["roles"]) >= 10
+                assert isinstance(roles_payload.get("catalog"), list) and len(roles_payload["catalog"]) >= 70
+
+                rbac_groups = client.get(f"{base_url}/api/v1/rbac/groups")
+                assert rbac_groups.status_code == 200, rbac_groups.text
+                assert isinstance(rbac_groups.json(), list)
+
+                rbac_matrix = client.get(f"{base_url}/api/v1/rbac/permissions/matrix")
+                assert rbac_matrix.status_code == 200, rbac_matrix.text
+                matrix_payload = rbac_matrix.json()
+                assert len(matrix_payload.get("dashboards", [])) >= 4
+                assert isinstance(matrix_payload.get("rules"), list)
+
+                assert client.get(f"{base_url}/api/v1/rbac/ad/connections").status_code == 200
+                assert client.get(f"{base_url}/api/v1/rbac/policies").status_code == 200
+                assert client.get(f"{base_url}/api/v1/monitoring/audit-logs").status_code == 200
+                assert client.get(f"{base_url}/api/v1/monitoring/performance").status_code == 200
+
+                # Create local user + toggle & copy permission matrix rules via CSRF cookie auth
+                viewer_role = next(r for r in roles_payload["roles"] if r["slug"] == "report_viewer")
+                designer_role = next(r for r in roles_payload["roles"] if r["slug"] == "dashboard_designer")
+                created_u = client.post(
+                    f"{base_url}/api/v1/rbac/users",
+                    headers=csrf_headers,
+                    json={
+                        "username": "desktop_analyst",
+                        "email": "analyst@company.local",
+                        "full_name": "Desktop Analyst",
+                        "password": "AnalystPass!2026",
+                        "role_ids": [viewer_role["id"]],
+                    },
+                )
+                assert created_u.status_code == 200, created_u.text
+
+                target_dash = matrix_payload["dashboards"][0]["id"]
+                set_perm = client.put(
+                    f"{base_url}/api/v1/rbac/permissions/matrix/set",
+                    headers=csrf_headers,
+                    json={
+                        "subject_type": "role",
+                        "subject_id": viewer_role["id"],
+                        "resource_type": "dashboard",
+                        "resource_id": target_dash,
+                        "action": "view",
+                        "effect": "allow",
+                    },
+                )
+                assert set_perm.status_code == 200, set_perm.text
+                copy_perm = client.post(
+                    f"{base_url}/api/v1/rbac/permissions/matrix/copy",
+                    headers=csrf_headers,
+                    json={
+                        "from_subject_type": "role",
+                        "from_subject_id": viewer_role["id"],
+                        "to_subject_type": "role",
+                        "to_subject_id": designer_role["id"],
+                    },
+                )
+                assert copy_perm.status_code == 200, copy_perm.text
+                assert copy_perm.json()["copied"] >= 1
+                print("[ok] Users, Roles, Groups, Permission Matrix & Monitoring verified via desktop cookies.")
 
                 # 5. Verify DuckDB analytics, dashboard batch execution, and CSV file upload via gateway
-                dashes = client.get(f"{base_url}/api/v1/dashboards", headers=headers).json()
+                dashes = client.get(f"{base_url}/api/v1/dashboards").json()
                 assert len(dashes) >= 4
                 exec_res = client.post(
                     f"{base_url}/api/v1/dashboards/{dashes[0]['id']}/execute-batch",
-                    headers=headers,
+                    headers=csrf_headers,
                     json={},
                 )
                 assert exec_res.status_code == 200
@@ -245,7 +331,7 @@ def main() -> None:
                 assert bpmn_dash is not None, f"BPMN dashboard missing from {[d.get('title') for d in dashes]}"
                 bpmn_exec = client.post(
                     f"{base_url}/api/v1/dashboards/{bpmn_dash['id']}/execute-batch",
-                    headers=headers,
+                    headers=csrf_headers,
                     json={},
                 )
                 assert bpmn_exec.status_code == 200
@@ -256,7 +342,7 @@ def main() -> None:
                 csv_bytes = b"region,product,sales\nNorth,WidgetA,1200\nSouth,WidgetB,2450\n"
                 imp = client.post(
                     f"{base_url}/api/v1/data-sources/files/import",
-                    headers=headers,
+                    headers=csrf_headers,
                     data={"dataset_name": "Desktop Offline CSV"},
                     files={"file": ("offline_sales.csv", csv_bytes, "text/csv")},
                 )

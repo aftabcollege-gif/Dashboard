@@ -147,6 +147,44 @@ def _actor_is_super_admin(db: Session, user: User) -> bool:
     )
 
 
+def _assert_can_grant_public_override(
+    db: Session,
+    actor: User,
+    *,
+    permission_ids: Optional[list[str]] = None,
+    resource_type: Optional[str] = None,
+    action: Optional[str] = None,
+    effect: str = "allow",
+) -> None:
+    if _actor_is_super_admin(db, actor):
+        return
+    needs_guard = False
+    if permission_ids:
+        override_perm = (
+            db.query(Permission)
+            .filter(
+                Permission.id.in_(permission_ids),
+                Permission.resource_type == "dashboard",
+                Permission.action == "public_restricted_override",
+            )
+            .first()
+        )
+        if override_perm is not None:
+            needs_guard = True
+    if (
+        effect == "allow"
+        and resource_type in ("dashboard", "*")
+        and action in ("public_restricted_override", "*")
+    ):
+        needs_guard = True
+    if needs_guard:
+        if not permission_resolver.resolve(db, actor, "dashboard", "*", "public_restricted_override").allowed:
+            raise HTTPException(
+                status_code=403,
+                detail="Only an authorized administrator holding public_restricted_override may grant this permission",
+            )
+
+
 def _validate_org_roles(db: Session, actor: User, role_ids: list[str]) -> list[Role]:
     is_super = _actor_is_super_admin(db, actor)
     out: list[Role] = []
@@ -178,10 +216,15 @@ def _invalidate_org_caches(db: Session, org_id: str) -> None:
 def list_users(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "view")
     users = db.query(User).filter(User.organization_id == user.organization_id).all()
+    org_roles = {
+        r.id: r
+        for r in db.query(Role).filter(Role.organization_id == user.organization_id).all()
+    }
     out = []
     for u in users:
         r_ids = [ur.role_id for ur in db.query(UserRole).filter(UserRole.user_id == u.id).all()]
         g_ids = [gm.group_id for gm in db.query(GroupMember).filter(GroupMember.user_id == u.id).all()]
+        role_objs = [org_roles[rid] for rid in r_ids if rid in org_roles]
         out.append({
             "id": u.id,
             "username": u.username,
@@ -196,6 +239,8 @@ def list_users(user: User = Depends(get_current_user), db: Session = Depends(get
             "department": u.profile.department if u.profile else "",
             "region": u.profile.region if u.profile else "",
             "role_ids": r_ids,
+            "roles": [r.name for r in role_objs],
+            "role_slugs": [r.slug for r in role_objs],
             "group_ids": g_ids,
         })
     return out
@@ -362,6 +407,7 @@ def create_role(body: RoleCreate, user: User = Depends(get_current_user), db: Se
         raise HTTPException(status_code=403, detail="Cannot create a super_admin role")
     if db.query(Role).filter(Role.organization_id == user.organization_id, Role.slug == body.slug).first():
         raise HTTPException(status_code=400, detail="Role slug already exists in organization")
+    _assert_can_grant_public_override(db, user, permission_ids=body.permission_ids)
     r = Role(organization_id=user.organization_id, name=body.name, slug=body.slug, description=body.description)
     db.add(r)
     db.flush()
@@ -379,6 +425,7 @@ def update_role(role_id: str, body: RoleCreate, user: User = Depends(get_current
     r = get_role_for_org(db, role_id, user.organization_id)
     if r.is_super_admin and not _actor_is_super_admin(db, user):
         raise HTTPException(status_code=403, detail="Only a super_admin can edit a super_admin role")
+    _assert_can_grant_public_override(db, user, permission_ids=body.permission_ids)
     r.name = body.name
     r.description = body.description
     db.query(RolePermission).filter(RolePermission.role_id == r.id).delete()
@@ -521,6 +568,13 @@ def set_matrix_permission(
 ):
     enforce_permission(db, user, "admin", "*", "edit", ip_address=get_client_ip(request))
     _validate_matrix_subject(db, user, body.subject_type, body.subject_id)
+    _assert_can_grant_public_override(
+        db,
+        user,
+        resource_type=body.resource_type,
+        action=body.action,
+        effect=body.effect,
+    )
     if body.resource_id != "*":
         if body.resource_type == "dashboard":
             get_dashboard_for_org(db, body.resource_id, user.organization_id)
@@ -599,6 +653,13 @@ def copy_matrix_permissions(
     )
     copied = 0
     for sr in src_rules:
+        _assert_can_grant_public_override(
+            db,
+            user,
+            resource_type=sr.resource_type,
+            action=sr.action,
+            effect=sr.effect,
+        )
         dup = (
             db.query(ResourcePermission)
             .filter(

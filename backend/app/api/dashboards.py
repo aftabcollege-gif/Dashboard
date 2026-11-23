@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import secrets
 import time
 from typing import Any, Optional
@@ -5,12 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-from app.api.deps import enforce_permission, get_client_ip, get_current_user
+from app.api.deps import enforce_permission, enforce_scoped_rate_limit, get_client_ip, get_current_user
 from app.config import settings
 from app.core.audit import record_audit
 from app.core.cache import cache_manager
 from app.core.permissions import permission_resolver
-from app.core.rate_limit import rate_limiter
 from app.core.rls_cls import (
     DataSecurityContext,
     apply_cls_and_masking,
@@ -51,7 +51,7 @@ from app.models.dashboard import (
     Workspace,
 )
 from app.models.data import DataLineage, Dataset, DatasetField
-from app.models.identity import User
+from app.models.identity import GroupMember, GroupRole, Role, User, UserRole
 from app.models.performance import DashboardPerformanceLog, WidgetPerformanceLog
 
 router = APIRouter(prefix="/dashboards", tags=["Dashboards, Designer & Interactive Analytics"])
@@ -74,6 +74,11 @@ class DashboardCreate(BaseModel):
     theme_id: Optional[str] = None
     is_template: bool = False
     is_public: bool = False
+    settings_json: Optional[dict[str, Any]] = None
+    allow_public_restricted: Optional[bool] = None
+    public_restricted_reason: Optional[str] = None
+    public_override_reason: Optional[str] = None
+    override_reason: Optional[str] = None
 
 
 class DashboardUpdate(BaseModel):
@@ -84,6 +89,23 @@ class DashboardUpdate(BaseModel):
     refresh_interval_sec: Optional[int] = None
     settings_json: Optional[dict[str, Any]] = None
     expected_updated_at: Optional[str] = None
+    allow_public_restricted: Optional[bool] = None
+    public_restricted_reason: Optional[str] = None
+    public_override_reason: Optional[str] = None
+    override_reason: Optional[str] = None
+
+
+class ShareDashboardBody(BaseModel):
+    allow_public_restricted: Optional[bool] = None
+    public_restricted_reason: Optional[str] = None
+    public_override_reason: Optional[str] = None
+    override_reason: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class PublicOverrideBody(BaseModel):
+    allow_public_restricted: bool
+    reason: str = ""
 
 
 class PageCreate(BaseModel):
@@ -213,6 +235,209 @@ def _check_optimistic_concurrency(dash: Dashboard, expected_updated_at: Optional
         )
 
 
+_RESERVED_PUBLIC_OVERRIDE_SETTINGS_KEYS = {
+    "allow_public_restricted",
+    "public_override_reason",
+    "public_override_by_user_id",
+    "public_override_at",
+    "public_restricted_reason",
+    "public_restricted_by",
+    "public_restricted_at",
+}
+
+
+def _sanitize_client_settings(settings_in: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if settings_in is None:
+        return {}
+    if not isinstance(settings_in, dict):
+        raise HTTPException(status_code=400, detail="settings_json must be a JSON object")
+    for k in settings_in.keys():
+        if str(k) in _RESERVED_PUBLIC_OVERRIDE_SETTINGS_KEYS:
+            raise HTTPException(
+                status_code=403,
+                detail="Client-supplied settings cannot modify public restriction override governance",
+            )
+    return dict(settings_in)
+
+
+def _is_org_admin_actor(db: Session, user: User) -> bool:
+    try:
+        direct_role_ids = [
+            ur.role_id for ur in db.query(UserRole).filter(UserRole.user_id == user.id).all()
+        ]
+        group_ids = [
+            gm.group_id for gm in db.query(GroupMember).filter(GroupMember.user_id == user.id).all()
+        ]
+        group_role_ids = (
+            [gr.role_id for gr in db.query(GroupRole).filter(GroupRole.group_id.in_(group_ids)).all()]
+            if group_ids
+            else []
+        )
+        role_ids = list(set(direct_role_ids + group_role_ids))
+        if not role_ids:
+            return False
+        roles = (
+            db.query(Role)
+            .filter(Role.id.in_(role_ids), Role.organization_id == user.organization_id)
+            .all()
+        )
+        if any(r.is_super_admin for r in roles):
+            return True
+        if any(
+            (r.slug or "").lower() in ("super_admin", "org_admin", "security_admin", "dashboard_admin")
+            for r in roles
+        ):
+            return True
+        return permission_resolver.resolve(db, user, "admin", "*", "edit").allowed
+    except Exception:
+        return False
+
+
+def _actor_can_override_public_restricted(db: Session, user: User, resource_id: str) -> bool:
+    try:
+        if not _is_org_admin_actor(db, user):
+            return False
+        dec = permission_resolver.resolve(db, user, "dashboard", resource_id, "public_restricted_override")
+        return bool(dec.allowed)
+    except Exception:
+        return False
+
+
+def _verify_public_override_authority(
+    db: Session,
+    user: User,
+    resource_id: str,
+    ip_address: Optional[str] = None,
+    operation: str = "override",
+) -> None:
+    try:
+        is_admin = _is_org_admin_actor(db, user)
+        dec = permission_resolver.resolve(db, user, "dashboard", resource_id, "public_restricted_override")
+    except Exception as exc:
+        record_audit(
+            db,
+            user.organization_id,
+            "public_restricted_override_denied",
+            "dashboard",
+            status="denied",
+            user_id=user.id,
+            username=user.username,
+            resource_id=resource_id,
+            ip_address=ip_address,
+            details={"reason": f"fail_closed_resolver_error:{type(exc).__name__}", "operation": operation},
+        )
+        raise HTTPException(status_code=403, detail="Public restriction override authorization failed (fail closed)")
+
+    if not is_admin or not dec.allowed:
+        record_audit(
+            db,
+            user.organization_id,
+            "public_restricted_override_denied",
+            "dashboard",
+            status="denied",
+            user_id=user.id,
+            username=user.username,
+            resource_id=resource_id,
+            ip_address=ip_address,
+            details={
+                "is_org_admin": is_admin,
+                "permission_reason": dec.reason,
+                "operation": operation,
+            },
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Only an explicitly authorized organization administrator holding dashboard:public_restricted_override may manage this override",
+        )
+
+
+def _validate_override_reason(reason: Optional[str], enabling: bool) -> str:
+    clean = (reason or "").strip()
+    if enabling and len(clean) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit override reason (at least 3 characters) is required to enable allow_public_restricted",
+        )
+    return clean
+
+
+def _apply_public_override_change(
+    db: Session,
+    user: User,
+    dash: Dashboard,
+    enable: bool,
+    reason: Optional[str],
+    ip_address: Optional[str],
+    operation: str,
+) -> None:
+    _verify_public_override_authority(db, user, dash.id, ip_address=ip_address, operation=operation)
+    clean_reason = _validate_override_reason(reason, enabling=enable)
+    now_dt = datetime.now(timezone.utc)
+    prev_val = bool(dash.allow_public_restricted)
+    prev_reason = dash.public_restricted_reason
+    effective_reason = clean_reason if enable else (clean_reason or "Revoked by authorized administrator")
+
+    dash.allow_public_restricted = bool(enable)
+    dash.public_restricted_reason = effective_reason
+    dash.public_restricted_by = user.id
+    dash.public_restricted_at = now_dt
+    if isinstance(dash.settings_json, dict) and any(
+        k in dash.settings_json for k in _RESERVED_PUBLIC_OVERRIDE_SETTINGS_KEYS
+    ):
+        cleaned = dict(dash.settings_json)
+        for k in _RESERVED_PUBLIC_OVERRIDE_SETTINGS_KEYS:
+            cleaned.pop(k, None)
+        dash.settings_json = cleaned
+
+    record_audit(
+        db,
+        user.organization_id,
+        "public_restricted_override_changed",
+        "dashboard",
+        status="success",
+        user_id=user.id,
+        username=user.username,
+        resource_id=dash.id,
+        ip_address=ip_address,
+        before_state={"allow_public_restricted": prev_val, "reason": prev_reason},
+        after_state={
+            "allow_public_restricted": bool(enable),
+            "reason": effective_reason,
+            "timestamp": now_dt.isoformat(),
+        },
+        details={
+            "actor_id": user.id,
+            "actor_username": user.username,
+            "organization_id": user.organization_id,
+            "dashboard_id": dash.id,
+            "previous_value": prev_val,
+            "new_value": bool(enable),
+            "reason": effective_reason,
+            "operation": operation,
+            "timestamp": now_dt.isoformat(),
+        },
+        commit=False,
+    )
+
+
+def _has_verified_public_override(db: Session, org_id: str, dash: Dashboard) -> bool:
+    try:
+        if dash.allow_public_restricted is not True:
+            return False
+        if not (dash.public_restricted_reason or "").strip():
+            return False
+        if not dash.public_restricted_by:
+            return False
+        actor = (
+            db.query(User)
+            .filter(User.id == dash.public_restricted_by, User.organization_id == org_id)
+            .first()
+        )
+        return actor is not None
+    except Exception:
+        return False
+
+
 def _assert_dataset_public_safe(db: Session, org_id: str, ds: Dataset) -> None:
     safe, reason = inspect_dataset_public_safety(db, org_id, ds)
     if not safe:
@@ -222,39 +447,70 @@ def _assert_dataset_public_safe(db: Session, org_id: str, ds: Dataset) -> None:
         )
 
 
-def _assert_dashboard_public_safe(db: Session, org_id: str, dash: Dashboard) -> None:
-    if (dash.settings_json or {}).get("allow_public_restricted") is True:
-        return
+def _collect_dashboard_datasets_strict(db: Session, org_id: str, dash: Dashboard) -> list[Dataset]:
     widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
     if not widgets:
-        return
+        return []
     w_ids = [w.id for w in widgets]
     wqs = {wq.widget_id: wq for wq in db.query(WidgetQuery).filter(WidgetQuery.widget_id.in_(w_ids)).all()}
     org_datasets = db.query(Dataset).filter(Dataset.organization_id == org_id).all()
-    ds_by_id = {d.id: d for d in org_datasets}
-    ds_by_tbl = {d.warehouse_table.lower(): d for d in org_datasets if d.warehouse_table}
+    org_ds_by_id = {d.id: d for d in org_datasets}
+    org_ds_by_tbl = {d.warehouse_table.lower(): d for d in org_datasets if d.warehouse_table}
 
-    checked_ds: dict[str, Dataset] = {}
+    collected: dict[str, Dataset] = {}
+
+    def _require_same_org_dataset_id(ds_id: Optional[str]) -> None:
+        if not ds_id:
+            return
+        if ds_id in org_ds_by_id:
+            collected[ds_id] = org_ds_by_id[ds_id]
+            return
+        raise HTTPException(
+            status_code=403,
+            detail="Cross-organization dataset exposure is forbidden on public dashboards",
+        )
+
     for w in widgets:
         wq = wqs.get(w.id)
-        for cand_id in (w.dataset_id, wq.dataset_id if wq else None):
-            if cand_id and cand_id in ds_by_id:
-                checked_ds[cand_id] = ds_by_id[cand_id]
-        if wq and wq.visual_spec_json:
-            for j in wq.visual_spec_json.get("joins", []) or []:
-                jid = j.get("dataset_id")
-                if jid and jid in ds_by_id:
-                    checked_ds[jid] = ds_by_id[jid]
-        if wq and wq.query_mode == "sql" and wq.sql_text:
-            try:
-                refs = validate_readonly_sql_ast(wq.sql_text, dialect="duckdb")
+        _require_same_org_dataset_id(w.dataset_id)
+        if wq:
+            _require_same_org_dataset_id(wq.dataset_id)
+            if wq.visual_spec_json:
+                for j in wq.visual_spec_json.get("joins", []) or []:
+                    _require_same_org_dataset_id(j.get("dataset_id"))
+            if wq.query_mode == "sql" and wq.sql_text:
+                try:
+                    refs = validate_readonly_sql_ast(wq.sql_text, dialect="duckdb")
+                except Exception as exc:
+                    raise HTTPException(status_code=403, detail=f"Public widget SQL rejected: {exc}")
                 for tbl in refs:
-                    d_match = ds_by_tbl.get(tbl.lower())
-                    if d_match:
-                        checked_ds[d_match.id] = d_match
-            except Exception:
-                pass
-    for ds_item in checked_ds.values():
+                    d_match = org_ds_by_tbl.get(tbl.lower())
+                    if not d_match:
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Public widget SQL references dataset '{tbl}' outside organization scope",
+                        )
+                    collected[d_match.id] = d_match
+
+    return list(collected.values())
+
+
+def _assert_dashboard_public_safe(db: Session, org_id: str, dash: Dashboard) -> None:
+    try:
+        datasets = _collect_dashboard_datasets_strict(db, org_id, dash)
+        override_verified = _has_verified_public_override(db, org_id, dash)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Public safety policy verification failed ({type(exc).__name__})",
+        )
+
+    if override_verified:
+        return
+
+    for ds_item in datasets:
         _assert_dataset_public_safe(db, org_id, ds_item)
 
 
@@ -288,6 +544,64 @@ def _enforce_widget_dataset_permissions(
             ref_ds = org_map.get(tbl.lower())
             if ref_ds:
                 enforce_permission(db, user, "dataset", ref_ds.id, "view", ip_address=ip_address)
+
+
+def _enforce_widget_public_safety(
+    db: Session,
+    user: User,
+    dash: Dashboard,
+    dataset_id: Optional[str],
+    query_mode: str,
+    sql_text: Optional[str],
+    visual_spec: Optional[dict[str, Any]],
+) -> None:
+    if not dash.is_public:
+        return
+    org_id = user.organization_id
+    referenced: dict[str, Dataset] = {}
+    if dataset_id:
+        ds = get_dataset_for_org(db, dataset_id, org_id)
+        referenced[ds.id] = ds
+    if visual_spec:
+        for j in visual_spec.get("joins", []) or []:
+            jid = j.get("dataset_id")
+            if jid:
+                jds = get_dataset_for_org(db, str(jid), org_id)
+                referenced[jds.id] = jds
+    if query_mode == "sql" and sql_text:
+        org_map = list_org_allowed_dataset_tables(db, org_id)
+        try:
+            refs = validate_readonly_sql_ast(
+                sql_text, allowed_tables=set(org_map.keys()), require_table_allowlist=True
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=403, detail=f"Public widget SQL rejected: {exc}")
+        for tbl in refs:
+            ref_ds = org_map.get(tbl.lower())
+            if not ref_ds:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Public widget SQL references dataset '{tbl}' outside organization scope",
+                )
+            referenced[ref_ds.id] = ref_ds
+
+    unsafe_reasons: list[str] = []
+    for ds_item in referenced.values():
+        safe, reason = inspect_dataset_public_safety(db, org_id, ds_item)
+        if not safe:
+            unsafe_reasons.append(reason)
+    if not unsafe_reasons:
+        return
+
+    if _has_verified_public_override(db, org_id, dash) and _actor_can_override_public_restricted(
+        db, user, dash.id
+    ):
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail=f"Public sharing blocked by data protection policy: {unsafe_reasons[0]}",
+    )
 
 
 def _execute_public_sql_widget(
@@ -490,6 +804,10 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
         "is_public": dash.is_public,
         "is_template": dash.is_template,
         "embed_token": dash.embed_token,
+        "allow_public_restricted": bool(dash.allow_public_restricted),
+        "public_restricted_reason": dash.public_restricted_reason,
+        "public_restricted_by": dash.public_restricted_by,
+        "public_restricted_at": dash.public_restricted_at,
         "refresh_interval_sec": dash.refresh_interval_sec,
         "settings": dash.settings_json,
         "pages": [
@@ -523,6 +841,7 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
             "manage_filters": permission_resolver.resolve(db, user, "dashboard", dash.id, "manage_filters").allowed,
             "export": permission_resolver.resolve(db, user, "dashboard", dash.id, "export").allowed,
             "share": permission_resolver.resolve(db, user, "dashboard", dash.id, "share").allowed,
+            "public_restricted_override": _actor_can_override_public_restricted(db, user, dash.id),
         },
         "updated_at": dash.updated_at,
     }
@@ -531,7 +850,9 @@ def _serialize_dashboard(db: Session, dash: Dashboard, user: User) -> dict[str, 
 @router.get("/public/{embed_token}")
 def get_public_dashboard(embed_token: str, request: Request, db: Session = Depends(get_db)):
     ip = get_client_ip(request)
-    rate_limiter.check(f"public_dash:{ip}", limit=settings.RATE_LIMIT_PUBLIC_PER_MIN, window_seconds=60)
+    enforce_scoped_rate_limit(
+        "public_dash", ip=ip, ip_limit=settings.RATE_LIMIT_PUBLIC_PER_MIN, window_seconds=60
+    )
 
     row = (
         db.query(Dashboard, Workspace.organization_id)
@@ -542,7 +863,14 @@ def get_public_dashboard(embed_token: str, request: Request, db: Session = Depen
     if not row:
         raise HTTPException(status_code=404, detail="Shared dashboard not found or not public")
     dash, dash_org_id = row
+    enforce_scoped_rate_limit(
+        "public_dash_org",
+        org_id=dash_org_id,
+        org_limit=settings.RATE_LIMIT_PUBLIC_PER_MIN * 4,
+        window_seconds=60,
+    )
     _assert_dashboard_public_safe(db, dash_org_id, dash)
+    override_verified = _has_verified_public_override(db, dash_org_id, dash)
 
     pages = db.query(DashboardPage).filter(DashboardPage.dashboard_id == dash.id).order_by(DashboardPage.page_order.asc()).all()
     widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
@@ -568,7 +896,8 @@ def get_public_dashboard(embed_token: str, request: Request, db: Session = Depen
         data: dict[str, Any] = {"columns": [], "rows": []}
         if ds and wq:
             try:
-                _assert_dataset_public_safe(db, dash_org_id, ds)
+                if not override_verified:
+                    _assert_dataset_public_safe(db, dash_org_id, ds)
                 if wq.query_mode == "sql" and wq.sql_text:
                     data = _execute_public_sql_widget(
                         db, dash_org_id, ds, wq.sql_text, [], named_params=wq.parameters_json or {}
@@ -644,7 +973,9 @@ def execute_public_dashboard_batch(
     db: Session = Depends(get_db),
 ):
     ip = get_client_ip(request)
-    rate_limiter.check(f"public_batch:{ip}", limit=settings.RATE_LIMIT_PUBLIC_PER_MIN, window_seconds=60)
+    enforce_scoped_rate_limit(
+        "public_batch", ip=ip, ip_limit=settings.RATE_LIMIT_PUBLIC_PER_MIN, window_seconds=60
+    )
 
     row = (
         db.query(Dashboard, Workspace.organization_id)
@@ -655,7 +986,14 @@ def execute_public_dashboard_batch(
     if not row:
         raise HTTPException(status_code=404, detail="Shared dashboard not found or not public")
     dash, dash_org_id = row
+    enforce_scoped_rate_limit(
+        "public_batch_org",
+        org_id=dash_org_id,
+        org_limit=settings.RATE_LIMIT_PUBLIC_PER_MIN * 4,
+        window_seconds=60,
+    )
     _assert_dashboard_public_safe(db, dash_org_id, dash)
+    override_verified = _has_verified_public_override(db, dash_org_id, dash)
 
     t0 = time.perf_counter()
     widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
@@ -710,7 +1048,8 @@ def execute_public_dashboard_batch(
         data: dict[str, Any] = {"columns": [], "rows": [], "row_count": 0, "execution_ms": 0.0}
         if ds and wq:
             try:
-                _assert_dataset_public_safe(db, dash_org_id, ds)
+                if not override_verified:
+                    _assert_dataset_public_safe(db, dash_org_id, ds)
                 if wq.query_mode == "sql" and wq.sql_text:
                     data = _execute_public_sql_widget(
                         db, dash_org_id, ds, wq.sql_text, eff_filters, named_params=wq.parameters_json or {}
@@ -823,6 +1162,16 @@ def create_dashboard(
     enforce_permission(db, user, "dashboard", "*", "add", ip_address=ip)
     if body.is_public:
         enforce_permission(db, user, "dashboard", "*", "share", ip_address=ip)
+    sanitized_settings = _sanitize_client_settings(body.settings_json)
+    override_reason_raw = body.public_restricted_reason or body.public_override_reason or body.override_reason
+    if body.allow_public_restricted is not None:
+        _verify_public_override_authority(db, user, "*", ip_address=ip, operation="create")
+        clean_override_reason = _validate_override_reason(
+            override_reason_raw, enabling=bool(body.allow_public_restricted)
+        )
+    else:
+        clean_override_reason = None
+
     if body.workspace_id:
         ws = get_workspace_for_org(db, body.workspace_id, user.organization_id)
     else:
@@ -832,6 +1181,7 @@ def create_dashboard(
     if body.theme_id:
         get_theme_for_org(db, body.theme_id, user.organization_id)
 
+    now_dt = datetime.now(timezone.utc)
     d = Dashboard(
         workspace_id=ws.id,
         title=body.title,
@@ -840,6 +1190,15 @@ def create_dashboard(
         is_template=body.is_template,
         is_public=body.is_public,
         embed_token=secrets.token_urlsafe(24) if body.is_public else None,
+        settings_json=sanitized_settings,
+        allow_public_restricted=bool(body.allow_public_restricted) if body.allow_public_restricted is not None else False,
+        public_restricted_reason=(
+            (clean_override_reason or "Cleared on create")
+            if body.allow_public_restricted is not None
+            else None
+        ),
+        public_restricted_by=user.id if body.allow_public_restricted is not None else None,
+        public_restricted_at=now_dt if body.allow_public_restricted is not None else None,
         created_by=user.id,
     )
     db.add(d)
@@ -850,10 +1209,61 @@ def create_dashboard(
     db.add(DashboardLayout(page_id=p.id, columns_count=12, layout_json=[]))
     record_audit(
         db, user.organization_id, "dashboard_created", "dashboard", resource_id=d.id,
-        user_id=user.id, username=user.username, ip_address=get_client_ip(request)
+        user_id=user.id, username=user.username, ip_address=ip, commit=False
     )
+    if body.allow_public_restricted is not None:
+        record_audit(
+            db,
+            user.organization_id,
+            "public_restricted_override_changed",
+            "dashboard",
+            status="success",
+            user_id=user.id,
+            username=user.username,
+            resource_id=d.id,
+            ip_address=ip,
+            before_state={"allow_public_restricted": False, "reason": None},
+            after_state={
+                "allow_public_restricted": bool(body.allow_public_restricted),
+                "reason": d.public_restricted_reason,
+                "timestamp": now_dt.isoformat(),
+            },
+            details={
+                "actor_id": user.id,
+                "actor_username": user.username,
+                "organization_id": user.organization_id,
+                "dashboard_id": d.id,
+                "previous_value": False,
+                "new_value": bool(body.allow_public_restricted),
+                "reason": d.public_restricted_reason,
+                "operation": "create",
+                "timestamp": now_dt.isoformat(),
+            },
+            commit=False,
+        )
+    if body.is_public:
+        record_audit(
+            db,
+            user.organization_id,
+            "dashboard_published",
+            "dashboard",
+            status="success",
+            user_id=user.id,
+            username=user.username,
+            resource_id=d.id,
+            ip_address=ip,
+            before_state={"is_public": False},
+            after_state={"is_public": True, "allow_public_restricted": bool(d.allow_public_restricted)},
+            details={"operation": "create"},
+            commit=False,
+        )
     db.commit()
-    return {"id": d.id, "title": d.title, "default_page_id": p.id}
+    return {
+        "id": d.id,
+        "title": d.title,
+        "default_page_id": p.id,
+        "allow_public_restricted": bool(d.allow_public_restricted),
+    }
 
 
 @router.get("/{dashboard_id}")
@@ -879,40 +1289,108 @@ def update_dashboard(
     db: Session = Depends(get_db),
 ):
     dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    ip = get_client_ip(request)
     _check_optimistic_concurrency(dash, body.expected_updated_at)
 
     if body.theme_id is not None and any(
-        v is not None for v in (body.title, body.description, body.is_public, body.refresh_interval_sec, body.settings_json)
+        v is not None
+        for v in (
+            body.title,
+            body.description,
+            body.is_public,
+            body.refresh_interval_sec,
+            body.settings_json,
+            body.allow_public_restricted,
+        )
     ):
-        enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
+        enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=ip)
         get_theme_for_org(db, body.theme_id, user.organization_id)
         dash.theme_id = body.theme_id
     elif body.theme_id is not None:
         if not permission_resolver.resolve(db, user, "dashboard", dash.id, "change_theme").allowed:
-            enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
+            enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=ip)
         get_theme_for_org(db, body.theme_id, user.organization_id)
         dash.theme_id = body.theme_id
     else:
-        enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
+        enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=ip)
+
+    if body.settings_json is not None:
+        dash.settings_json = _sanitize_client_settings(body.settings_json)
+
+    if body.allow_public_restricted is not None:
+        _apply_public_override_change(
+            db,
+            user,
+            dash,
+            enable=bool(body.allow_public_restricted),
+            reason=body.public_restricted_reason or body.public_override_reason or body.override_reason,
+            ip_address=ip,
+            operation="update",
+        )
 
     if body.is_public is not None:
-        enforce_permission(db, user, "dashboard", dash.id, "share", ip_address=get_client_ip(request))
+        enforce_permission(db, user, "dashboard", dash.id, "share", ip_address=ip)
+        prev_pub = bool(dash.is_public)
         if body.is_public:
             _assert_dashboard_public_safe(db, user.organization_id, dash)
             if not dash.embed_token:
                 dash.embed_token = secrets.token_urlsafe(24)
         dash.is_public = body.is_public
+        if prev_pub != bool(body.is_public):
+            record_audit(
+                db,
+                user.organization_id,
+                "dashboard_published" if body.is_public else "dashboard_unpublished",
+                "dashboard",
+                status="success",
+                user_id=user.id,
+                username=user.username,
+                resource_id=dash.id,
+                ip_address=ip,
+                before_state={"is_public": prev_pub},
+                after_state={
+                    "is_public": bool(body.is_public),
+                    "allow_public_restricted": bool(dash.allow_public_restricted),
+                },
+                details={"reason": body.public_restricted_reason or body.public_override_reason or body.override_reason or ""},
+                commit=False,
+            )
+    elif body.allow_public_restricted is False and dash.is_public:
+        # Automatically unpublish if revoking override leaves restricted datasets exposed
+        try:
+            _assert_dashboard_public_safe(db, user.organization_id, dash)
+        except HTTPException:
+            dash.is_public = False
+            record_audit(
+                db,
+                user.organization_id,
+                "dashboard_unpublished",
+                "dashboard",
+                status="success",
+                user_id=user.id,
+                username=user.username,
+                resource_id=dash.id,
+                ip_address=ip,
+                before_state={"is_public": True},
+                after_state={"is_public": False, "allow_public_restricted": False},
+                details={"reason": "Auto-unpublished after public_restricted_override revocation"},
+                commit=False,
+            )
+
     if body.title is not None:
         dash.title = body.title
     if body.description is not None:
         dash.description = body.description
     if body.refresh_interval_sec is not None:
         dash.refresh_interval_sec = body.refresh_interval_sec
-    if body.settings_json is not None:
-        dash.settings_json = body.settings_json
     db.commit()
     db.refresh(dash)
-    return {"status": "updated", "updated_at": dash.updated_at}
+    return {
+        "status": "updated",
+        "updated_at": dash.updated_at,
+        "is_public": bool(dash.is_public),
+        "allow_public_restricted": bool(dash.allow_public_restricted),
+    }
 
 
 @router.delete("/{dashboard_id}")
@@ -995,9 +1473,9 @@ def create_widget(
     _enforce_widget_dataset_permissions(
         db, user, body.dataset_id, body.query_mode, body.sql_text, body.visual_spec, ip_address=ip
     )
-    if dash.is_public and body.dataset_id:
-        ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
-        _assert_dataset_public_safe(db, user.organization_id, ds)
+    _enforce_widget_public_safety(
+        db, user, dash, body.dataset_id, body.query_mode, body.sql_text, body.visual_spec
+    )
     if body.chart_type not in ALL_30_CHART_TYPES:
         raise HTTPException(status_code=400, detail=f"Unsupported chart_type: {body.chart_type}")
 
@@ -1047,8 +1525,7 @@ def update_widget(
     eff_sql = body.sql_text if body.sql_text is not None else (eff_wq.sql_text if eff_wq else None)
     if any(x is not None for x in (body.dataset_id, body.sql_text, body.visual_spec_json, body.query_mode)):
         _enforce_widget_dataset_permissions(db, user, eff_ds, eff_mode, eff_sql, eff_spec, ip_address=ip)
-        if dash.is_public and eff_ds:
-            _assert_dataset_public_safe(db, user.organization_id, get_dataset_for_org(db, eff_ds, user.organization_id))
+        _enforce_widget_public_safety(db, user, dash, eff_ds, eff_mode, eff_sql, eff_spec)
 
     if body.title is not None:
         w.title = body.title
@@ -1506,11 +1983,21 @@ def get_widget_data(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "widget_data",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_WIDGET_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_WIDGET_PER_MIN,
+        org_limit=settings.RATE_LIMIT_WIDGET_PER_MIN * 5,
+    )
     w, _ = get_widget_for_org(db, widget_id, user.organization_id)
     try:
         return _execute_single_widget(
             db, user, w, body.active_filters, body.cross_filters, body.drill_stack,
-            body.use_cache, ip_address=get_client_ip(request)
+            body.use_cache, ip_address=ip
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
@@ -1528,9 +2015,19 @@ def execute_dashboard_batch(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "dash_batch",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_WIDGET_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_WIDGET_PER_MIN,
+        org_limit=settings.RATE_LIMIT_WIDGET_PER_MIN * 5,
+    )
     dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
     if not dash.is_public:
-        enforce_permission(db, user, "dashboard", dash.id, "view", ip_address=get_client_ip(request))
+        enforce_permission(db, user, "dashboard", dash.id, "view", ip_address=ip)
 
     t0 = time.perf_counter()
     wq = db.query(Widget).filter(Widget.dashboard_id == dash.id)
@@ -1703,15 +2200,134 @@ def add_comment(
 
 
 @router.post("/{dashboard_id}/share")
-def generate_share_link(dashboard_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def generate_share_link(
+    dashboard_id: str,
+    request: Request,
+    body: Optional[ShareDashboardBody] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
     dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
-    enforce_permission(db, user, "dashboard", dash.id, "share")
+    enforce_permission(db, user, "dashboard", dash.id, "share", ip_address=ip)
+    if body and body.allow_public_restricted is not None:
+        _apply_public_override_change(
+            db,
+            user,
+            dash,
+            enable=bool(body.allow_public_restricted),
+            reason=body.public_restricted_reason or body.public_override_reason or body.override_reason or body.reason,
+            ip_address=ip,
+            operation="publish",
+        )
     _assert_dashboard_public_safe(db, user.organization_id, dash)
+    prev_pub = bool(dash.is_public)
     if not dash.embed_token:
         dash.embed_token = secrets.token_urlsafe(24)
     dash.is_public = True
+    record_audit(
+        db,
+        user.organization_id,
+        "dashboard_published",
+        "dashboard",
+        status="success",
+        user_id=user.id,
+        username=user.username,
+        resource_id=dash.id,
+        ip_address=ip,
+        before_state={"is_public": prev_pub},
+        after_state={"is_public": True, "allow_public_restricted": bool(dash.allow_public_restricted)},
+        details={"reason": (body.reason or body.public_restricted_reason or body.public_override_reason or body.override_reason or "") if body else ""},
+        commit=False,
+    )
     db.commit()
-    return {"embed_token": dash.embed_token, "is_public": dash.is_public}
+    return {
+        "embed_token": dash.embed_token,
+        "is_public": dash.is_public,
+        "allow_public_restricted": bool(dash.allow_public_restricted),
+    }
+
+
+@router.post("/{dashboard_id}/unshare")
+def unshare_dashboard(
+    dashboard_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "share", ip_address=ip)
+    prev_pub = bool(dash.is_public)
+    dash.is_public = False
+    record_audit(
+        db,
+        user.organization_id,
+        "dashboard_unpublished",
+        "dashboard",
+        status="success",
+        user_id=user.id,
+        username=user.username,
+        resource_id=dash.id,
+        ip_address=ip,
+        before_state={"is_public": prev_pub},
+        after_state={"is_public": False, "allow_public_restricted": bool(dash.allow_public_restricted)},
+        details={"operation": "unshare"},
+        commit=False,
+    )
+    db.commit()
+    return {"is_public": False}
+
+
+@router.put("/{dashboard_id}/public-override")
+def set_public_override(
+    dashboard_id: str,
+    body: PublicOverrideBody,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    _apply_public_override_change(
+        db,
+        user,
+        dash,
+        enable=bool(body.allow_public_restricted),
+        reason=body.reason,
+        ip_address=ip,
+        operation="public_override_endpoint",
+    )
+    if not body.allow_public_restricted and dash.is_public:
+        try:
+            _assert_dashboard_public_safe(db, user.organization_id, dash)
+        except HTTPException:
+            dash.is_public = False
+            record_audit(
+                db,
+                user.organization_id,
+                "dashboard_unpublished",
+                "dashboard",
+                status="success",
+                user_id=user.id,
+                username=user.username,
+                resource_id=dash.id,
+                ip_address=ip,
+                before_state={"is_public": True},
+                after_state={"is_public": False, "allow_public_restricted": False},
+                details={"reason": "Auto-unpublished after public_restricted_override revocation"},
+                commit=False,
+            )
+    db.commit()
+    db.refresh(dash)
+    return {
+        "dashboard_id": dash.id,
+        "allow_public_restricted": bool(dash.allow_public_restricted),
+        "public_restricted_reason": dash.public_restricted_reason,
+        "public_restricted_by": dash.public_restricted_by,
+        "public_restricted_at": dash.public_restricted_at,
+        "is_public": bool(dash.is_public),
+    }
 
 
 @router.post("/{dashboard_id}/clone-template")

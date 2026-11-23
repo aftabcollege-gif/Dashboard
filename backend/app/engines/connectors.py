@@ -5,11 +5,13 @@ import os
 import re
 import socket
 import sqlite3
+import ssl
 import time
 import zipfile
 from typing import Any, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 import defusedxml.ElementTree as SafeET
+import httpcore
 import httpx
 import pandas as pd
 from app.config import settings
@@ -78,34 +80,245 @@ def validate_readonly_sql(
     )
 
 
-def _validate_external_http_url(url: str) -> None:
-    parsed = urlparse((url or "").strip())
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("Only HTTP/HTTPS URLs are allowed")
-    host = parsed.hostname.strip().lower()
-    # Always block link-local cloud metadata endpoints
-    if host in ("169.254.169.254", "metadata.google.internal"):
+_FORBIDDEN_METADATA_HOSTS = {
+    "169.254.169.254",
+    "169.254.170.2",
+    "fd00:ec2::254",
+    "metadata.google.internal",
+    "metadata.goog",
+    "metadata.azure.internal",
+    "metadata",
+}
+
+_FORBIDDEN_LOCAL_HOSTS = {
+    "localhost",
+    "localhost.localdomain",
+    "ip6-localhost",
+    "ip6-loopback",
+}
+
+
+def _assert_ip_safe(ip_obj: ipaddress._BaseAddress, *, strict: bool) -> None:
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped is not None:
+            _assert_ip_safe(ip_obj.ipv4_mapped, strict=strict)
+        if ip_obj.sixtofour is not None:
+            _assert_ip_safe(ip_obj.sixtofour, strict=strict)
+        if ip_obj.teredo is not None:
+            for t_ip in ip_obj.teredo:
+                _assert_ip_safe(t_ip, strict=strict)
+
+    if str(ip_obj).lower() in _FORBIDDEN_METADATA_HOSTS:
         raise ValueError("Access to cloud metadata endpoint is forbidden")
+    if ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
+        raise ValueError("Unsafe link-local, multicast, or unspecified IP target is forbidden")
+    if strict and (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or not ip_obj.is_global):
+        raise ValueError("Private, loopback, reserved, or non-global SSRF targets are forbidden in production")
+
+
+def _validate_and_resolve_http_target(url: str, *, allow_local_non_prod: bool = False) -> tuple[str, str, int, list[str]]:
+    raw_url = (url or "").strip()
+    if not raw_url or any(ord(c) <= 32 or ord(c) == 127 for c in raw_url):
+        raise ValueError("Malformed or empty URL")
+
+    parsed = urlparse(raw_url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only HTTP/HTTPS URLs with valid hosts are allowed")
+    if parsed.username is not None or parsed.password is not None or "@" in (parsed.netloc or ""):
+        raise ValueError("Embedded URL credentials are forbidden")
     try:
-        ip_obj = ipaddress.ip_address(host)
-        if ip_obj.is_link_local or ip_obj.is_multicast:
-            raise ValueError("Unsafe IP target is forbidden")
-        if settings.ENVIRONMENT == "production" and (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved):
-            raise ValueError("Private/loopback SSRF targets are forbidden in production")
+        explicit_port = parsed.port
     except ValueError as exc:
-        if "forbidden" in str(exc):
-            raise
-        # Hostname: resolve in production to block SSRF to internal metadata/loopback
-        if settings.ENVIRONMENT == "production":
+        raise ValueError("Invalid URL port") from exc
+    port = int(explicit_port) if explicit_port is not None else (443 if parsed.scheme.lower() == "https" else 80)
+    if port < 1 or port > 65535:
+        raise ValueError("URL port out of valid range (1-65535)")
+
+    host = parsed.hostname.strip()
+    if "%" in host:
+        raise ValueError("IPv6 zone identifiers or percent-encoded hosts are forbidden")
+    host_clean = host.rstrip(".").lower()
+    if not host_clean or ".." in host_clean or host_clean.startswith("."):
+        raise ValueError("Malformed target hostname")
+
+    strict_prod = (settings.ENVIRONMENT == "production") or (not allow_local_non_prod)
+
+    if host_clean in _FORBIDDEN_METADATA_HOSTS:
+        raise ValueError("Access to cloud metadata endpoint is forbidden")
+    if strict_prod and host_clean in _FORBIDDEN_LOCAL_HOSTS:
+        raise ValueError("Access to localhost targets is forbidden in production")
+
+    # Reject alternative/obfuscated IPv4 notations (decimal integer, hex, octal, short 127.1)
+    if re.fullmatch(r"\d+", host_clean) or re.fullmatch(r"0x[0-9a-f]+", host_clean, re.I):
+        raise ValueError("Non-canonical numeric/hexadecimal IP host notation is forbidden")
+    if any(seg.startswith("0") and len(seg) > 1 and seg.isdigit() for seg in host_clean.split(".")):
+        raise ValueError("Octal IP notation is forbidden")
+    try:
+        ip_literal: Optional[ipaddress._BaseAddress] = ipaddress.ip_address(host_clean)
+    except ValueError:
+        ip_literal = None
+        if re.fullmatch(r"[0-9a-fx.]+", host_clean, re.I):
             try:
-                for info in socket.getaddrinfo(host, None):
-                    addr = ipaddress.ip_address(info[4][0])
-                    if addr.is_link_local or addr.is_private or addr.is_loopback or addr.is_reserved:
-                        raise ValueError("Resolved target IP is forbidden in production")
-            except ValueError:
-                raise
+                socket.inet_aton(host_clean)
+                raise ValueError("Non-canonical IPv4 host notation is forbidden")
+            except OSError:
+                pass
+
+    if ip_literal is not None:
+        _assert_ip_safe(ip_literal, strict=strict_prod)
+        canonical_ip = str(ip_literal)
+        return raw_url, canonical_ip, port, [canonical_ip]
+
+    try:
+        ascii_host = host_clean.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise ValueError("Invalid internationalized hostname") from exc
+    for label in ascii_host.split("."):
+        if not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label):
+            raise ValueError("Malformed target hostname label")
+
+    # Resolve all A and AAAA records and fail closed on DNS failure or ANY unsafe IP
+    try:
+        addr_infos = socket.getaddrinfo(ascii_host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"DNS resolution failed for host '{ascii_host}'") from exc
+
+    resolved_ips: list[str] = []
+    seen_ips: set[str] = set()
+    for info in addr_infos or []:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        raw_ip = str(sockaddr[0]).split("%", 1)[0]
+        ip_obj = ipaddress.ip_address(raw_ip)
+        _assert_ip_safe(ip_obj, strict=strict_prod)
+        canon = str(ip_obj)
+        if canon not in seen_ips:
+            seen_ips.add(canon)
+            resolved_ips.append(canon)
+
+    if not resolved_ips:
+        raise ValueError(f"DNS resolution returned no usable addresses for '{ascii_host}'")
+
+    # Prefer IPv4 when both A and AAAA exist for reliable TCP pinning across dual-stack hosts
+    resolved_ips.sort(key=lambda ip_s: 0 if ipaddress.ip_address(ip_s).version == 4 else 1)
+    return raw_url, ascii_host, port, resolved_ips
+
+
+def _validate_external_http_url(url: str) -> tuple[str, str, int, list[str]]:
+    return _validate_and_resolve_http_target(url, allow_local_non_prod=(settings.ENVIRONMENT != "production"))
+
+
+class _PinnedSSRFNetworkBackend(httpcore.SyncBackend):
+    def __init__(self, expected_host: str, pinned_ip: str, expected_port: int):
+        self._expected_host = expected_host.strip("[]").lower()
+        self._pinned_ip = pinned_ip
+        self._expected_port = int(expected_port)
+        super().__init__()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: Optional[float] = None,
+        local_address: Optional[str] = None,
+        socket_options: Any = None,
+    ) -> httpcore.NetworkStream:
+        req_host = host.strip("[]").lower()
+        if req_host != self._expected_host or int(port) != self._expected_port:
+            raise ValueError(f"SSRF connection pin violation: unexpected target {host}:{port}")
+        # Connect strictly to the pre-validated pinned IP (zero secondary DNS lookup)
+        return super().connect_tcp(
+            self._pinned_ip,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+
+class _PinnedSSRFHTTPTransport(httpx.HTTPTransport):
+    def __init__(self, expected_host: str, pinned_ip: str, expected_port: int):
+        super().__init__(verify=True, trust_env=False, proxy=None)
+        if self._pool is not None:
+            try:
+                self._pool.close()
             except Exception:
                 pass
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=ssl.create_default_context(),
+            proxy=None,
+            network_backend=_PinnedSSRFNetworkBackend(expected_host, pinned_ip, expected_port),
+        )
+
+
+def _ssrf_safe_http_request(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[dict[str, str]] = None,
+    json_body: Optional[dict[str, Any]] = None,
+    timeout: float = 10.0,
+    config: Optional[dict[str, Any]] = None,
+) -> httpx.Response:
+    cfg = config or {}
+    if cfg.get("proxy") or cfg.get("proxies") or cfg.get("proxy_url"):
+        raise ValueError("Custom proxy configuration is forbidden for external HTTP connectors")
+
+    req_headers = {
+        str(k): str(v)
+        for k, v in (headers or {}).items()
+        if str(k).lower() not in ("proxy-authorization", "proxy-connection", "host")
+    }
+    allow_redirects = bool(cfg.get("allow_redirects", False))
+    max_redirects = max(0, min(int(cfg.get("max_redirects", 3)), 5)) if allow_redirects else 0
+
+    current_url = url
+    current_method = method.upper()
+    current_json = json_body
+    visited_origin: Optional[tuple[str, str, int]] = None
+
+    for hop in range(max_redirects + 1):
+        clean_url, resolved_host, resolved_port, pinned_ips = _validate_external_http_url(current_url)
+        pinned_ip = pinned_ips[0]
+        cur_origin = (urlparse(clean_url).scheme.lower(), resolved_host, resolved_port)
+        if visited_origin is not None and cur_origin != visited_origin:
+            # Strip sensitive auth headers across cross-origin redirects
+            req_headers = {
+                k: v for k, v in req_headers.items() if k.lower() not in ("authorization", "cookie", "x-api-key")
+            }
+        visited_origin = cur_origin
+
+        transport = _PinnedSSRFHTTPTransport(resolved_host, pinned_ip, resolved_port)
+        with httpx.Client(
+            timeout=float(timeout),
+            trust_env=False,
+            follow_redirects=False,
+            transport=transport,
+        ) as client:
+            resp = client.request(
+                current_method,
+                clean_url,
+                headers=req_headers,
+                json=current_json if current_method in ("POST", "PUT", "PATCH") else None,
+            )
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            if not allow_redirects:
+                raise ValueError(f"HTTP redirect ({resp.status_code}) blocked by SSRF policy")
+            if hop >= max_redirects:
+                raise ValueError("Maximum HTTP redirect hops exceeded")
+            location = resp.headers.get("location")
+            if not location:
+                raise ValueError("Redirect response missing Location header")
+            current_url = urljoin(clean_url, location.strip())
+            if resp.status_code in (301, 302, 303) and current_method == "POST":
+                current_method = "GET"
+                current_json = None
+            continue
+        return resp
+
+    raise ValueError("Redirect limit exceeded")
 
 
 def _guard_xlsx_zip_bomb(file_bytes: bytes) -> None:
@@ -430,20 +643,22 @@ class DataConnectorEngine:
                 url = config.get("url") or config.get("base_url")
                 if not url:
                     return {"ok": False, "error": "URL is required"}
-                _validate_external_http_url(url)
                 headers = dict(config.get("headers", {}))
                 if credentials.get("bearer_token"):
                     headers["Authorization"] = f"Bearer {credentials['bearer_token']}"
-                with httpx.Client(timeout=6.0) as client:
-                    if st == "graphql":
-                        resp = client.post(url, json={"query": "{ __typename }"}, headers=headers)
-                    else:
-                        resp = client.get(url, headers=headers)
-                    return {
-                        "ok": resp.status_code < 500,
-                        "status_code": resp.status_code,
-                        "message": f"HTTP {resp.status_code}",
-                    }
+                resp = _ssrf_safe_http_request(
+                    "POST" if st == "graphql" else "GET",
+                    url,
+                    headers=headers,
+                    json_body={"query": "{ __typename }"} if st == "graphql" else None,
+                    timeout=6.0,
+                    config=config,
+                )
+                return {
+                    "ok": resp.status_code < 500,
+                    "status_code": resp.status_code,
+                    "message": f"HTTP {resp.status_code}",
+                }
 
             if st in SUPPORTED_FILE_TYPES:
                 return {"ok": True, "message": f"File source ({st}) ready"}
@@ -710,30 +925,32 @@ class DataConnectorEngine:
                 client.close()
 
         if st in ("rest_api", "graphql"):
-            url = config.get("url")
+            url = config.get("url") or config.get("base_url")
             if not url:
                 raise ValueError("URL is required")
-            _validate_external_http_url(url)
             headers = dict(config.get("headers", {}))
             if credentials.get("bearer_token"):
                 headers["Authorization"] = f"Bearer {credentials['bearer_token']}"
-            with httpx.Client(timeout=float(eff_timeout)) as client:
-                if st == "graphql":
-                    resp = client.post(url, json={"query": query or config.get("query", "")}, headers=headers)
-                else:
-                    resp = client.get(url, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                data_path = config.get("data_path")
-                if data_path and isinstance(data, dict):
-                    for part in data_path.split("."):
-                        data = data.get(part, [])
-                if isinstance(data, dict):
-                    for v in data.values():
-                        if isinstance(v, list):
-                            data = v
-                            break
-                df_api = pd.json_normalize(data if isinstance(data, list) else [data])
-                return df_api.head(eff_max_rows)
+            resp = _ssrf_safe_http_request(
+                "POST" if st == "graphql" else "GET",
+                url,
+                headers=headers,
+                json_body={"query": query or config.get("query", "")} if st == "graphql" else None,
+                timeout=float(eff_timeout),
+                config=config,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            data_path = config.get("data_path")
+            if data_path and isinstance(data, dict):
+                for part in data_path.split("."):
+                    data = data.get(part, [])
+            if isinstance(data, dict):
+                for v in data.values():
+                    if isinstance(v, list):
+                        data = v
+                        break
+            df_api = pd.json_normalize(data if isinstance(data, list) else [data])
+            return df_api.head(eff_max_rows)
 
         raise ValueError(f"Cannot extract live rows from source type: {source_type}")

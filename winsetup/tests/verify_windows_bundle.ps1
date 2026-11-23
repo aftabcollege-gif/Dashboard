@@ -174,8 +174,10 @@ try {
     if (-not $healthy) { throw "Bundled services did not become healthy" }
 
     Write-Host "=== 3. Verifying UI, secure initial setup, DuckDB execution, and CSV upload ==="
-    $homePage = Invoke-WebRequest -Uri "$baseUrl/" -UseBasicParsing -TimeoutSec 5
-    if ($homePage.StatusCode -ne 200) { throw "Home page returned $($homePage.StatusCode)" }
+    foreach ($uiRoute in @("/", "/admin/security", "/admin/monitoring", "/dashboards", "/settings")) {
+        $pageResp = Invoke-WebRequest -Uri "$baseUrl$uiRoute" -UseBasicParsing -TimeoutSec 5
+        if ($pageResp.StatusCode -ne 200) { throw "Route $uiRoute returned $($pageResp.StatusCode)" }
+    }
 
     $statusJson = Invoke-RestMethod -Uri "$baseUrl/api/v1/auth/status" -Method GET
     if (-not $statusJson.needs_initial_setup -or $statusJson.demo_mode) {
@@ -207,6 +209,17 @@ try {
     if (-not $tok) { throw "Missing access_token from bootstrap-admin" }
 
     $headers = @{ Authorization = "Bearer $tok" }
+
+    $rbacUsers = Invoke-RestMethod -Uri "$baseUrl/api/v1/rbac/users" -Headers $headers -Method GET
+    if (@($rbacUsers).Count -lt 1) { throw "Expected at least 1 RBAC user" }
+    $rbacRoles = Invoke-RestMethod -Uri "$baseUrl/api/v1/rbac/roles" -Headers $headers -Method GET
+    if (-not $rbacRoles.roles -or @($rbacRoles.roles).Count -lt 5) { throw "Expected RBAC roles payload with roles array" }
+    $rbacGroups = Invoke-RestMethod -Uri "$baseUrl/api/v1/rbac/groups" -Headers $headers -Method GET
+    if ($null -eq $rbacGroups) { throw "Expected RBAC groups response" }
+    $rbacMatrix = Invoke-RestMethod -Uri "$baseUrl/api/v1/rbac/permissions/matrix" -Headers $headers -Method GET
+    if (-not $rbacMatrix.dashboards -or @($rbacMatrix.dashboards).Count -lt 1) { throw "Expected RBAC permission matrix dashboards" }
+    Write-Host "[ok] Verified Users, Roles, Groups, and Permission Matrix APIs through bundled gateway."
+
     $rawDashes = Invoke-RestMethod -Uri "$baseUrl/api/v1/dashboards" -Headers $headers -Method GET
     $dashes = [System.Collections.Generic.List[object]]::new()
     foreach ($item in $rawDashes) {

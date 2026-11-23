@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
-    String, Boolean, Integer, Text, DateTime, ForeignKey, UniqueConstraint, JSON, Index
+    String, Boolean, Integer, Text, DateTime, ForeignKey, UniqueConstraint, JSON, Index, event
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
@@ -307,3 +307,22 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False, index=True
     )
+
+
+class SystemBootstrapState(Base):
+    __tablename__ = "system_bootstrap_state"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default="singleton")
+    completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    bootstrapped_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+@event.listens_for(AuditLog, "before_update")
+def _prevent_audit_log_update(mapper, connection, target):
+    raise ValueError("AuditLog entries are immutable and cannot be modified")
+
+
+@event.listens_for(AuditLog, "before_delete")
+def _prevent_audit_log_delete(mapper, connection, target):
+    raise ValueError("AuditLog entries are immutable and cannot be deleted")

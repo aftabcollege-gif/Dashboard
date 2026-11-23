@@ -17,6 +17,7 @@ from app.models.identity import (
     AccessPolicy,
     ResourcePermission,
     AuditLog,
+    SystemBootstrapState,
 )
 from app.models.dashboard import (
     Workspace,
@@ -85,6 +86,7 @@ __all__ = [
     "AccessPolicy",
     "ResourcePermission",
     "AuditLog",
+    "SystemBootstrapState",
     "Workspace",
     "DashboardTheme",
     "Dashboard",

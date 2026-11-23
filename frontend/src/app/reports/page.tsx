@@ -61,7 +61,9 @@ export default function ReportsPage() {
   const handleRunReportNow = async (id: string) => {
     try {
       const res = await apiFetch<any>(`/exports/scheduled-reports/${id}/run`, { method: "POST" });
-      showToast(`Generated ${res.size_bytes} byte report (${res.format.toUpperCase()})`);
+      const byteCount = res.bytes ?? res.size_bytes ?? 0;
+      const fmt = (res.format || "pdf").toUpperCase();
+      showToast(`Generated ${byteCount} byte report (${fmt})`);
       load();
     } catch (err: any) {
       showToast(err.message);

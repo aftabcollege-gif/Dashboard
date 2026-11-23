@@ -8,11 +8,10 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from app.api.deps import get_client_ip, get_current_user, is_https_request
+from app.api.deps import enforce_scoped_rate_limit, get_client_ip, get_current_user, is_https_request
 from app.config import settings
 from app.core.audit import record_audit
 from app.core.permissions import permission_resolver
-from app.core.rate_limit import rate_limiter
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -32,6 +31,7 @@ from app.engines.scheduler import sync_scheduler_jobs
 from app.models.dashboard import Workspace
 from app.models.identity import (
     DirectoryConnection,
+    SystemBootstrapState,
     User,
     UserProfile,
     UserRole,
@@ -129,11 +129,17 @@ def _clear_auth_cookies(response: Response, request: Request) -> None:
 @router.get("/status")
 def auth_status(db: Session = Depends(get_db)):
     user_count = db.query(User).count()
+    boot_state = (
+        db.query(SystemBootstrapState)
+        .filter(SystemBootstrapState.id == "singleton")
+        .first()
+    )
+    needs_setup = (user_count == 0) and not (boot_state and boot_state.completed)
     return {
-        "needs_initial_setup": user_count == 0,
+        "needs_initial_setup": needs_setup,
         "demo_mode": bool(settings.BI_SEED_DEMO_USERS and settings.ENVIRONMENT != "production"),
         "setup_token_required": bool(
-            user_count == 0 and (settings.BI_INITIAL_SETUP_TOKEN or settings.ENVIRONMENT == "production")
+            needs_setup and (settings.BI_INITIAL_SETUP_TOKEN or settings.ENVIRONMENT == "production")
         ),
         "environment": settings.ENVIRONMENT,
     }
@@ -147,36 +153,65 @@ def bootstrap_admin(
     db: Session = Depends(get_db),
 ):
     ip = get_client_ip(request)
-    rate_limiter.check(f"bootstrap:{ip}", limit=10, window_seconds=60)
+    enforce_scoped_rate_limit("bootstrap", ip=ip, ip_limit=10, window_seconds=60)
     now = datetime.now(timezone.utc)
 
+    if settings.ENVIRONMENT == "production" and not settings.BI_INITIAL_SETUP_TOKEN:
+        raise HTTPException(
+            status_code=403,
+            detail="Initial admin bootstrap requires BI_INITIAL_SETUP_TOKEN in production",
+        )
+
+    if settings.BI_INITIAL_SETUP_TOKEN:
+        if settings.ENVIRONMENT == "production" and len(settings.BI_INITIAL_SETUP_TOKEN.strip()) < 20:
+            raise HTTPException(status_code=500, detail="Server setup token configuration is too weak")
+        provided = (body.setup_token or request.headers.get("x-setup-token") or "").strip()
+        if not provided or not secrets.compare_digest(provided, settings.BI_INITIAL_SETUP_TOKEN):
+            raise HTTPException(status_code=403, detail="Invalid or missing initial setup token")
+
+    uname = body.username.strip()
+    if not re.match(r"^[A-Za-z0-9._-]{3,64}$", uname):
+        raise HTTPException(
+            status_code=400, detail="Username must be 3-64 alphanumeric, dot, underscore, or dash characters"
+        )
+    if "@" not in body.email:
+        raise HTTPException(status_code=400, detail="Valid email address is required")
+    validate_password_strength(body.password, allow_demo_passwords=False)
+
     with _BOOTSTRAP_LOCK:
-        # Acquire DB-level advisory lock on PostgreSQL so multi-worker/replica bootstraps cannot race
+        # Acquire DB-level advisory lock on PostgreSQL + atomic singleton CAS on system_bootstrap_state
         if db.bind is not None and db.bind.dialect.name == "postgresql":
             db.execute(text("SELECT pg_advisory_xact_lock(72839104)"))
 
         if db.query(User).count() > 0:
             raise HTTPException(status_code=403, detail="Initial setup already completed")
 
-        if settings.ENVIRONMENT == "production" and not settings.BI_INITIAL_SETUP_TOKEN:
-            raise HTTPException(
-                status_code=403,
-                detail="Initial admin bootstrap requires BI_INITIAL_SETUP_TOKEN in production",
-            )
-
-        if settings.BI_INITIAL_SETUP_TOKEN:
-            provided = (body.setup_token or request.headers.get("x-setup-token") or "").strip()
-            if not provided or not secrets.compare_digest(provided, settings.BI_INITIAL_SETUP_TOKEN):
-                raise HTTPException(status_code=403, detail="Invalid or missing initial setup token")
-
-        uname = body.username.strip()
-        if not re.match(r"^[A-Za-z0-9._-]{3,64}$", uname):
-            raise HTTPException(status_code=400, detail="Username must be 3-64 alphanumeric, dot, underscore, or dash characters")
-        if "@" not in body.email:
-            raise HTTPException(status_code=400, detail="Valid email address is required")
-        validate_password_strength(body.password, allow_demo_passwords=False)
-
         try:
+            boot_row = (
+                db.query(SystemBootstrapState)
+                .filter(SystemBootstrapState.id == "singleton")
+                .first()
+            )
+            if boot_row is None:
+                try:
+                    with db.begin_nested():
+                        db.add(SystemBootstrapState(id="singleton", completed=False))
+                        db.flush()
+                except IntegrityError:
+                    pass
+
+            claimed = (
+                db.query(SystemBootstrapState)
+                .filter(
+                    SystemBootstrapState.id == "singleton",
+                    SystemBootstrapState.completed == False,
+                )
+                .update({"completed": True, "completed_at": now}, synchronize_session=False)
+            )
+            if claimed == 0 or db.query(User).count() > 0:
+                db.rollback()
+                raise HTTPException(status_code=403, detail="Initial setup already completed")
+
             org, roles, theme_objs = seed_core_catalog(db)
             if body.organization_name.strip():
                 org.name = body.organization_name.strip()[:200]
@@ -202,6 +237,10 @@ def bootstrap_admin(
                 )
             )
             db.add(UserRole(user_id=admin_user.id, role_id=roles["super_admin"].id))
+            db.query(SystemBootstrapState).filter(SystemBootstrapState.id == "singleton").update(
+                {"bootstrapped_by": admin_user.id, "completed_at": now},
+                synchronize_session=False,
+            )
 
             if not db.query(Workspace).filter(Workspace.organization_id == org.id).first():
                 db.add(
@@ -213,9 +252,14 @@ def bootstrap_admin(
                     )
                 )
             db.commit()
+        except HTTPException:
+            raise
         except IntegrityError as exc:
             db.rollback()
             raise HTTPException(status_code=403, detail="Initial setup already completed") from exc
+        except Exception:
+            db.rollback()
+            raise
 
         if body.include_sample_data:
             seed_sample_bi_content(
@@ -292,8 +336,15 @@ def bootstrap_admin(
 @router.post("/login")
 def login(body: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
     ip = get_client_ip(request)
-    rate_limiter.check(f"login_ip:{ip}", limit=settings.RATE_LIMIT_LOGIN_PER_MIN, window_seconds=60)
-    rate_limiter.check(f"login_user:{ip}:{(body.username or '').lower()}", limit=15, window_seconds=60)
+    enforce_scoped_rate_limit("login_ip", ip=ip, ip_limit=settings.RATE_LIMIT_LOGIN_PER_MIN, window_seconds=60)
+    enforce_scoped_rate_limit(
+        "login_user",
+        ip=ip,
+        user_id=(body.username or "").lower() or "anonymous",
+        ip_limit=settings.RATE_LIMIT_LOGIN_PER_MIN,
+        user_limit=15,
+        window_seconds=60,
+    )
     now = datetime.now(timezone.utc)
 
     if body.auth_mode in ("active_directory", "ad"):
@@ -452,9 +503,14 @@ def refresh_token(
     db: Session = Depends(get_db),
 ):
     ip = get_client_ip(request)
-    rate_limiter.check(f"refresh:{ip}", limit=60, window_seconds=60)
+    enforce_scoped_rate_limit("refresh", ip=ip, ip_limit=60, window_seconds=60)
 
     has_body_refresh = bool(body and body.refresh_token)
+    if not has_body_refresh and _wants_bearer_tokens(request):
+        raise HTTPException(
+            status_code=400,
+            detail="Cookie-authenticated refresh cannot return bearer tokens in JSON",
+        )
     raw_refresh = (body.refresh_token if has_body_refresh else None) or request.cookies.get(
         settings.REFRESH_COOKIE_NAME
     )
@@ -537,7 +593,7 @@ def refresh_token(
     )
     db.commit()
 
-    if has_body_refresh or _wants_bearer_tokens(request):
+    if has_body_refresh:
         return {
             "auth_mode": "bearer",
             "access_token": access_token,

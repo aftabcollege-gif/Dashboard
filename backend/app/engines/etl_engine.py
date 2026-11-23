@@ -1,6 +1,9 @@
 import hashlib
 import json
+import logging
+import os
 import re
+import socket
 import threading
 import time
 import traceback
@@ -8,11 +11,13 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 import psutil
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.core.cache import cache_manager
 from app.core.security import decrypt_secret
 from app.core.sql_guard import validate_readonly_sql_ast
+from app.database import db_session_scope
 from app.engines.connectors import DataConnectorEngine, infer_bi_type, infer_semantic_role
 from app.engines.data_engine import DataProfiler
 from app.engines.warehouse import sanitize_identifier, warehouse
@@ -28,6 +33,12 @@ from app.models.etl import (
 )
 from app.models.performance import MaterializedViewMetadata
 
+logger = logging.getLogger(__name__)
+
+_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+_ETL_LEASE_TTL_SEC = max(45, int(os.environ.get("ETL_LEASE_TTL_SECONDS", "60")))
+_ETL_HEARTBEAT_INTERVAL_SEC = max(5.0, min(15.0, _ETL_LEASE_TTL_SEC / 3.0))
+
 _PIPELINE_LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
 _REDIS_UNLOCK_LUA = """
@@ -36,6 +47,20 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
+_REDIS_RENEW_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return 0
+"""
+
+
+def _etl_requires_redis() -> bool:
+    if os.environ.get("BI_ETL_REQUIRE_REDIS", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    if settings.ENVIRONMENT == "production" and not settings.is_desktop_mode() and bool(settings.REDIS_URL):
+        return True
+    return False
 
 
 def _get_pipeline_lock(pipeline_id: str) -> threading.Lock:
@@ -48,14 +73,30 @@ def _get_pipeline_lock(pipeline_id: str) -> threading.Lock:
 def _acquire_distributed_etl_lock(pipeline_id: str, ttl_sec: int) -> tuple[bool, Optional[str], Any]:
     redis_client = getattr(cache_manager, "_redis", None)
     if redis_client is None:
+        if _etl_requires_redis():
+            logger.error("ETL distributed Redis lock required in production, but Redis client is unavailable.")
+            return False, None, None
         return True, None, None
     token = uuid.uuid4().hex
     try:
         ok = redis_client.set(f"etl_lock:{pipeline_id}", token, nx=True, ex=max(30, ttl_sec))
         return bool(ok), token if ok else None, redis_client
-    except Exception:
-        # Fall back to DB CAS lock when Redis lock is unreachable
+    except Exception as exc:
+        if _etl_requires_redis():
+            logger.error("ETL distributed Redis lock acquisition failed (fail closed): %s", exc)
+            return False, None, None
+        # Dev/test single-node fallback uses DB CAS + fencing
         return True, None, None
+
+
+def _renew_distributed_etl_lock(pipeline_id: str, token: Optional[str], redis_client: Any, ttl_sec: int) -> bool:
+    if redis_client is None or not token:
+        return True
+    try:
+        res = redis_client.eval(_REDIS_RENEW_LUA, 1, f"etl_lock:{pipeline_id}", token, max(30, ttl_sec))
+        return int(res or 0) == 1
+    except Exception:
+        return False
 
 
 def _release_distributed_etl_lock(pipeline_id: str, token: Optional[str], redis_client: Any) -> None:
@@ -66,12 +107,107 @@ def _release_distributed_etl_lock(pipeline_id: str, token: Optional[str], redis_
             pass
 
 
+def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _assert_pipeline_fenced(
+    db: Session, pipeline_id: str, expected_fence_token: int, expected_worker_id: str
+) -> None:
+    pl = db.query(EtlPipeline).filter(EtlPipeline.id == pipeline_id).first()
+    if (
+        pl is None
+        or not pl.is_running
+        or int(pl.fence_token or 0) != int(expected_fence_token)
+        or (pl.active_worker_id and pl.active_worker_id != expected_worker_id)
+    ):
+        raise RuntimeError(
+            f"ETL execution fenced/superseded for pipeline {pipeline_id} "
+            f"(expected fence={expected_fence_token}, actual={getattr(pl, 'fence_token', None)})"
+        )
+
+
+class _EtlLeaseHeartbeat:
+    def __init__(
+        self,
+        pipeline_id: str,
+        fence_token: int,
+        worker_id: str,
+        dist_token: Optional[str],
+        dist_redis: Any,
+        lease_ttl_sec: int,
+        interval_sec: float,
+    ) -> None:
+        self.pipeline_id = pipeline_id
+        self.fence_token = fence_token
+        self.worker_id = worker_id
+        self.dist_token = dist_token
+        self.dist_redis = dist_redis
+        self.lease_ttl_sec = lease_ttl_sec
+        self.interval_sec = interval_sec
+        self.lease_lost = threading.Event()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name=f"etl-hb-{self.pipeline_id[:8]}", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(timeout=self.interval_sec):
+            if self.dist_token and self.dist_redis is not None:
+                if not _renew_distributed_etl_lock(
+                    self.pipeline_id, self.dist_token, self.dist_redis, self.lease_ttl_sec
+                ):
+                    self.lease_lost.set()
+                    return
+            now = datetime.now(timezone.utc)
+            exp = now + timedelta(seconds=self.lease_ttl_sec)
+            try:
+                with db_session_scope() as hdb:
+                    updated = (
+                        hdb.query(EtlPipeline)
+                        .filter(
+                            EtlPipeline.id == self.pipeline_id,
+                            EtlPipeline.is_running == True,
+                            EtlPipeline.fence_token == self.fence_token,
+                        )
+                        .update(
+                            {"heartbeat_at": now, "lease_expires_at": exp},
+                            synchronize_session=False,
+                        )
+                    )
+                    if updated == 0:
+                        self.lease_lost.set()
+                        return
+                    hdb.query(EtlJobRun).filter(
+                        EtlJobRun.pipeline_id == self.pipeline_id,
+                        EtlJobRun.status == "running",
+                        EtlJobRun.fence_token == self.fence_token,
+                    ).update(
+                        {"heartbeat_at": now, "lease_expires_at": exp},
+                        synchronize_session=False,
+                    )
+                    hdb.commit()
+            except Exception as exc:
+                logger.debug("ETL heartbeat tick skipped due to transient DB contention: %s", exc)
+
+
 def recover_stale_etl_runs(
     db: Session,
     pipeline_id: Optional[str] = None,
     max_age_minutes: Optional[int] = None,
 ) -> int:
-    """Marks abandoned running ETL pipelines/runs older than timeout as failed and resets is_running."""
+    """Marks abandoned running ETL pipelines/runs with expired leases or exceeded timeouts as failed."""
     age_mins = settings.ETL_STALE_RUN_TIMEOUT_MINUTES if max_age_minutes is None else int(max_age_minutes)
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=max(0, age_mins))
@@ -89,15 +225,21 @@ def recover_stale_etl_runs(
             .order_by(EtlJobRun.started_at.desc())
             .all()
         )
+        pl_exp = _as_utc(getattr(pl, "lease_expires_at", None))
         is_stale = False
-        if not running_runs:
-            upd = pl.updated_at if pl.updated_at.tzinfo else pl.updated_at.replace(tzinfo=timezone.utc)
-            if upd <= cutoff:
+        if pl_exp is not None and pl_exp <= now:
+            is_stale = True
+        elif not running_runs:
+            hb_or_upd = _as_utc(getattr(pl, "heartbeat_at", None)) or _as_utc(pl.updated_at)
+            if hb_or_upd is not None and hb_or_upd <= cutoff:
                 is_stale = True
         else:
             newest = running_runs[0]
-            st = newest.started_at if newest.started_at.tzinfo else newest.started_at.replace(tzinfo=timezone.utc)
-            if st <= cutoff:
+            run_exp = _as_utc(getattr(newest, "lease_expires_at", None))
+            hb_or_st = _as_utc(getattr(newest, "heartbeat_at", None)) or _as_utc(newest.started_at)
+            if run_exp is not None and run_exp <= now:
+                is_stale = True
+            elif hb_or_st is not None and hb_or_st <= cutoff:
                 is_stale = True
 
         if not is_stale:
@@ -106,7 +248,8 @@ def recover_stale_etl_runs(
         for r in running_runs:
             r.status = "failed"
             r.finished_at = now
-            r.log_text = (r.log_text or "") + "\n[RECOVERY] Stale ETL run aborted after timeout/crash."
+            r.lease_expires_at = None
+            r.log_text = (r.log_text or "") + "\n[RECOVERY] Stale ETL run aborted after lease expiry/timeout."
             db.query(EtlJob).filter(EtlJob.id == r.job_id, EtlJob.status.in_(("running", "retrying"))).update(
                 {"status": "failed"}, synchronize_session=False
             )
@@ -115,11 +258,14 @@ def recover_stale_etl_runs(
                     pipeline_id=pl.id,
                     job_run_id=r.id,
                     error_type="StaleRunRecovered",
-                    message="Recovered stale crashed or timed-out ETL execution",
+                    message="Recovered stale crashed, lease-expired, or timed-out ETL execution",
                     traceback="",
                 )
             )
         pl.is_running = False
+        pl.active_worker_id = None
+        pl.lease_expires_at = None
+        pl.fence_token = int(pl.fence_token or 0) + 1
         recovered += 1
 
     if recovered > 0:
@@ -170,15 +316,16 @@ def run_etl_pipeline(
     dist_token: Optional[str] = None
     dist_redis: Any = None
     claimed_db = False
+    my_fence: Optional[int] = None
+    heartbeat: Optional[_EtlLeaseHeartbeat] = None
 
     try:
-        dist_ok, dist_token, dist_redis = _acquire_distributed_etl_lock(
-            pipeline_id, max(settings.ETL_RUN_TIMEOUT_SECONDS * 2, 120)
-        )
+        lease_ttl = max(_ETL_LEASE_TTL_SEC, 45)
+        dist_ok, dist_token, dist_redis = _acquire_distributed_etl_lock(pipeline_id, lease_ttl)
         if not dist_ok:
             return {
                 "status": "skipped_duplicate",
-                "message": "Pipeline lock held by another worker; duplicate execution prevented",
+                "message": "Pipeline lock held by another worker or distributed lock unavailable; duplicate prevented",
                 "pipeline_id": pipeline_id,
             }
 
@@ -189,10 +336,21 @@ def run_etl_pipeline(
         if pipeline.is_running:
             recover_stale_etl_runs(db, pipeline_id=pipeline_id)
 
+        claim_now = datetime.now(timezone.utc)
+        claim_exp = claim_now + timedelta(seconds=lease_ttl)
         claimed = (
             db.query(EtlPipeline)
             .filter(EtlPipeline.id == pipeline_id, EtlPipeline.is_running == False)
-            .update({"is_running": True}, synchronize_session=False)
+            .update(
+                {
+                    "is_running": True,
+                    "fence_token": func.coalesce(EtlPipeline.fence_token, 0) + 1,
+                    "active_worker_id": _WORKER_ID,
+                    "heartbeat_at": claim_now,
+                    "lease_expires_at": claim_exp,
+                },
+                synchronize_session=False,
+            )
         )
         db.commit()
         if claimed == 0:
@@ -203,6 +361,18 @@ def run_etl_pipeline(
             }
         claimed_db = True
         db.refresh(pipeline)
+        my_fence = int(pipeline.fence_token or 1)
+
+        heartbeat = _EtlLeaseHeartbeat(
+            pipeline_id=pipeline.id,
+            fence_token=my_fence,
+            worker_id=_WORKER_ID,
+            dist_token=dist_token,
+            dist_redis=dist_redis,
+            lease_ttl_sec=lease_ttl,
+            interval_sec=_ETL_HEARTBEAT_INTERVAL_SEC,
+        )
+        heartbeat.start()
 
         job = EtlJob(pipeline_id=pipeline.id, trigger_type=trigger_type, status="running", attempt_count=1)
         db.add(job)
@@ -218,6 +388,10 @@ def run_etl_pipeline(
         logs: list[str] = []
 
         for attempt in range(1, max_retries + 2):
+            if heartbeat.lease_lost.is_set():
+                raise RuntimeError("ETL lease lost before attempt start")
+            _assert_pipeline_fenced(db, pipeline.id, my_fence, _WORKER_ID)
+
             job.attempt_count = attempt
             started_at = datetime.now(timezone.utc)
             t0 = time.perf_counter()
@@ -226,6 +400,10 @@ def run_etl_pipeline(
                 pipeline_id=pipeline.id,
                 status="running",
                 started_at=started_at,
+                fence_token=my_fence,
+                worker_id=_WORKER_ID,
+                heartbeat_at=started_at,
+                lease_expires_at=started_at + timedelta(seconds=lease_ttl),
             )
             db.add(run_record)
             db.commit()
@@ -339,6 +517,10 @@ def run_etl_pipeline(
                 rows_inserted = 0
                 rows_updated = 0
 
+                if heartbeat.lease_lost.is_set():
+                    raise RuntimeError("ETL lease lost before warehouse write")
+                _assert_pipeline_fenced(db, pipeline.id, my_fence, _WORKER_ID)
+
                 if len(transformed_df) == 0 and warehouse.table_exists(dataset.warehouse_table):
                     logs.append("No new/changed rows detected since last checkpoint.")
                 else:
@@ -438,6 +620,10 @@ def run_etl_pipeline(
                 inv_count = cache_manager.invalidate_dataset(dataset.id)
                 logs.append(f"Refreshed dataset v{dataset.data_version} ({total_rows} rows); invalidated {inv_count} cache entries")
 
+                if heartbeat.lease_lost.is_set():
+                    raise RuntimeError("ETL lease lost before job completion commit")
+                _assert_pipeline_fenced(db, pipeline.id, my_fence, _WORKER_ID)
+
                 elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
                 run_record.status = "succeeded"
                 run_record.rows_extracted = rows_extracted
@@ -446,6 +632,7 @@ def run_etl_pipeline(
                 run_record.rows_unchanged = rows_unchanged
                 run_record.duration_ms = elapsed_ms
                 run_record.finished_at = datetime.now(timezone.utc)
+                run_record.lease_expires_at = None
                 run_record.log_text = "\n".join(logs)
 
                 job.status = "succeeded"
@@ -468,6 +655,7 @@ def run_etl_pipeline(
                     "pipeline_id": pipeline.id,
                     "job_id": job.id,
                     "run_id": run_record.id,
+                    "fence_token": my_fence,
                     "attempts": attempt,
                     "rows_extracted": rows_extracted,
                     "rows_inserted": rows_inserted,
@@ -486,6 +674,7 @@ def run_etl_pipeline(
                 run_record.status = "failed"
                 run_record.duration_ms = elapsed_ms
                 run_record.finished_at = datetime.now(timezone.utc)
+                run_record.lease_expires_at = None
                 run_record.log_text = "\n".join(logs)
 
                 db.add(
@@ -506,6 +695,11 @@ def run_etl_pipeline(
                     ds.freshness_status = "stale"
                 db.commit()
 
+                if heartbeat.lease_lost.is_set() or "fenced" in str(exc).lower():
+                    job.status = "failed"
+                    db.commit()
+                    break
+
                 if attempt <= max_retries:
                     job.status = "retrying"
                     db.commit()
@@ -520,15 +714,26 @@ def run_etl_pipeline(
             "status": "failed",
             "pipeline_id": pipeline.id,
             "job_id": job.id,
-            "attempts": max_retries + 1,
+            "fence_token": my_fence,
+            "attempts": attempt if "attempt" in locals() else 1,
             "error": str(last_exc),
             "logs": logs,
         }
     finally:
-        if claimed_db:
+        if heartbeat is not None:
+            heartbeat.stop()
+        if claimed_db and my_fence is not None:
             try:
-                db.query(EtlPipeline).filter(EtlPipeline.id == pipeline_id).update(
-                    {"is_running": False}, synchronize_session=False
+                db.query(EtlPipeline).filter(
+                    EtlPipeline.id == pipeline_id,
+                    EtlPipeline.fence_token == my_fence,
+                ).update(
+                    {
+                        "is_running": False,
+                        "active_worker_id": None,
+                        "lease_expires_at": None,
+                    },
+                    synchronize_session=False,
                 )
                 db.commit()
             except Exception:

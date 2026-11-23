@@ -62,6 +62,7 @@ PERMISSION_CATALOG: list[tuple[str, str, str]] = [
     ("dashboard", "export", "Export dashboard"),
     ("dashboard", "share", "Share or embed dashboard"),
     ("dashboard", "manage_permissions", "Manage dashboard permissions"),
+    ("dashboard", "public_restricted_override", "Authorize publishing dashboards containing restricted datasets"),
     # Dashboard Page
     ("dashboard_page", "view", "View dashboard page"),
     ("dashboard_page", "edit", "Edit dashboard page"),
@@ -284,7 +285,12 @@ class PermissionResolver:
             if cached is not None:
                 return cached
 
-        decision = self._evaluate(db, user, resource_type, resource_id, action, parent_chain)
+        try:
+            decision = self._evaluate(db, user, resource_type, resource_id, action, parent_chain)
+        except Exception as exc:
+            return PermissionDecision(False, f"policy_evaluation_failed:{type(exc).__name__}", "fail_closed")
+        if not isinstance(decision, PermissionDecision):
+            return PermissionDecision(False, "invalid_policy_decision", "fail_closed")
         with self._lock:
             if len(self._memo) > 10000:
                 self._memo.clear()

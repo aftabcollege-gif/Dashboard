@@ -222,3 +222,33 @@
 7. **Stage 8 (Demo vs Production Hygiene):** Clean auth cookie client flow in `api.ts`, explicit demo-mode notices, isolate `demoStore` strictly to preview demo mode.
 8. **Stage 9 (Database Migrations, Health & CI):** Alembic setup, update `postgres_schema.sql`, pooling & deep healthcheck, CI workflow + SAST checks.
 9. **Stage 10 (Final E2E Verification & Production Packaging Check):** Full pytest security/concurrency/BI/BPMN/AI suites, frontend TypeScript + Next build (`VERCEL=1` & standard), live server E2E, Windows installer build script & security E2E validation, and clean branch readiness.
+
+---
+
+## Stage 4 Closure & Verification Summary (`arena/590acc8b-dashboard`)
+
+All Stage 1–4 security, multi-tenancy, reliability, desktop packaging, and frontend↔backend contract findings have been implemented and verified end-to-end:
+
+- **Windows Desktop Production & `/admin/security` Users & Permission Matrix Fix:**
+  - `frontend/src/app/admin/security/page.tsx` rewritten to unwrap `{roles, catalog}`, replace silent `.catch(() => {})` calls with `Promise.allSettled` + explicit error/retry banners, restore full User/Role/Group CRUD, handle 0-dashboard clean desktop installs via Role Catalog matrix mode + widget matrix + remove-override mode, and fix `res.copied`, `resource_type`, and CLS `hidden_columns`.
+  - `backend/app/api/users_rbac.py` now returns normalized `roles` and `role_ids` / `role_slugs`, blocks non-delegable/admin escalation (`super_admin`, `admin:*`), and protects system roles.
+  - `frontend/src/lib/vercelDemoApi.ts` updated with `GET /rbac/groups` and `{roles, catalog}` compatibility.
+- **Remaining Frontend↔Backend Contract Fixes:**
+  - `frontend/src/app/reports/page.tsx`: uses `res.bytes ?? res.size_bytes ?? 0` and safe `res.format`.
+  - `frontend/src/app/query-builder/page.tsx`: reads `res.query_plan ?? res.explain_plan` and `h.sql_text || h.query_hash`.
+  - `frontend/src/app/admin/monitoring/page.tsx`: `Promise.allSettled`, error banner, and `try/catch` around cache invalidation & CSV export (`?search=` verified natively in `backend/app/api/monitoring.py`).
+  - `frontend/src/app/settings/page.tsx`: verified `POST /themes` supports default auto-slug generation in `backend/app/api/themes.py`.
+  - `frontend/package.json`: replaced removed Next.js 16 `next lint` with `next typegen && tsc --noEmit`.
+- **Stage 4 Security & Reliability Hardening:**
+  - **Public Dashboard Override Governance:** `dashboard:public_restricted_override`, `inspect_dataset_public_safety`, `PUT /dashboards/{id}/public-override` audit trail, automatic unpublish on revocation, showcase `is_public=False` default.
+  - **DuckDB & SSRF Hardening:** `enable_external_access = false`, `lock_configuration = true`, `check_readiness()` startup verification, sanitized production 500 handler (`error_id` correlation), and `_PinnedSSRFHTTPTransport` pre-validated IP pinning preventing DNS rebinding.
+  - **Atomic Rate Limiting, Cookie Refresh & Production Schema Verification:** Atomic Redis Lua sliding-window limiter with fail-closed prod protection, proxy header CIDR validation, cookie-mode `/auth/refresh` omitting bearer tokens unless explicitly requested, `SystemBootstrapState` DB singleton (`0003_stage4_security_reliability.py`), ETL fencing/lease heartbeat, single-worker + leader lock scheduler, and production Alembic head + legacy schema contract verification.
+- **Verification Results:**
+  - `.venv/bin/pytest backend/tests -v` → **39 passed, 0 failed** (including `test_stage2_security.py`, `test_stage3_security.py`, `test_stage4_security.py`).
+  - `bandit -r backend/app -lll -q` & `bandit -r backend/app -ll -s B608 -q` → **0 findings**.
+  - `pip-audit -r backend/requirements.txt` & `npm audit --omit=dev` → **0 known vulnerabilities**.
+  - `alembic upgrade head && alembic check` + `downgrade 0002 -> upgrade head` + `postgres_schema.sql` parity check → **0 drift**.
+  - `npm run lint && npm run typecheck && NEXT_OUTPUT_MODE=standalone NEXT_DISABLE_BUILD_REWRITES=1 npm run build` → **12/12 Next.js routes compiled cleanly**.
+  - `.venv/bin/python winsetup/tests/test_desktop_security_e2e.py` → **All 9 desktop security & gateway E2E checks passed**.
+  - `.venv/bin/python backend/scripts/benchmark_stage4.py` → **Verified sub-10ms 100k DuckDB analytics & 121ms warm 9-widget batch execution** (see `docs/08_performance_benchmark_report.md`).
+

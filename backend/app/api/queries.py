@@ -3,10 +3,9 @@ import sqlparse
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from app.api.deps import enforce_permission, get_client_ip, get_current_user
+from app.api.deps import enforce_permission, enforce_scoped_rate_limit, get_client_ip, get_current_user
 from app.config import settings
 from app.core.audit import record_audit
-from app.core.rate_limit import rate_limiter
 from app.core.rls_cls import apply_cls_and_masking, build_data_security_context
 from app.core.sql_guard import validate_readonly_sql_ast
 from app.core.tenant import (
@@ -75,8 +74,17 @@ def execute_sql_editor(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    rate_limiter.check(f"sql_exec:{user.id}", limit=settings.RATE_LIMIT_SQL_PER_MIN, window_seconds=60)
-    enforce_permission(db, user, "query", "*", "execute", ip_address=get_client_ip(request))
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "execute_sql",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 5,
+    )
+    enforce_permission(db, user, "query", "*", "execute", ip_address=ip)
     ds = get_dataset_for_org(db, body.dataset_id, user.organization_id) if body.dataset_id else None
     bounded_limit = max(1, min(int(body.limit), settings.MAX_QUERY_ROWS))
     try:
@@ -111,11 +119,21 @@ def execute_sql_editor(
 @router.post("/execute-visual")
 def execute_visual_builder(
     body: VisualExecuteRequest,
+    request: Request,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    rate_limiter.check(f"sql_visual:{user.id}", limit=settings.RATE_LIMIT_SQL_PER_MIN, window_seconds=60)
-    enforce_permission(db, user, "query", "*", "execute")
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "execute_visual",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 5,
+    )
+    enforce_permission(db, user, "query", "*", "execute", ip_address=ip)
     ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
     enforce_permission(db, user, "dataset", ds.id, "view")
     try:

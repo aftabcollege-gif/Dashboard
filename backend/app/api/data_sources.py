@@ -7,10 +7,9 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from app.api.deps import enforce_permission, get_client_ip, get_current_user
+from app.api.deps import enforce_permission, enforce_scoped_rate_limit, get_client_ip, get_current_user
 from app.config import settings
 from app.core.audit import record_audit
-from app.core.rate_limit import rate_limiter
 from app.core.security import decrypt_secret, encrypt_secret
 from app.core.tenant import get_data_source_for_org
 from app.database import get_db
@@ -206,9 +205,18 @@ def execute_direct_source_query(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    rate_limiter.check(f"source_sql:{user.id}", limit=settings.RATE_LIMIT_SQL_PER_MIN, window_seconds=60)
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "source_sql",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 5,
+    )
     src = get_data_source_for_org(db, source_id, user.organization_id)
-    enforce_permission(db, user, "data_source", src.id, "execute_query", ip_address=get_client_ip(request))
+    enforce_permission(db, user, "data_source", src.id, "execute_query", ip_address=ip)
     cred_row = db.query(DataSourceCredential).filter(DataSourceCredential.data_source_id == src.id).first()
     creds = json.loads(decrypt_secret(cred_row.encrypted_payload)) if cred_row else {}
     bounded_limit = max(1, min(int(body.limit), 2000))
