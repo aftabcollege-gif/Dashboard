@@ -38,6 +38,7 @@ class AiAnalyticsEngine:
         include_profile: bool = True,
         *,
         related_dataset_ids: Optional[list[str]] = None,
+        calendar_mode: str = "jalali",
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         from app.engines.kpi_engine import IntelligentKpiEngine
@@ -46,7 +47,9 @@ class AiAnalyticsEngine:
             db,
             dataset,
             user=user,
+            calendar_mode=calendar_mode,
             related_dataset_ids=related_dataset_ids,
+            auto_generate_kpis=True,
             force_refresh=force_refresh,
         )
         # Flatten pages into backward-compatible suggested_widgets list while exposing full 5-stage analysis
@@ -125,9 +128,12 @@ class AiAnalyticsEngine:
         max_pages: int = 7,
         theme_id: Optional[str] = None,
         selected_kpi_ids: Optional[list[str]] = None,
+        confirmed_kpis: Optional[list[dict[str, Any]]] = None,
+        auto_generate_kpis: bool = False,
         custom_kpis: Optional[list[dict[str, Any]]] = None,
         target_values: Optional[dict[str, float]] = None,
         related_dataset_ids: Optional[list[str]] = None,
+        dashboard_id: Optional[str] = None,
     ) -> Dashboard:
         from app.engines.kpi_engine import IntelligentKpiEngine
 
@@ -144,9 +150,12 @@ class AiAnalyticsEngine:
             max_pages=max_pages,
             theme_id=theme_id,
             selected_kpi_ids=selected_kpi_ids,
+            confirmed_kpis=confirmed_kpis,
+            auto_generate_kpis=auto_generate_kpis,
             custom_kpis=custom_kpis,
             target_values=target_values,
             related_dataset_ids=related_dataset_ids,
+            dashboard_id=dashboard_id,
         )
         return dash
 

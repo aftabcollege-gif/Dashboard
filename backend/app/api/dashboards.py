@@ -194,6 +194,13 @@ class WidgetExecuteRequest(BaseModel):
     use_cache: bool = True
 
 
+class WidgetDrillDetailsRequest(BaseModel):
+    active_filters: list[dict[str, Any]] = []
+    cross_filters: list[dict[str, Any]] = []
+    breakdown_dimension: Optional[str] = None
+    limit: int = 100
+
+
 class BatchExecuteRequest(BaseModel):
     page_id: Optional[str] = None
     active_filters: list[dict[str, Any]] = []
@@ -2005,6 +2012,133 @@ def get_widget_data(
         raise HTTPException(status_code=504, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/widgets/{widget_id}/drill-details")
+def get_widget_drill_details(
+    widget_id: str,
+    body: WidgetDrillDetailsRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "widget_data",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_WIDGET_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_WIDGET_PER_MIN,
+        org_limit=settings.RATE_LIMIT_WIDGET_PER_MIN * 5,
+    )
+    w, _ = get_widget_for_org(db, widget_id, user.organization_id)
+    parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
+    enforce_permission(db, user, "widget", w.id, "view", parent_chain=parent_chain, ip_address=ip)
+
+    wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
+    wdr = db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id == w.id).first()
+    target_ds_id = wq.dataset_id if wq and wq.dataset_id else w.dataset_id
+    ds = (
+        db.query(Dataset)
+        .filter(Dataset.id == target_ds_id, Dataset.organization_id == user.organization_id)
+        .first()
+        if target_ds_id
+        else None
+    )
+    if not ds:
+        raise HTTPException(status_code=400, detail="Widget has no underlying dataset for drill-down")
+
+    ds_dec = permission_resolver.resolve(db, user, "dataset", ds.id, "view")
+    if not ds_dec.allowed and ds_dec.reason.startswith("explicit_deny"):
+        raise HTTPException(status_code=403, detail=f"Permission denied for dataset '{ds.name}' ({ds_dec.reason})")
+
+    # Build effective filters respecting widget scope, cross-filters, and permanent widget filters
+    dash_filters_db = db.query(DashboardFilter).filter(DashboardFilter.dashboard_id == w.dashboard_id).all()
+    df_meta = {df.id: df for df in dash_filters_db}
+    effective_filters: list[dict[str, Any]] = []
+    for af in body.active_filters:
+        fid = af.get("filter_id")
+        meta = df_meta.get(fid) if fid else None
+        if meta:
+            if meta.scope == "dashboard" and meta.page_id and meta.page_id != w.page_id:
+                continue
+            if meta.excluded_widget_ids and w.id in meta.excluded_widget_ids:
+                continue
+            if meta.target_widget_ids and w.id not in meta.target_widget_ids:
+                continue
+        effective_filters.append(af)
+    for cf in body.cross_filters:
+        if cf.get("source_widget_id") != w.id:
+            effective_filters.append(cf)
+    for wf in db.query(WidgetFilter).filter(WidgetFilter.widget_id == w.id, WidgetFilter.is_active == True).all():
+        val = wf.value_json.get("value") if isinstance(wf.value_json, dict) and "value" in wf.value_json else wf.value_json
+        effective_filters.append({"field_name": wf.field_name, "operator": wf.operator, "value": val, "is_active": True})
+
+    sec_ctx = build_data_security_context(db, user, ds.id)
+    visual_spec = dict(wq.visual_spec_json) if wq and isinstance(wq.visual_spec_json, dict) else {}
+    row_limit = max(10, min(int(body.limit or 100), 200))
+    raw_spec = {**visual_spec, "limit": row_limit}
+
+    # Determine breakdown dimension (requested > drill hierarchy > first non-metric string column)
+    hierarchy = list(wdr.hierarchy_json or []) if wdr and isinstance(wdr.hierarchy_json, list) else []
+    available_dims = [str(h.get("field")) for h in hierarchy if isinstance(h, dict) and h.get("field")]
+    if not available_dims:
+        ds_fields = db.query(DatasetField).filter(DatasetField.dataset_id == ds.id).all()
+        for f in ds_fields:
+            if f.semantic_type == "dimension" and f.data_type in {"string", "text", "varchar"}:
+                available_dims.append(f.field_name)
+    chosen_dim = body.breakdown_dimension if body.breakdown_dimension in available_dims else (available_dims[0] if available_dims else None)
+
+    try:
+        # 1. Raw underlying records (RBAC + RLS + CLS enforced)
+        raw_bundle: dict[str, Any] = {}
+        raw_sql, raw_params, _ = build_visual_query_sql(
+            db, ds, raw_spec, effective_filters, sec_ctx.rls_where_clauses, sec_ctx.rls_params,
+            raw_mode=True, user=user, enforce_join_rbac=True, security_bundle_out=raw_bundle,
+        )
+        raw_eff_ctx: DataSecurityContext = raw_bundle.get("merged_sec_ctx") or sec_ctx
+        raw_res = warehouse.execute_query(raw_sql, raw_params, limit=row_limit)
+        vis_cols, masked_rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], raw_eff_ctx)
+
+        # 2. Dimensional breakdown for KPI/Gauge widgets
+        breakdown_rows: list[dict[str, Any]] = []
+        breakdown_cols: list[str] = []
+        if chosen_dim and not visual_spec.get("multi_source_agg"):
+            bd_bundle: dict[str, Any] = {}
+            bd_spec = {**visual_spec, "dimension": chosen_dim, "limit": 25}
+            bd_sql, bd_params, _ = build_visual_query_sql(
+                db, ds, bd_spec, effective_filters, sec_ctx.rls_where_clauses, sec_ctx.rls_params,
+                override_dimension=chosen_dim, raw_mode=False, user=user, enforce_join_rbac=True,
+                security_bundle_out=bd_bundle,
+            )
+            bd_eff_ctx: DataSecurityContext = bd_bundle.get("merged_sec_ctx") or sec_ctx
+            bd_raw = warehouse.execute_query(bd_sql, bd_params, limit=25)
+            breakdown_cols, breakdown_rows = apply_cls_and_masking(bd_raw["columns"], bd_raw["rows"], bd_eff_ctx)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    record_audit(
+        db, user.organization_id, "kpi_drill_details", "widget", resource_id=w.id,
+        status="success", user_id=user.id, username=user.username, ip_address=ip,
+        details={"dimension": chosen_dim, "rows": len(masked_rows)},
+    )
+
+    return {
+        "widget_id": w.id,
+        "title": w.title,
+        "formula": visual_spec.get("formula"),
+        "drill_through_page_id": wdr.drill_through_page_id if wdr else None,
+        "available_dimensions": available_dims,
+        "breakdown_dimension": chosen_dim,
+        "breakdown_columns": breakdown_cols,
+        "breakdown_rows": breakdown_rows,
+        "columns": vis_cols,
+        "rows": masked_rows,
+        "row_count": len(masked_rows),
+    }
 
 
 @router.post("/{dashboard_id}/execute-batch")

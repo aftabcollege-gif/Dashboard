@@ -18,6 +18,7 @@ export default function DashboardsListPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [showAssistant, setShowAssistant] = useState(true);
   const [showSmartStudio, setShowSmartStudio] = useState(false);
+  const [studioDatasetId, setStudioDatasetId] = useState("");
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
 
@@ -59,15 +60,11 @@ export default function DashboardsListPage() {
     }
   };
 
-  const handleAiGen = async (dsId: string) => {
-    try {
-      const res = await apiFetch<{ dashboard_id: string }>("/ai/generate-dashboard", {
-        method: "POST",
-        body: JSON.stringify({ dataset_id: dsId }),
-      });
-      window.location.href = `/dashboards/${res.dashboard_id}`;
-    } catch (err: any) {
-      showToast(err.message);
+  const handleAiGen = (dsId: string) => {
+    setStudioDatasetId(dsId);
+    setShowSmartStudio(true);
+    if (typeof window !== "undefined") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
   };
 
@@ -129,7 +126,8 @@ export default function DashboardsListPage() {
 
         {showSmartStudio && (
           <IntelligentDashboardStudio
-            initialDatasetId={datasets[0]?.id}
+            key={studioDatasetId || datasets[0]?.id || "default"}
+            initialDatasetId={studioDatasetId || datasets[0]?.id}
             onClose={() => setShowSmartStudio(false)}
           />
         )}
@@ -198,7 +196,7 @@ export default function DashboardsListPage() {
         {datasets.length > 0 && (
           <div className="bi-card p-5 space-y-3">
             <div className="flex items-center gap-2 text-sm font-bold">
-              <Bot className="w-4 h-4 text-violet-500" /> {isFa ? "ساخت سریع ۱-کلیکی داشبورد از منبع داده" : "Generate AI Dashboard from Dataset"}
+              <Bot className="w-4 h-4 text-violet-500" /> {isFa ? "تحلیل و انتخاب KPIها برای ساخت داشبورد از منبع داده" : "Analyze & Confirm KPIs to Generate AI Dashboard"}
             </div>
             <div className="flex flex-wrap gap-2">
               {datasets.map((ds) => (

@@ -18,6 +18,7 @@ from app.engines.ai_engine import AiAnalyticsEngine
 from app.engines.data_engine import DataProfiler
 from app.engines.formula_engine import validate_and_compile_formula
 from app.engines.kpi_engine import IntelligentKpiEngine, SEMANTIC_CLASS_META, _format_kpi_value, _safe_float
+from app.engines.query_engine import build_visual_query_sql
 from app.engines.warehouse import warehouse
 from app.models.identity import User
 
@@ -27,6 +28,7 @@ router = APIRouter(prefix="/ai", tags=["AI Analytics Engine"])
 class GenerateDashboardRequest(BaseModel):
     dataset_id: str
     workspace_id: Optional[str] = None
+    dashboard_id: Optional[str] = None
     title: Optional[str] = None
     template_mode: str = "executive"
     detail_level: str = "standard"
@@ -35,6 +37,8 @@ class GenerateDashboardRequest(BaseModel):
     max_pages: int = 7
     theme_id: Optional[str] = None
     selected_kpi_ids: Optional[list[str]] = None
+    confirmed_kpis: Optional[list[dict[str, Any]]] = None
+    auto_generate_kpis: bool = False
     custom_kpis: Optional[list[dict[str, Any]]] = None
     target_values: Optional[dict[str, float]] = None
     related_dataset_ids: Optional[list[str]] = None
@@ -58,10 +62,14 @@ class KpiPreviewRequest(BaseModel):
     format_type: str = "number"
     unit: str = ""
     target_value: Optional[float] = None
+    calendar_mode: str = "jalali"
+    related_dataset_ids: Optional[list[str]] = None
+    multi_source_agg: Optional[dict[str, Any]] = None
 
 
 class KpiRegisterRequest(BaseModel):
     kpis: list[dict[str, Any]] = Field(default_factory=list)
+    related_dataset_ids: Optional[list[str]] = None
 
 
 class NlqRequest(BaseModel):
@@ -113,6 +121,7 @@ def recommend_dashboard(
     dataset_id: str,
     refresh: bool = Query(False),
     related_dataset_ids: Optional[str] = Query(None),
+    calendar_mode: str = Query("jalali"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -125,6 +134,7 @@ def recommend_dashboard(
         user=user,
         include_profile=False,
         related_dataset_ids=rel_list or None,
+        calendar_mode=calendar_mode,
         force_refresh=refresh,
     )
     sec_ctx = build_data_security_context(db, user, ds.id)
@@ -167,21 +177,59 @@ def preview_custom_kpi(
     enforce_permission(db, user, "query", "*", "execute", ip_address=get_client_ip(request))
     enforce_permission(db, user, "dataset", ds.id, "view", ip_address=get_client_ip(request))
     try:
+        ds_ids = [ds.id, *(body.related_dataset_ids or [])]
+        if body.multi_source_agg:
+            psql, pparams, _ = build_visual_query_sql(
+                db,
+                ds,
+                {"multi_source_agg": body.multi_source_agg, "calendar_mode": body.calendar_mode, "limit": 1},
+                [], [], [], user=user, enforce_join_rbac=True,
+            )
+            rows = warehouse.execute_query(psql, pparams, limit=1)["rows"]
+            val = _safe_float(rows[0].get("value")) if rows else None
+            return {
+                "valid": True,
+                "name": body.name,
+                "formula": body.formula,
+                "compiled_sql": body.formula,
+                "value": round(val, 4) if val is not None else None,
+                "formatted_value": _format_kpi_value(val, body.format_type, body.unit),
+                "target_value": body.target_value,
+                "warnings": [],
+                "output_data_type": "double",
+                "base_fields": [],
+            }
+
         comp = validate_and_compile_formula(
             db,
             user,
-            dataset_ids=[ds.id],
+            dataset_ids=ds_ids,
             formula=body.formula,
             calculation_type="analytical_metric",
             qualify_with_alias=False,
             auto_safe_divide=False,
         )
-        sc = build_data_security_context(db, user, ds.id)
-        sub_sql, sub_p, _ = build_security_projection_and_where(
-            ds.warehouse_table, warehouse.describe_table(ds.warehouse_table), sc
-        )
-        rows = warehouse.execute_query(f'SELECT ({comp["compiled_sql"]}) AS v FROM ({sub_sql}) AS _kv', sub_p, limit=1)["rows"]
-        val = _safe_float(rows[0]["v"]) if rows else None
+        if comp.get("is_aov_macro") or comp.get("is_mom_calendar_macro") or comp.get("is_window_macro"):
+            vspec: dict[str, Any] = {"formula": body.formula, "calendar_mode": body.calendar_mode, "limit": 1}
+            if comp.get("time_field"):
+                vspec["time_field"] = comp["time_field"]
+            if comp.get("is_aov_macro"):
+                vspec["pre_agg_grain"] = {
+                    "grain_field": comp["order_field"],
+                    "measure_field": comp["amount_field"],
+                    "grain_agg": "SUM",
+                }
+            psql, pparams, _ = build_visual_query_sql(db, ds, vspec, [], [], [], user=user)
+            rows = warehouse.execute_query(psql, pparams, limit=1)["rows"]
+            val = _safe_float(rows[0].get("value")) if rows else None
+        else:
+            sc = build_data_security_context(db, user, ds.id)
+            sub_sql, sub_p, _ = build_security_projection_and_where(
+                ds.warehouse_table, warehouse.describe_table(ds.warehouse_table), sc
+            )
+            rows = warehouse.execute_query(f'SELECT ({comp["compiled_sql"]}) AS v FROM ({sub_sql}) AS _kv', sub_p, limit=1)["rows"]
+            val = _safe_float(rows[0]["v"]) if rows else None
+
         return {
             "valid": True,
             "name": body.name,
@@ -192,6 +240,7 @@ def preview_custom_kpi(
             "target_value": body.target_value,
             "warnings": comp.get("warnings", []),
             "output_data_type": comp["output_data_type"],
+            "base_fields": [f["field_name"] for f in comp.get("referenced_fields", [])],
         }
     except PermissionError as pe:
         raise HTTPException(status_code=403, detail=str(pe))
@@ -210,7 +259,9 @@ def register_kpis_to_semantic_layer(
     ds = get_dataset_for_org(db, dataset_id, user.organization_id)
     enforce_permission(db, user, "dataset", ds.id, "edit", ip_address=get_client_ip(request))
     try:
-        reg = IntelligentKpiEngine.register_kpis_to_semantic_layer(db, user, ds, body.kpis)
+        reg = IntelligentKpiEngine.register_kpis_to_semantic_layer(
+            db, user, ds, body.kpis, related_dataset_ids=body.related_dataset_ids
+        )
         record_audit(
             db, user.organization_id, "kpi_registered_semantic_layer", "dataset",
             resource_id=ds.id, user_id=user.id, username=user.username, ip_address=get_client_ip(request),
@@ -229,7 +280,11 @@ def auto_generate_dashboard(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    enforce_permission(db, user, "dashboard", "*", "add", ip_address=get_client_ip(request))
+    if body.dashboard_id:
+        existing_dash = get_dashboard_for_org(db, body.dashboard_id, user.organization_id)
+        enforce_permission(db, user, "dashboard", existing_dash.id, "edit", ip_address=get_client_ip(request))
+    else:
+        enforce_permission(db, user, "dashboard", "*", "add", ip_address=get_client_ip(request))
     ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
     enforce_permission(db, user, "dataset", ds.id, "view", ip_address=get_client_ip(request))
     if body.workspace_id:
@@ -238,26 +293,37 @@ def auto_generate_dashboard(
         ws = get_default_workspace_for_org(db, user.organization_id)
         if not ws:
             raise HTTPException(status_code=404, detail="Workspace not found")
-    dash, meta = IntelligentKpiEngine.generate_and_persist_dashboard(
-        db,
-        user,
-        ws.id,
-        ds,
-        title=body.title,
-        template_mode=body.template_mode,
-        detail_level=body.detail_level,
-        calendar_mode=body.calendar_mode,
-        date_range=body.date_range,
-        max_pages=max(1, min(int(body.max_pages or 7), 10)),
-        theme_id=body.theme_id,
-        selected_kpi_ids=body.selected_kpi_ids,
-        custom_kpis=body.custom_kpis,
-        target_values=body.target_values,
-        related_dataset_ids=body.related_dataset_ids,
-    )
+    try:
+        dash, meta = IntelligentKpiEngine.generate_and_persist_dashboard(
+            db,
+            user,
+            ws.id,
+            ds,
+            title=body.title,
+            template_mode=body.template_mode,
+            detail_level=body.detail_level,
+            calendar_mode=body.calendar_mode,
+            date_range=body.date_range,
+            max_pages=max(1, min(int(body.max_pages or 7), 10)),
+            theme_id=body.theme_id,
+            selected_kpi_ids=body.selected_kpi_ids,
+            confirmed_kpis=body.confirmed_kpis,
+            auto_generate_kpis=body.auto_generate_kpis,
+            custom_kpis=body.custom_kpis,
+            target_values=body.target_values,
+            related_dataset_ids=body.related_dataset_ids,
+            dashboard_id=body.dashboard_id,
+        )
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
     record_audit(
-        db, user.organization_id, "ai_auto_dashboard", "dashboard", resource_id=dash.id,
-        user_id=user.id, username=user.username, ip_address=get_client_ip(request)
+        db, user.organization_id,
+        "ai_dashboard_kpis_updated" if body.dashboard_id else "ai_auto_dashboard",
+        "dashboard", resource_id=dash.id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
     )
     return {
         "dashboard_id": dash.id,

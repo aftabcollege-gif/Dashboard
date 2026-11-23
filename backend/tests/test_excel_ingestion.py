@@ -93,7 +93,7 @@ def test_persian_excel_preview_import_dashboard_and_cleanup(client, admin_header
     gen_res = client.post(
         "/api/v1/ai/generate-dashboard",
         headers=admin_headers,
-        json={"dataset_id": ds_id},
+        json={"dataset_id": ds_id, "auto_generate_kpis": True},
     )
     assert gen_res.status_code == 200, gen_res.text
     dash_id = gen_res.json()["dashboard_id"]
@@ -168,7 +168,7 @@ def test_wide_excel_over_250_columns_upload_profile_and_dashboard(client, admin_
     gen_res = client.post(
         "/api/v1/ai/generate-dashboard",
         headers=admin_headers,
-        json={"dataset_id": ds_id},
+        json={"dataset_id": ds_id, "auto_generate_kpis": True},
     )
     assert gen_res.status_code == 200, gen_res.text
     dash_id = gen_res.json()["dashboard_id"]
@@ -212,7 +212,7 @@ def test_large_excel_over_50k_rows_streaming_import_and_dashboard(client, admin_
     gen_res = client.post(
         "/api/v1/ai/generate-dashboard",
         headers=admin_headers,
-        json={"dataset_id": ds_id},
+        json={"dataset_id": ds_id, "auto_generate_kpis": True},
     )
     assert gen_res.status_code == 200, gen_res.text
     dash_id = gen_res.json()["dashboard_id"]
@@ -313,7 +313,7 @@ def test_log_files_apache_app_jsonl_txt_upload_and_ai_dashboard(client, admin_he
     gen_apache = client.post(
         "/api/v1/ai/generate-dashboard",
         headers=admin_headers,
-        json={"dataset_id": apache_ds_id},
+        json={"dataset_id": apache_ds_id, "auto_generate_kpis": True},
     )
     assert gen_apache.status_code == 200, gen_apache.text
     dash_id = gen_apache.json()["dashboard_id"]

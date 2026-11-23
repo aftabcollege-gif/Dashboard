@@ -382,6 +382,7 @@ SAFE_FORMULA_FUNCS = {
     "year", "quarter", "month", "week", "day", "dayofweek", "dayofyear", "epoch",
     "timezone", "at_time_zone",
     "jalali_year", "jalali_month", "jalali_quarter", "jalali_date",
+    "aov", "mom_calendar",
 }
 
 ALLOWED_FORMULA_NON_FUNC_NODES = (

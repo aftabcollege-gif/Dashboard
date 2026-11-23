@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { BarChart2, GitBranch, Layers, Plus, Sparkles } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
 import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
@@ -9,7 +8,6 @@ import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
 export default function DatasetsPage() {
-  const router = useRouter();
   const { user, locale, showToast } = useBi();
   const [datasets, setDatasets] = useState<any[]>([]);
   const [selected, setSelected] = useState<any>(null);
@@ -18,7 +16,6 @@ export default function DatasetsPage() {
   const [lineage, setLineage] = useState<any>(null);
   const [metrics, setMetrics] = useState<any[]>([]);
   const [relationships, setRelationships] = useState<any[]>([]);
-  const [buildingDash, setBuildingDash] = useState(false);
   const [showSmartStudio, setShowSmartStudio] = useState(false);
   const [previewColPage, setPreviewColPage] = useState(0);
   const [profSearch, setProfSearch] = useState("");
@@ -64,21 +61,9 @@ export default function DatasetsPage() {
     setLineage(lin);
   };
 
-  const handleBuildDashboard = async () => {
-    if (!selected || buildingDash) return;
-    setBuildingDash(true);
-    try {
-      const res = await apiFetch<any>("/ai/generate-dashboard", {
-        method: "POST",
-        body: JSON.stringify({ dataset_id: selected.id }),
-      });
-      showToast(locale === "fa" ? `داشبورد «${res.title}» ساخته شد!` : `Created dashboard "${res.title}"`);
-      router.push(`/dashboards/${res.dashboard_id}`);
-    } catch (err: any) {
-      showToast(err.message);
-    } finally {
-      setBuildingDash(false);
-    }
+  const handleBuildDashboard = () => {
+    if (!selected) return;
+    setShowSmartStudio(true);
   };
 
   const handleAddCalculatedField = async (e: React.FormEvent) => {
@@ -189,22 +174,11 @@ export default function DatasetsPage() {
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => setShowSmartStudio((s) => !s)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-xs font-semibold bg-indigo-600 hover:bg-indigo-700"
-                    >
-                      <Sparkles className="w-3.5 h-3.5" />
-                      {locale === "fa" ? "استودیوی هوشمند KPI" : "Smart KPI Studio"}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={buildingDash}
                       onClick={handleBuildDashboard}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-xs font-semibold bg-violet-600 hover:bg-violet-700 disabled:opacity-60"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-xs font-semibold bg-violet-600 hover:bg-violet-700"
                     >
                       <Sparkles className="w-3.5 h-3.5" />
-                      {buildingDash
-                        ? locale === "fa" ? "در حال ساخت داشبورد..." : "Building..."
-                        : locale === "fa" ? "ساخت فوری داشبورد" : "Build Dashboard"}
+                      {locale === "fa" ? "تحلیل، انتخاب KPIها و ساخت داشبورد" : "Confirm KPIs & Build Dashboard"}
                     </button>
                     <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-500 font-semibold">
                       {selected.freshness_status || "fresh"} · v{selected.data_version ?? 1}
@@ -214,6 +188,7 @@ export default function DatasetsPage() {
                 {showSmartStudio && (
                   <div className="pt-2">
                     <IntelligentDashboardStudio
+                      key={selected.id}
                       initialDatasetId={selected.id}
                       onClose={() => setShowSmartStudio(false)}
                     />

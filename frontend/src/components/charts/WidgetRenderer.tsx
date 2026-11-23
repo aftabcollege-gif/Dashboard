@@ -144,13 +144,14 @@ function StandardWidgetRenderer({
 
   // ---------------- 1. KPI CARD ----------------
   if (chartType === "kpi") {
-    const val = rows[0]?.[yField] ?? rows[0]?.[columns[0]] ?? 0;
-    const numericVal = Number(val) || 0;
+    const val = rows[0]?.[yField] ?? rows[0]?.[columns[0]] ?? null;
+    const hasVal = val !== null && val !== undefined && val !== "" && !Number.isNaN(Number(val));
+    const numericVal = hasVal ? Number(val) : 0;
     const target = Number(styleConfig.target_value || 0);
     const hasPrev = styleConfig.previous_value !== undefined && styleConfig.previous_value !== null && Number(styleConfig.previous_value) !== 0;
     const prev = Number(styleConfig.previous_value || 0);
-    const pctChange = hasPrev ? ((numericVal - prev) / Math.abs(prev)) * 100 : null;
-    const targetPct = target > 0 ? Math.min(100, Math.round((numericVal / target) * 100)) : null;
+    const pctChange = hasVal && hasPrev ? ((numericVal - prev) / Math.abs(prev)) * 100 : null;
+    const targetPct = hasVal && target > 0 ? Math.min(100, Math.round((numericVal / target) * 100)) : null;
     const statusColor =
       targetPct === null
         ? palette[0]
@@ -175,10 +176,24 @@ function StandardWidgetRenderer({
     const poly = sparkNorm.map((m, idx) => `${(idx * stepX).toFixed(1)},${(28 - m * 22).toFixed(1)}`).join(" ");
 
     return (
-      <div className="h-full flex flex-col justify-between gap-1 p-0.5">
+      <div
+        role={onPointClick ? "button" : undefined}
+        tabIndex={onPointClick ? 0 : undefined}
+        onClick={() => onPointClick?.("__kpi_drill__", hasVal ? numericVal : null)}
+        onKeyDown={(e) => {
+          if (onPointClick && (e.key === "Enter" || e.key === " ")) {
+            e.preventDefault();
+            onPointClick("__kpi_drill__", hasVal ? numericVal : null);
+          }
+        }}
+        title={onPointClick ? (locale === "fa" ? "کلیک برای تحلیل جزئیات و رکوردهای KPI" : "Click to inspect KPI breakdown & records") : undefined}
+        className={`h-full flex flex-col justify-between gap-1 p-0.5 rounded-lg transition ${
+          onPointClick ? "cursor-pointer hover:bg-blue-500/5" : ""
+        }`}
+      >
         <div className="flex items-start justify-between gap-2 min-w-0">
           <div className="text-lg sm:text-xl lg:text-2xl font-bold tracking-tight leading-tight truncate min-w-0" style={{ color: textColor }}>
-            {formatBIValue(numericVal, numFmt, decimals, unit, abbreviate)}
+            {hasVal ? formatBIValue(numericVal, numFmt, decimals, unit, abbreviate) : "—"}
           </div>
           {styleConfig.show_sparkline !== false && (
             <svg viewBox="0 0 120 32" className="w-12 sm:w-20 h-6 sm:h-7 shrink-0 opacity-90">
@@ -204,7 +219,9 @@ function StandardWidgetRenderer({
               {Math.abs(pctChange).toFixed(1)}% {locale === "fa" ? "نسبت به قبل" : "vs prev"}
             </span>
           ) : (
-            <span style={{ color: mutedColor }}>{locale === "fa" ? "شاخص زنده" : "Live KPI"}</span>
+            <span style={{ color: mutedColor }}>
+              {locale === "fa" ? (onPointClick ? "شاخص زنده (کلیک برای جزئیات)" : "شاخص زنده") : (onPointClick ? "Live KPI (Click for details)" : "Live KPI")}
+            </span>
           )}
           {targetPct !== null && (
             <div className="flex items-center gap-1.5 flex-1 min-w-[70px] max-w-[160px]">
@@ -266,11 +283,15 @@ function StandardWidgetRenderer({
     return (
       <div className="h-full overflow-y-auto flex flex-col justify-center space-y-3 pr-1">
         {items.map((it, idx) => (
-          <div
-            key={idx}
-            className="space-y-1 cursor-pointer hover:opacity-90"
-            onClick={() => it.rawX !== undefined && onPointClick?.(xField, it.rawX)}
-          >
+            <div
+              key={idx}
+              className="space-y-1 cursor-pointer hover:opacity-90"
+              onClick={() =>
+                it.rawX !== undefined
+                  ? onPointClick?.(xField, it.rawX)
+                  : onPointClick?.("__kpi_drill__", it.actual)
+              }
+            >
             <div className="flex justify-between text-xs font-medium gap-2">
               <span className="truncate">{it.lbl}</span>
               <span className="shrink-0 text-[11px]">
@@ -519,6 +540,10 @@ function EChartsCanvas(props: {
     chart.on("click", (params: any) => {
       if (!props.onPointClick) return;
       if (props.chartType === "radar") return;
+      if (props.chartType === "gauge") {
+        props.onPointClick("__kpi_drill__", Array.isArray(params.value) ? params.value[0] : params.value);
+        return;
+      }
       let clickedVal: any = params.name;
       if (props.chartType === "sankey" && params.dataType === "edge") {
         clickedVal = params.data?.source;

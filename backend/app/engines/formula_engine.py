@@ -544,6 +544,24 @@ SQL_FUNCTION_CATALOG: list[dict[str, Any]] = [
         "common_errors_fa": "نیازمند ستون مرتب‌سازی روی محور افقی.",
         "engine_notes_fa": "از پنجره UNBOUNDED PRECEDING AND CURRENT ROW استفاده می‌کند.",
     },
+    {
+        "id": "AOV", "sql_name": "AOV", "fa_name": "میانگین مبلغ سفارش (تجمیع دومرحله‌ای)", "category": "period", "category_fa": "شاخص‌های مقایسه‌ای و دوره‌ای",
+        "signature": "AOV(ستون_مبلغ, ستون_شناسه_سفارش)", "min_args": 2, "max_args": 2, "arg_types": ["numeric", "any"], "return_type": "double",
+        "description_fa": "ابتدا مبالغ هر سفارش را در سطح شناسه سفارش تجمیع کرده و سپس میانگین سفارش‌ها را محاسبه می‌کند تا سفارش‌های چندآیتمی باعث خطای میانگین نشوند.",
+        "simple_example": "AOV(sales_amount, order_id)",
+        "combined_example": "AOV(sales_amount, order_id)",
+        "common_errors_fa": "انتخاب ستون غیرعددی برای مبلغ یا ستون خالی برای شناسه سفارش.",
+        "engine_notes_fa": "با CTE تجمیع سطح سفارش و حذف سفارش‌های NULL و محافظت تقسیم بر صفر اجرا می‌شود.",
+    },
+    {
+        "id": "MOM_CALENDAR", "sql_name": "MOM_CALENDAR", "fa_name": "رشد ماهانه هم‌تراز با تقویم", "category": "period", "category_fa": "شاخص‌های مقایسه‌ای و دوره‌ای",
+        "signature": "MOM_CALENDAR(ستون_عددی, ستون_تاریخ)", "min_args": 2, "max_args": 2, "arg_types": ["numeric", "date"], "return_type": "double",
+        "description_fa": "مقدار ماه جاری تقویمی را با ماه تقویمی بلافاصله قبل مقایسه می‌کند (با محافظت از تقسیم بر صفر و بدون اشتباه در ماه‌های گمشده).",
+        "simple_example": "MOM_CALENDAR(sales_amount, order_date)",
+        "combined_example": "MOM_CALENDAR(sales_amount, order_date)",
+        "common_errors_fa": "نیازمند حداقل دو ماه تقویمی متوالی است.",
+        "engine_notes_fa": "مرتب‌سازی بر اساس اندیس تقویمی ماه جاری و ماه قبل (شمسی یا میلادی).",
+    },
 ]
 
 _FUNC_ARITY_RULES: dict[str, tuple[int, int]] = {
@@ -562,6 +580,7 @@ _FUNC_ARITY_RULES: dict[str, tuple[int, int]] = {
     "date_diff": (3, 3), "datediff": (3, 3), "strftime": (2, 2), "time_to_str": (2, 2),
     "coalesce": (1, 20), "nullif": (2, 2), "if": (3, 3), "iif": (3, 3),
     "jalali_year": (1, 1), "jalali_month": (1, 1), "jalali_quarter": (1, 1), "jalali_date": (1, 1),
+    "aov": (2, 2), "mom_calendar": (2, 2),
 }
 
 
@@ -739,6 +758,28 @@ _AGG_EXP_TYPES = tuple(
 )
 
 
+def _check_macro_arg_cls_and_resolve(sym: str, context: dict[str, Any]) -> dict[str, Any]:
+    clean = sym.strip().strip('"')
+    if "." in clean:
+        tname, cname = clean.split(".", 1)
+        matched_ds = next(
+            (
+                d for d in context["datasets"]
+                if d.name.lower() == tname.lower() or d.id.lower() == tname.lower() or d.warehouse_table.lower() == tname.lower()
+            ),
+            None,
+        )
+        if matched_ds and cname in context["hidden_by_ds"].get(matched_ds.id, set()):
+            raise PermissionError(f"ستون '{cname}' به دلیل سیاست سطح ستون (CLS) غیرقابل دسترسی است")
+    elif clean in context["all_hidden"] and clean.lower() not in context["unqualified_matches"]:
+        raise PermissionError(f"ستون '{clean}' به دلیل سیاست سطح ستون (CLS) غیرقابل دسترسی است")
+
+    resolved = _lookup_symbol(clean, context)
+    if resolved is None:
+        raise ValueError(f"فیلد '{clean}' در منابع انتخاب‌شده یافت نشد یا قابل دسترسی نیست")
+    return resolved
+
+
 def _rewrite_formula_ast(
     formula: str,
     context: dict[str, Any],
@@ -761,6 +802,68 @@ def _rewrite_formula_ast(
     # Normalize Persian/Arabic COUNT DISTINCT & whitespace
     normalized = re.sub(r"\bCOUNT\s+DISTINCT\s*\(", "COUNT(DISTINCT ", raw, flags=re.IGNORECASE)
 
+    # Check if two-stage AOV macro: AOV(amount_col, order_id_col)
+    aov_macro = re.match(
+        r"^AOV\(\s*([^,\)]+)\s*,\s*([^,\)]+)\s*\)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if aov_macro:
+        amt_res = _check_macro_arg_cls_and_resolve(aov_macro.group(1), context)
+        ord_res = _check_macro_arg_cls_and_resolve(aov_macro.group(2), context)
+        if amt_res["data_type"] not in NUMERIC_TYPES:
+            raise ValueError(f"آرگومان اول AOV (مبلغ) باید عددی باشد (نوع '{amt_res['field_name']}': {amt_res['data_type']})")
+        ds_ids = list(dict.fromkeys([amt_res["dataset_id"], ord_res["dataset_id"]]))
+        return {
+            "valid": True,
+            "normalized_formula": f'AOV("{amt_res["field_name"]}", "{ord_res["field_name"]}")',
+            "compiled_sql": f'AOV("{amt_res["field_name"]}", "{ord_res["field_name"]}")',
+            "is_aggregate": True,
+            "is_window_macro": True,
+            "is_aov_macro": True,
+            "macro_name": "AOV",
+            "amount_field": amt_res["field_name"],
+            "order_field": ord_res["field_name"],
+            "macro_field": amt_res["field_name"],
+            "output_data_type": "double",
+            "referenced_fields": [amt_res, ord_res] if amt_res["field_name"] != ord_res["field_name"] or amt_res["dataset_id"] != ord_res["dataset_id"] else [amt_res],
+            "referenced_datasets": ds_ids,
+            "warnings": [],
+            "errors": [],
+        }
+
+    # Check if calendar-aligned MoM macro: MOM_CALENDAR(measure_col, time_col)
+    mom_cal_macro = re.match(
+        r"^MOM_CALENDAR\(\s*([^,\)]+)\s*,\s*([^,\)]+)\s*\)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if mom_cal_macro:
+        m_res = _check_macro_arg_cls_and_resolve(mom_cal_macro.group(1), context)
+        t_res = _check_macro_arg_cls_and_resolve(mom_cal_macro.group(2), context)
+        if m_res["data_type"] not in NUMERIC_TYPES:
+            raise ValueError(f"آرگومان اول MOM_CALENDAR باید عددی باشد (نوع '{m_res['field_name']}': {m_res['data_type']})")
+        if t_res["data_type"] not in (*DATE_TYPES, *STRING_TYPES):
+            raise ValueError(f"آرگومان دوم MOM_CALENDAR باید تاریخ/زمان باشد (نوع '{t_res['field_name']}': {t_res['data_type']})")
+        ds_ids = list(dict.fromkeys([m_res["dataset_id"], t_res["dataset_id"]]))
+        return {
+            "valid": True,
+            "normalized_formula": f'MOM_CALENDAR("{m_res["field_name"]}", "{t_res["field_name"]}")',
+            "compiled_sql": f'MOM_CALENDAR("{m_res["field_name"]}", "{t_res["field_name"]}")',
+            "is_aggregate": True,
+            "is_window_macro": True,
+            "is_mom_calendar_macro": True,
+            "macro_name": "MOM_CALENDAR",
+            "measure_field": m_res["field_name"],
+            "time_field": t_res["field_name"],
+            "macro_field": m_res["field_name"],
+            "output_data_type": "double",
+            "referenced_fields": [m_res, t_res] if m_res["field_name"] != t_res["field_name"] or m_res["dataset_id"] != t_res["dataset_id"] else [m_res],
+            "referenced_datasets": ds_ids,
+            "warnings": [],
+            "errors": [],
+        }
+
     # Check if shorthand single-function period macro (YOY/MOM/YTD/MTD/PERCENTAGE/RUNNING_TOTAL)
     period_macro = re.match(
         r"^(YOY|MOM|YTD|MTD|PERCENTAGE|RUNNING_TOTAL)\(\s*([A-Za-z0-9_.\"]+)\s*\)$",
@@ -771,9 +874,7 @@ def _rewrite_formula_ast(
         fn_macro = period_macro.group(1).upper()
         arg_sym = period_macro.group(2).strip('"')
         # Resolve field existence & CLS before compiling macro
-        resolved = _lookup_symbol(arg_sym, context)
-        if resolved is None:
-            raise ValueError(f"فیلد '{arg_sym}' در منابع انتخاب‌شده یافت نشد یا قابل دسترسی نیست")
+        resolved = _check_macro_arg_cls_and_resolve(arg_sym, context)
         if resolved["data_type"] not in NUMERIC_TYPES:
             raise ValueError(f"تابع {fn_macro} فقط روی فیلدهای عددی قابل استفاده است (نوع '{arg_sym}': {resolved['data_type']})")
         return {

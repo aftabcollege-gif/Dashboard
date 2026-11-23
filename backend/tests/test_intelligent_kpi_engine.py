@@ -223,7 +223,15 @@ def test_multi_domain_classification_kpis_pages_and_live_execution(client, admin
     # Zero division KPI should fail gracefully or compute null without throwing 500
     assert len(sp_data["kpis"]["data_quality"]) >= 2
 
-    # D. Generate full multi-page dashboard in analytical mode + jalali calendar + verify every widget runs cleanly!
+    # D. Strict gate: unconfirmed /generate-dashboard without confirmed_kpis or auto_generate_kpis returns 400
+    unconf_res = client.post(
+        "/api/v1/ai/generate-dashboard",
+        headers=admin_headers,
+        json={"dataset_id": ds_sales.id, "title": "Should Reject Unconfirmed"},
+    )
+    assert unconf_res.status_code == 400
+
+    # Generate full multi-page dashboard in legacy auto_generate_kpis=True + analytical mode + jalali calendar + verify every widget runs cleanly!
     gen_res = client.post(
         "/api/v1/ai/generate-dashboard",
         headers=admin_headers,
@@ -234,6 +242,7 @@ def test_multi_domain_classification_kpis_pages_and_live_execution(client, admin
             "detail_level": "comprehensive",
             "calendar_mode": "jalali",
             "max_pages": 7,
+            "auto_generate_kpis": True,
         },
     )
     assert gen_res.status_code == 200
@@ -447,3 +456,233 @@ def test_overrides_custom_preview_register_and_cls_security(client, admin_header
         json={"name": "Secret", "formula": 'SUM("secret_margin")'},
     )
     assert r_prev_secret.status_code in (400, 403)
+
+
+def test_standard_kpis_math_edge_cases_confirmed_workflow_drill_and_regen(client, admin_headers, kpi_cleanup):
+    # Multi-item orders, duplicate order_ids, NULLs, delayed & cancelled flags, multi-month Gregorian dates (2025-01 -> 2025-02 -> 2025-03)
+    df = pd.DataFrame({
+        "order_id": ["ORD-1", "ORD-1", "ORD-2", "ORD-3", "ORD-4", "ORD-4"],
+        "customer_id": ["C1", "C1", "C2", "C3", "C1", "C1"],
+        "order_date": ["2025-01-10", "2025-01-10", "2025-02-05", "2025-02-20", "2025-03-12", "2025-03-12"],
+        "region": ["North", "North", "South", "North", "West", "West"],
+        "revenue": [100.0, 200.0, 200.0, None, 400.0, 200.0],
+        "cost": [50.0, 100.0, 100.0, None, 200.0, 100.0],
+        "target_amount": [400.0, 400.0, 400.0, 400.0, 400.0, 200.0],
+        "status": ["completed", "completed", "pending", "cancelled", "delivered", "delivered"],
+        "delay_days": [0, 0, 4, 0, 2, 2],
+    })
+    # Gapped calendar dataset (Jan + Mar only; Feb missing!) to ensure MOM_CALENDAR does NOT compare Mar to Jan
+    df_gapped = pd.DataFrame({
+        "order_id": ["G1", "G2"],
+        "order_date": ["2025-01-15", "2025-03-15"],
+        "revenue": [500.0, 1000.0],
+    })
+    # Zero denominator dataset for completion/delay/AOV edge cases
+    df_zero = pd.DataFrame({
+        "order_id": [None, None],
+        "customer_id": ["C9", "C9"],
+        "order_date": ["2025-03-01", "2025-03-02"],
+        "revenue": [0.0, None],
+        "cost": [0.0, 0.0],
+        "status": ["", ""],
+    })
+    # Related dataset for multi-source zero-fan-out test
+    df_customers = pd.DataFrame({
+        "customer_id": ["C1", "C2", "C3"],
+        "customer_name": ["Alice", "Bob", "Carol"],
+        "credit_limit": [5000.0, 3000.0, 4000.0],
+        "region": ["North", "South", "North"],
+    })
+
+    with SessionLocal() as db:
+        org = db.query(Organization).first()
+        assert org is not None
+        ds = _make_dataset(db, org.id, "Standard KPI Math", df)
+        ds_gap = _make_dataset(db, org.id, "Gapped MoM Math", df_gapped, pks=["order_id"])
+        ds_zero = _make_dataset(db, org.id, "Zero Denom Math", df_zero)
+        ds_cust = _make_dataset(db, org.id, "Customers MultiSrc", df_customers, pks=["customer_id"])
+        db.add(
+            DatasetRelationship(
+                left_dataset_id=ds.id,
+                left_field="customer_id",
+                right_dataset_id=ds_cust.id,
+                right_field="customer_id",
+                join_type="left",
+                cardinality="many_to_one",
+                is_active=True,
+            )
+        )
+        db.commit()
+        kpi_cleanup["dataset_ids"].extend([ds.id, ds_gap.id, ds_zero.id, ds_cust.id])
+
+    # 1. All 7 Standard KPIs evaluated cleanly on df
+    rec = client.get(f"/api/v1/ai/recommend/{ds.id}?calendar_mode=gregorian", headers=admin_headers)
+    assert rec.status_code == 200, rec.text
+    kpis_block = rec.json()["kpis"]
+    std_by_id = {k["id"]: k for k in kpis_block["standard"]}
+    assert set(std_by_id.keys()) == {
+        "std_total_sales",
+        "std_profit_margin",
+        "std_mom_growth",
+        "std_aov",
+        "std_unique_customers",
+        "std_target_achievement",
+        "std_delay_rate",
+    }
+    # Total sales = 100+200+200+0+400+200 = 1100
+    assert abs(std_by_id["std_total_sales"]["value"] - 1100.0) < 0.01
+    # Profit margin = (1100 - 550) / 1100 * 100 = 50.0%
+    assert abs(std_by_id["std_profit_margin"]["value"] - 50.0) < 0.01
+    # Two-stage AOV: ORD-1=300, ORD-2=200, ORD-3=0, ORD-4=600 -> AVG = 1100 / 4 = 275.0 (NOT line-item AVG 1100/5=220!)
+    assert abs(std_by_id["std_aov"]["value"] - 275.0) < 0.01
+    # Calendar MoM: Mar (600) vs Feb (200) -> +200.0%
+    assert abs(std_by_id["std_mom_growth"]["value"] - 200.0) < 0.01
+    # Unique customers = 3 (C1, C2, C3)
+    assert abs(std_by_id["std_unique_customers"]["value"] - 3.0) < 0.01
+    # Target achievement = 1100 / 2200 * 100 = 50.0%
+    assert abs(std_by_id["std_target_achievement"]["value"] - 50.0) < 0.01
+    # Delay rate: 5 eligible non-cancelled rows, 3 delayed (delay_days > 0) = 60.0%
+    assert abs(std_by_id["std_delay_rate"]["value"] - 60.0) < 0.01
+
+    # 2. Gapped month calendar MoM (Jan + Mar, missing Feb -> must classify as needs_data with None, NOT +100%!)
+    rec_gap = client.get(f"/api/v1/ai/recommend/{ds_gap.id}?calendar_mode=gregorian", headers=admin_headers)
+    assert rec_gap.status_code == 200
+    gap_std = {k["id"]: k for k in rec_gap.json()["kpis"]["standard"]}
+    assert gap_std["std_mom_growth"]["value"] is None
+    assert gap_std["std_mom_growth"]["computability_status"] == "needs_data"
+
+    # 3. Zero / NULL denominator edge cases do not crash
+    rec_zero = client.get(f"/api/v1/ai/recommend/{ds_zero.id}?calendar_mode=gregorian", headers=admin_headers)
+    assert rec_zero.status_code == 200
+    zero_std = {k["id"]: k for k in rec_zero.json()["kpis"]["standard"]}
+    assert zero_std["std_total_sales"]["value"] == 0.0
+    assert zero_std["std_profit_margin"]["computability_status"] == "uncomputable"
+    assert zero_std["std_aov"]["computability_status"] == "uncomputable"
+    assert zero_std["std_target_achievement"]["computability_status"] == "needs_data"
+
+    # 4. Live preview of AOV, MOM_CALENDAR, and zero-fan-out multi_source_agg!
+    p_aov = client.post(
+        f"/api/v1/ai/datasets/{ds.id}/kpis/preview",
+        headers=admin_headers,
+        json={"name": "AOV Check", "formula": 'AOV("revenue", "order_id")'},
+    )
+    assert p_aov.status_code == 200, p_aov.text
+    assert abs(p_aov.json()["value"] - 275.0) < 0.01
+
+    p_mom = client.post(
+        f"/api/v1/ai/datasets/{ds.id}/kpis/preview",
+        headers=admin_headers,
+        json={"name": "MoM Check", "formula": 'MOM_CALENDAR("revenue", "order_date")', "calendar_mode": "gregorian"},
+    )
+    assert p_mom.status_code == 200, p_mom.text
+    assert abs(p_mom.json()["value"] - 200.0) < 0.01
+
+    p_ms = client.post(
+        f"/api/v1/ai/datasets/{ds.id}/kpis/preview",
+        headers=admin_headers,
+        json={
+            "name": "Zero Fanout MultiSource Revenue / Credit Limit",
+            "formula": "COALESCE(SUM(_l_val), 0) / NULLIF(SUM(_r_val), 0) * 100.0",
+            "related_dataset_ids": [ds_cust.id],
+            "multi_source_agg": {
+                "right_dataset_id": ds_cust.id,
+                "left_key": "customer_id",
+                "right_key": "customer_id",
+                "left_field": "revenue",
+                "right_field": "credit_limit",
+                "left_agg": "SUM",
+                "right_agg": "MAX",
+                "join_type": "INNER",
+                "final_expr": "COALESCE(SUM(_l_val), 0) / NULLIF(SUM(_r_val), 0) * 100.0",
+            },
+        },
+    )
+    assert p_ms.status_code == 200, p_ms.text
+    # Left revenue = 1100; Right unique customer credit limits = 5000 + 3000 + 4000 = 12000 (NOT fanned out to 3*5000 + 4000 + 4000 = 23000!)
+    # 1100 / 12000 * 100 = 9.1667%
+    assert abs(p_ms.json()["value"] - 9.1667) < 0.05
+
+    # 5. Confirmed KPI Dashboard Generation -> verify KPIs, pages, drill-through page, drill-details, and in-place regeneration!
+    confirmed = [
+        {
+            "id": "std_total_revenue",
+            "name": "درآمد کل تاییدشده",
+            "formula": 'COALESCE(SUM("revenue"), 0)',
+            "format_type": "currency",
+            "target_value": 1500,
+            "chart_type": "gauge",
+            "is_confirmed": True,
+        },
+        {
+            "id": "std_aov",
+            "name": "میانگین ارزش سفارش واقعی",
+            "formula": 'AOV("revenue", "order_id")',
+            "format_type": "currency",
+            "target_value": 300,
+            "chart_type": "kpi",
+            "is_confirmed": True,
+        },
+        {
+            "id": "std_mom_growth",
+            "name": "رشد ماهانه تقویمی",
+            "formula": 'MOM_CALENDAR("revenue", "order_date")',
+            "format_type": "percent",
+            "chart_type": "kpi",
+            "is_confirmed": True,
+        },
+    ]
+    gen = client.post(
+        "/api/v1/ai/generate-dashboard",
+        headers=admin_headers,
+        json={
+            "dataset_id": ds.id,
+            "title": "داشبورد KPI تاییدشده",
+            "calendar_mode": "gregorian",
+            "confirmed_kpis": confirmed,
+        },
+    )
+    assert gen.status_code == 200, gen.text
+    dash_id = gen.json()["dashboard_id"]
+    kpi_cleanup["dashboard_ids"].append(dash_id)
+
+    dash = client.get(f"/api/v1/dashboards/{dash_id}", headers=admin_headers).json()
+    assert dash["settings"]["kpi_config"]["confirmed_kpis"][0]["name"] == "درآمد کل تاییدشده"
+    assert any(p["is_drill_through"] for p in dash["pages"])
+
+    # Execute batch & verify all widgets succeed
+    batch = client.post(f"/api/v1/dashboards/{dash_id}/execute-batch", headers=admin_headers, json={})
+    assert batch.status_code == 200
+    bwidgets = batch.json()["widgets"]
+    for wid, wres in bwidgets.items():
+        assert not wres.get("error"), wres
+
+    # Test KPI Drill-Down endpoint (/widgets/{id}/drill-details) on AOV KPI widget
+    aov_w = next(w for w in dash["widgets"] if w["title"] == "میانگین ارزش سفارش واقعی")
+    assert aov_w["drill_rule"]["drill_through_page_id"] is not None
+    dd = client.post(
+        f"/api/v1/dashboards/widgets/{aov_w['id']}/drill-details",
+        headers=admin_headers,
+        json={"breakdown_dimension": "region", "limit": 50},
+    )
+    assert dd.status_code == 200, dd.text
+    dd_json = dd.json()
+    assert dd_json["row_count"] == 6
+    assert dd_json["breakdown_dimension"] == "region"
+    assert len(dd_json["breakdown_rows"]) == 3  # North, South, West
+
+    # Test in-place KPI Regeneration (`dashboard_id` passed -> preserves dashboard ID, replaces KPI set cleanly!)
+    regen = client.post(
+        "/api/v1/ai/generate-dashboard",
+        headers=admin_headers,
+        json={
+            "dataset_id": ds.id,
+            "dashboard_id": dash_id,
+            "calendar_mode": "gregorian",
+            "confirmed_kpis": [confirmed[0]],
+        },
+    )
+    assert regen.status_code == 200, regen.text
+    assert regen.json()["dashboard_id"] == dash_id
+    dash_after = client.get(f"/api/v1/dashboards/{dash_id}", headers=admin_headers).json()
+    assert len(dash_after["settings"]["kpi_config"]["confirmed_kpis"]) == 1
+

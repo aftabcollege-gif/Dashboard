@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { CheckCircle2, Database, FileSpreadsheet, Play, Plus, Sparkles, Trash2, UploadCloud, XCircle } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
 import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
@@ -9,13 +8,11 @@ import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
 export default function DataSourcesPage() {
-  const router = useRouter();
   const { user, locale, showToast } = useBi();
   const [sources, setSources] = useState<any[]>([]);
   const [datasets, setDatasets] = useState<any[]>([]);
   const [supported, setSupported] = useState<{ databases: string[]; files: string[] }>({ databases: [], files: [] });
   const [lastImported, setLastImported] = useState<any>(null);
-  const [buildingDash, setBuildingDash] = useState(false);
   const [studioDatasetId, setStudioDatasetId] = useState<string>("");
 
   // New DB Connector form
@@ -175,20 +172,8 @@ export default function DataSourcesPage() {
     }
   };
 
-  const handleBuildDashboardForDataset = async (dsId: string) => {
-    setBuildingDash(true);
-    try {
-      const res = await apiFetch<any>("/ai/generate-dashboard", {
-        method: "POST",
-        body: JSON.stringify({ dataset_id: dsId }),
-      });
-      showToast(locale === "fa" ? `داشبورد «${res.title}» ساخته شد!` : `Created dashboard "${res.title}"`);
-      router.push(`/dashboards/${res.dashboard_id}`);
-    } catch (err: any) {
-      showToast(err.message);
-    } finally {
-      setBuildingDash(false);
-    }
+  const handleBuildDashboardForDataset = (dsId: string) => {
+    setStudioDatasetId(dsId);
   };
 
   return (
@@ -255,22 +240,11 @@ export default function DataSourcesPage() {
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setStudioDatasetId(lastImported.dataset_id || lastImported.id)}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-white font-semibold bg-indigo-600 hover:bg-indigo-700"
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  {locale === "fa" ? "شخصی‌سازی KPIها و صفحات" : "Customize KPIs"}
-                </button>
-                <button
-                  type="button"
-                  disabled={buildingDash}
                   onClick={() => handleBuildDashboardForDataset(lastImported.dataset_id || lastImported.id)}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white font-semibold bg-emerald-600 hover:bg-emerald-700"
                 >
                   <Sparkles className="w-3.5 h-3.5" />
-                  {buildingDash
-                    ? locale === "fa" ? "در حال ساخت داشبورد..." : "Building..."
-                    : locale === "fa" ? "ساخت فوری داشبورد از این فایل" : "Auto-Build Dashboard"}
+                  {locale === "fa" ? "تحلیل، انتخاب KPIها و ساخت داشبورد" : "Analyze, Confirm KPIs & Build Dashboard"}
                 </button>
               </div>
             </div>
@@ -278,6 +252,7 @@ export default function DataSourcesPage() {
 
           {studioDatasetId && (
             <IntelligentDashboardStudio
+              key={studioDatasetId}
               initialDatasetId={studioDatasetId}
               onClose={() => setStudioDatasetId("")}
             />
@@ -311,12 +286,11 @@ export default function DataSourcesPage() {
                     <div className="flex items-center gap-1 shrink-0">
                       <button
                         type="button"
-                        disabled={buildingDash}
                         onClick={() => handleBuildDashboardForDataset(ds.id)}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-violet-600 text-white text-[11px] font-semibold hover:bg-violet-700 disabled:opacity-60"
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-violet-600 text-white text-[11px] font-semibold hover:bg-violet-700"
                       >
                         <Sparkles className="w-3 h-3" />
-                        {locale === "fa" ? "ساخت داشبورد" : "Build Dashboard"}
+                        {locale === "fa" ? "انتخاب KPI و ساخت داشبورد" : "Confirm KPIs & Build"}
                       </button>
                       {ds.is_uploaded_excel && (
                         <button

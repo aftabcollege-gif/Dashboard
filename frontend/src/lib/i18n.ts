@@ -57,6 +57,11 @@ export const TRANSLATIONS: Record<Locale, Record<string, string>> = {
     switchTheme: "Theme / Template",
     switchDashboard: "Switch Dashboard",
     templatesGallery: "Templates Gallery",
+    selectAndConfirmKpis: "Select & Confirm KPIs",
+    editKpis: "Edit KPIs",
+    kpiDrillDown: "KPI Breakdown & Records",
+    confirmAndGenerate: "Confirm KPIs & Generate Dashboard",
+    updateKpisAndRegen: "Confirm & Rebuild Dashboard",
   },
   fa: {
     brand: "نکسوس BI سازمانی",
@@ -114,5 +119,10 @@ export const TRANSLATIONS: Record<Locale, Record<string, string>> = {
     switchTheme: "تم و قالب داشبورد",
     switchDashboard: "تغییر داشبورد",
     templatesGallery: "گالری قالب‌ها",
+    selectAndConfirmKpis: "انتخاب و تأیید KPIها",
+    editKpis: "ویرایش KPIها",
+    kpiDrillDown: "تحلیل جزئیات و رکوردهای KPI",
+    confirmAndGenerate: "تأیید KPIها و تولید داشبورد",
+    updateKpisAndRegen: "تأیید و بازساخت داشبورد",
   },
 };

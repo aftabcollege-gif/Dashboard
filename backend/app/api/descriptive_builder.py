@@ -229,7 +229,7 @@ def get_smart_kpis_for_builder(
     enforce_permission(db, user, "dataset", ds.id, "view")
     rel_list = [x.strip() for x in (related_dataset_ids or "").split(",") if x.strip()]
     plan = IntelligentKpiEngine.build_intelligent_dashboard_plan(
-        db, ds, user=user, related_dataset_ids=rel_list or None
+        db, ds, user=user, related_dataset_ids=rel_list or None, auto_generate_kpis=True
     )
     return {
         "dataset_id": ds.id,

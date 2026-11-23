@@ -118,7 +118,7 @@ def test_bpmn_widget_crud_switch_and_persian_ai(client, admin_headers):
     gen = client.post(
         "/api/v1/ai/generate-dashboard",
         headers=admin_headers,
-        json={"dataset_id": new_ds_id, "title": "داشبورد فرآیند اکسل"},
+        json={"dataset_id": new_ds_id, "title": "داشبورد فرآیند اکسل", "auto_generate_kpis": True},
     )
     assert gen.status_code == 200, gen.text
     gen_dash_id = gen.json()["dashboard_id"]

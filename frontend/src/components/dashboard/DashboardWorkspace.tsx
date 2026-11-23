@@ -35,6 +35,7 @@ import WidgetRenderer from "@/components/charts/WidgetRenderer";
 import GlobalFilterBar from "@/components/dashboard/GlobalFilterBar";
 import PropertiesPanel from "@/components/dashboard/PropertiesPanel";
 import { PersianAssistantPanel } from "@/components/ai/PersianAssistantPanel";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { apiDownload, apiFetch } from "@/lib/api";
 import { CHART_REGISTRY } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
@@ -52,6 +53,7 @@ import {
   DashboardWidget,
   DatasetInfo,
   WidgetDataResult,
+  WidgetDrillDetailsResponse,
 } from "@/types/bi";
 
 export default function DashboardWorkspace({ dashboardId }: { dashboardId: string }) {
@@ -103,6 +105,13 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [showVersions, setShowVersions] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [shareInfo, setShareInfo] = useState<string | null>(null);
+  const [showEditKpisModal, setShowEditKpisModal] = useState(false);
+  const [prevNonDrillPageId, setPrevNonDrillPageId] = useState<string>("");
+
+  // KPI / Bullet / Gauge Interactive Drill-Down Modal State
+  const [kpiDrillWidget, setKpiDrillWidget] = useState<DashboardWidget | null>(null);
+  const [kpiDrillData, setKpiDrillData] = useState<WidgetDrillDetailsResponse | null>(null);
+  const [kpiDrillLoading, setKpiDrillLoading] = useState(false);
 
   // Add Widget Form
   const [newWTitle, setNewWTitle] = useState("");
@@ -176,8 +185,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       }
       if (savedState?.active_page_id && d.pages.some((p) => p.id === savedState.active_page_id)) {
         setActivePageId(savedState.active_page_id);
-      } else if (!activePageId && d.pages.length > 0) {
-        setActivePageId(d.pages[0].id);
+      } else if ((!activePageId || !d.pages.some((p) => p.id === activePageId)) && d.pages.length > 0) {
+        const firstMain = d.pages.find((p) => !p.is_drill_through) || d.pages[0];
+        setActivePageId(firstMain.id);
       }
       if (savedState?.filter_state && Object.keys(filterValues).length === 0) {
         setFilterValues(savedState.filter_state);
@@ -350,8 +360,34 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     return "drill";
   };
 
-  // Handle click on any chart point (Drill Down OR Cross-Filter!)
+  const loadKpiDrillDetails = async (w: DashboardWidget, breakdownDim?: string) => {
+    setKpiDrillWidget(w);
+    setKpiDrillLoading(true);
+    try {
+      const res = await apiFetch<WidgetDrillDetailsResponse>(`/dashboards/widgets/${w.id}/drill-details`, {
+        method: "POST",
+        body: JSON.stringify({
+          active_filters: compiledActiveFilters,
+          cross_filters: crossFilters,
+          breakdown_dimension: breakdownDim || undefined,
+          limit: 100,
+        }),
+      });
+      setKpiDrillData(res);
+    } catch (err: any) {
+      showToast(err.message || "خطا در دریافت جزئیات KPI");
+    } finally {
+      setKpiDrillLoading(false);
+    }
+  };
+
+  // Handle click on any chart point (KPI Drill Modal OR Chart Drill Down OR Cross-Filter!)
   const handleWidgetPointClick = async (w: DashboardWidget, field: string, value: any) => {
+    if (field === "__kpi_drill__") {
+      await loadKpiDrillDetails(w);
+      return;
+    }
+
     const hierarchy = w.drill_rule?.hierarchy || [];
     const currentStack = drillStates[w.id] || [];
     const mode = getWidgetClickMode(w);
@@ -1079,6 +1115,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               <button
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (!currentPage?.is_drill_through) {
+                    setPrevNonDrillPageId(activePageId);
+                  }
                   setActivePageId(w.drill_rule.drill_through_page_id!);
                 }}
                 className="text-[10px] px-1.5 py-1 sm:py-0.5 rounded border hover:bg-blue-500/10"
@@ -1346,6 +1385,16 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             <BookmarkCheck className="w-3.5 h-3.5" />
           </button>
           <button
+            type="button"
+            onClick={() => setShowEditKpisModal(true)}
+            className="px-2.5 py-1.5 rounded-lg border border-violet-500/40 text-violet-600 dark:text-violet-300 text-xs font-semibold flex items-center gap-1 hover:bg-violet-500/10"
+            title={locale === "fa" ? "انتخاب و ویرایش شاخص‌های کلیدی این داشبورد" : "Edit & Re-confirm Dashboard KPIs"}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            {locale === "fa" ? "ویرایش KPIها" : "Edit KPIs"}
+          </button>
+
+          <button
             onClick={() => {
               setAssistantEditWidgetId(null);
               setAssistantMode("auto");
@@ -1386,24 +1435,29 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         </div>
       )}
 
-      {/* Multi-Page Tabs */}
+      {/* Multi-Page Tabs (hide drill-through pages unless actively opened) */}
       <div className="flex items-center gap-2 overflow-x-auto pb-1">
-        {dash.pages.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => setActivePageId(p.id)}
-            className="px-3.5 py-1.5 rounded-lg text-xs font-semibold border transition whitespace-nowrap flex items-center gap-1.5"
-            style={{
-              background: p.id === activePageId ? "var(--bi-primary)" : "var(--bi-card)",
-              color: p.id === activePageId ? "#fff" : "var(--bi-text)",
-              borderColor: "var(--bi-border)",
-            }}
-          >
-            <Layers className="w-3.5 h-3.5" />
-            {p.title}
-            {p.is_drill_through && <span className="text-[10px] opacity-75">(Detail)</span>}
-          </button>
-        ))}
+        {dash.pages
+          .filter((p) => !p.is_drill_through || p.id === activePageId)
+          .map((p) => (
+            <button
+              key={p.id}
+              onClick={() => {
+                if (!p.is_drill_through) setPrevNonDrillPageId(p.id);
+                setActivePageId(p.id);
+              }}
+              className="px-3.5 py-1.5 rounded-lg text-xs font-semibold border transition whitespace-nowrap flex items-center gap-1.5"
+              style={{
+                background: p.id === activePageId ? "var(--bi-primary)" : "var(--bi-card)",
+                color: p.id === activePageId ? "#fff" : "var(--bi-text)",
+                borderColor: "var(--bi-border)",
+              }}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              {p.title}
+              {p.is_drill_through && <span className="text-[10px] opacity-85">(جزئیات)</span>}
+            </button>
+          ))}
         {editMode && (
           <button
             onClick={handleAddPage}
@@ -1414,6 +1468,32 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           </button>
         )}
       </div>
+
+      {/* Back Banner when viewing a hidden Drill-Through page */}
+      {currentPage?.is_drill_through && (
+        <div
+          className="px-3.5 py-2 rounded-xl border text-xs flex items-center justify-between gap-2 bg-blue-500/10 border-blue-500/30"
+        >
+          <span className="font-semibold text-blue-600 dark:text-blue-300">
+            {locale === "fa"
+              ? `در حال مشاهده صفحه جزئیات (${currentPage.title})`
+              : `Viewing Drill-Through Details Page (${currentPage.title})`}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              const targetBack =
+                (prevNonDrillPageId && dash.pages.some((p) => p.id === prevNonDrillPageId) && prevNonDrillPageId) ||
+                dash.pages.find((p) => !p.is_drill_through)?.id ||
+                dash.pages[0]?.id;
+              if (targetBack) setActivePageId(targetBack);
+            }}
+            className="px-3 py-1 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700"
+          >
+            {locale === "fa" ? "بازگشت به صفحه داشبورد" : "Back to Dashboard"}
+          </button>
+        </div>
+      )}
 
       {/* Interactive Analytics Guide Strip */}
       {pageWidgets.some((w) => (w.drill_rule?.hierarchy?.length || 0) > 0 || w.config.interactions?.cross_filter !== false) && (
@@ -1833,6 +1913,182 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* KPI / Gauge / Bullet Drill-Down & Underlying Rows Modal */}
+      {kpiDrillWidget && (
+        <div className="fixed inset-0 bg-black/55 z-50 flex items-center justify-center p-3 sm:p-5">
+          <div className="bi-card w-full max-w-4xl max-h-[88vh] flex flex-col overflow-hidden">
+            <div className="p-4 border-b flex flex-wrap items-center justify-between gap-2" style={{ borderColor: "var(--bi-border)" }}>
+              <div className="space-y-0.5 min-w-0">
+                <h3 className="text-sm sm:text-base font-bold truncate">
+                  {locale === "fa" ? `تحلیل و جزئیات KPI: ${kpiDrillWidget.title}` : `KPI Drill-Down: ${kpiDrillWidget.title}`}
+                </h3>
+                {(kpiDrillData?.formula || kpiDrillWidget.query?.visual_spec?.formula) && (
+                  <div dir="ltr" className="text-[11px] font-mono opacity-75 truncate">
+                    {kpiDrillData?.formula || kpiDrillWidget.query?.visual_spec?.formula}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {(kpiDrillData?.drill_through_page_id || kpiDrillWidget.drill_rule?.drill_through_page_id) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetPage =
+                        kpiDrillData?.drill_through_page_id ||
+                        kpiDrillWidget.drill_rule?.drill_through_page_id;
+                      if (targetPage) {
+                        if (!currentPage?.is_drill_through) setPrevNonDrillPageId(activePageId);
+                        setActivePageId(targetPage);
+                      }
+                      setKpiDrillWidget(null);
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold"
+                  >
+                    {locale === "fa" ? "مشاهده در صفحه جزئیات (Drill-Through)" : "Open Details Page"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setKpiDrillWidget(null);
+                    setKpiDrillData(null);
+                  }}
+                  className="p-1.5 rounded-lg hover:bg-rose-500/10 text-rose-500"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4 overflow-y-auto space-y-4 text-xs flex-1">
+              {kpiDrillLoading && (
+                <div className="py-10 text-center opacity-70">
+                  {locale === "fa" ? "در حال بارگذاری تفکیک ابعادی و رکوردهای خام..." : "Loading KPI breakdown & raw records..."}
+                </div>
+              )}
+
+              {!kpiDrillLoading && kpiDrillData && (
+                <>
+                  {/* Dimension Breakdown Section */}
+                  {kpiDrillData.available_dimensions && kpiDrillData.available_dimensions.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-bold">
+                          {locale === "fa" ? "تفکیک ابعادی KPI:" : "KPI Breakdown by Dimension:"}
+                        </span>
+                        <select
+                          value={kpiDrillData.breakdown_dimension || ""}
+                          onChange={(e) => loadKpiDrillDetails(kpiDrillWidget, e.target.value)}
+                          className="px-2.5 py-1.5 rounded-lg border text-xs"
+                          style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+                        >
+                          {kpiDrillData.available_dimensions.map((dim) => (
+                            <option key={dim} value={dim}>{dim}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {kpiDrillData.breakdown_rows && kpiDrillData.breakdown_rows.length > 0 && (
+                        <div className="overflow-x-auto max-h-52 rounded-xl border" style={{ borderColor: "var(--bi-border)" }}>
+                          <table className="w-full text-start border-collapse">
+                            <thead className="sticky top-0" style={{ background: "var(--bi-surface)" }}>
+                              <tr className="border-b" style={{ borderColor: "var(--bi-border)" }}>
+                                {kpiDrillData.breakdown_columns.map((c) => (
+                                  <th key={c} className="p-2 font-bold">{c}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {kpiDrillData.breakdown_rows.map((r, idx) => (
+                                <tr key={idx} className="border-b hover:bg-blue-500/5" style={{ borderColor: "var(--bi-border)" }}>
+                                  {kpiDrillData.breakdown_columns.map((c) => (
+                                    <td key={c} className="p-2">
+                                      {typeof r[c] === "number" ? Number(r[c]).toLocaleString() : String(r[c] ?? "—")}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Underlying Raw Rows Section */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold">
+                        {locale === "fa"
+                          ? `رکوردهای پایه (نمایش ${kpiDrillData.rows?.length || 0} ردیف با رعایت فیلترهای فعال و RLS/CLS)`
+                          : `Underlying Records (${kpiDrillData.rows?.length || 0} rows matching filters & RLS/CLS)`}
+                      </span>
+                    </div>
+                    {kpiDrillData.rows && kpiDrillData.rows.length > 0 ? (
+                      <div className="overflow-x-auto max-h-64 rounded-xl border" style={{ borderColor: "var(--bi-border)" }}>
+                        <table className="w-full text-start border-collapse text-[11px]">
+                          <thead className="sticky top-0" style={{ background: "var(--bi-surface)" }}>
+                            <tr className="border-b" style={{ borderColor: "var(--bi-border)" }}>
+                              {kpiDrillData.columns.map((c) => (
+                                <th key={c} className="p-2 font-bold whitespace-nowrap">{c}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {kpiDrillData.rows.map((r, idx) => (
+                              <tr key={idx} className="border-b hover:bg-blue-500/5" style={{ borderColor: "var(--bi-border)" }}>
+                                {kpiDrillData.columns.map((c) => (
+                                  <td key={c} className="p-2 whitespace-nowrap">
+                                    {typeof r[c] === "number" ? Number(r[c]).toLocaleString() : String(r[c] ?? "—")}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="p-4 text-center rounded-xl border opacity-70" style={{ borderColor: "var(--bi-border)" }}>
+                        {locale === "fa" ? "رکوردی با فیلترهای فعلی یافت نشد." : "No matching records under current filters."}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit KPIs Modal (re-opens IntelligentDashboardStudio in edit/regenerate mode) */}
+      {showEditKpisModal && dash && (
+        <div className="fixed inset-0 bg-black/60 z-50 overflow-y-auto p-3 sm:p-6">
+          <div className="max-w-6xl mx-auto">
+            <IntelligentDashboardStudio
+              initialDatasetId={
+                dash.settings?.kpi_config?.dataset_id ||
+                dash.widgets.find((w) => w.dataset_id)?.dataset_id ||
+                datasets[0]?.id
+              }
+              editingDashboardId={dash.id}
+              initialConfirmedKpis={dash.settings?.kpi_config?.confirmed_kpis || []}
+              initialSettings={{
+                title: dash.title,
+                template_mode: (dash.settings?.kpi_config?.template_mode as any) || "executive",
+                detail_level: (dash.settings?.kpi_config?.detail_level as any) || "standard",
+                calendar_mode: (dash.settings?.kpi_config?.calendar_mode as any) || "jalali",
+                related_dataset_ids: dash.settings?.kpi_config?.related_dataset_ids || [],
+              }}
+              onClose={() => setShowEditKpisModal(false)}
+              onGenerated={async () => {
+                setShowEditKpisModal(false);
+                await loadDashboard();
+              }}
+            />
           </div>
         </div>
       )}

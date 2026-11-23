@@ -6,34 +6,48 @@ import {
   Award,
   BarChart3,
   BookmarkCheck,
+  Calendar,
   Check,
   CheckCircle2,
   Database,
+  HelpCircle,
   Layers,
+  Link2,
   Loader2,
   Play,
   Plus,
   RefreshCw,
+  Search,
   ShieldCheck,
   Sliders,
   Sparkles,
   Star,
   Target,
-  Wand2,
   X,
   XCircle,
 } from "lucide-react";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
+import type { KpiDefinition } from "@/types/bi";
 
 interface Props {
   initialDatasetId?: string;
+  editingDashboardId?: string;
+  initialConfirmedKpis?: KpiDefinition[];
+  initialSettings?: {
+    title?: string;
+    template_mode?: "executive" | "analytical" | "operational";
+    detail_level?: "summary" | "standard" | "comprehensive";
+    calendar_mode?: "jalali" | "gregorian";
+    related_dataset_ids?: string[];
+  };
   onClose?: () => void;
   onGenerated?: (dashboardId: string) => void;
   compact?: boolean;
 }
 
 const CATEGORY_LABELS_FA: Record<string, string> = {
+  standard: "شاخص استاندارد",
   aggregate: "تجمیعی",
   ratio: "نسبت",
   growth: "رشد و تغییر",
@@ -46,8 +60,38 @@ const CATEGORY_LABELS_FA: Record<string, string> = {
   custom: "سفارشی",
 };
 
+const FORMAT_OPTIONS = [
+  { value: "currency", labelFa: "مالی (ریال/ارز)", labelEn: "Currency" },
+  { value: "percentage", labelFa: "درصد (%)", labelEn: "Percentage (%)" },
+  { value: "number", labelFa: "عددی", labelEn: "Number" },
+  { value: "count", labelFa: "تعدادی (شمارش)", labelEn: "Count" },
+  { value: "duration", labelFa: "مدت زمان", labelEn: "Duration" },
+];
+
+const COMPARISON_OPTIONS = [
+  { value: "none", labelFa: "بدون مقایسه", labelEn: "None" },
+  { value: "previous_period", labelFa: "نسبت به دوره قبل", labelEn: "Vs Previous Period" },
+  { value: "target", labelFa: "نسبت به هدف (Target)", labelEn: "Vs Target" },
+];
+
+interface KpiEditState {
+  name: string;
+  formula: string;
+  display_format: string;
+  unit: string;
+  comparison_mode: string;
+  target_value: string;
+  priority: number;
+  is_favorite: boolean;
+  value?: number | null;
+  formatted_value?: string;
+}
+
 export function IntelligentDashboardStudio({
   initialDatasetId,
+  editingDashboardId,
+  initialConfirmedKpis,
+  initialSettings,
   onClose,
   onGenerated,
 }: Props) {
@@ -56,6 +100,9 @@ export function IntelligentDashboardStudio({
 
   const [datasets, setDatasets] = useState<any[]>([]);
   const [datasetId, setDatasetId] = useState<string>(initialDatasetId || "");
+  const [relatedDatasetIds, setRelatedDatasetIds] = useState<string[]>(
+    initialSettings?.related_dataset_ids || []
+  );
   const [semanticClasses, setSemanticClasses] = useState<any[]>([]);
   const [analysis, setAnalysis] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
@@ -64,13 +111,17 @@ export function IntelligentDashboardStudio({
   const [registering, setRegistering] = useState(false);
 
   const [activeTab, setActiveTab] = useState<"kpis" | "profile" | "settings">("kpis");
-  const [kpiSubTab, setKpiSubTab] = useState<"business" | "quality" | "rejected">("business");
+  const [kpiSubTab, setKpiSubTab] = useState<"business" | "needs_data" | "quality" | "rejected">("business");
+  const [kpiSearch, setKpiSearch] = useState("");
 
   // User overrides & KPI curation state
-  const [fieldEdits, setFieldEdits] = useState<Record<string, { semantic_class?: string; target_value?: string; display_name?: string }>>({});
+  const [fieldEdits, setFieldEdits] = useState<
+    Record<string, { semantic_class?: string; target_value?: string; display_name?: string }>
+  >({});
   const [selectedKpiIds, setSelectedKpiIds] = useState<Set<string>>(new Set());
-  const [kpiEdits, setKpiEdits] = useState<Record<string, { name: string; formula: string; target_value?: string; is_favorite?: boolean; value?: number; formatted_value?: string }>>({});
-  const [customKpis, setCustomKpis] = useState<any[]>([]);
+  const [kpiEdits, setKpiEdits] = useState<Record<string, KpiEditState>>({});
+  const [customKpis, setCustomKpis] = useState<KpiDefinition[]>([]);
+  const [manualTargetsByKpi, setManualTargetsByKpi] = useState<Record<string, string>>({});
 
   // New custom KPI builder
   const [newKpiName, setNewKpiName] = useState("");
@@ -80,10 +131,16 @@ export function IntelligentDashboardStudio({
   const [previewingFormula, setPreviewingFormula] = useState(false);
 
   // Dashboard generation settings
-  const [dashTitle, setDashTitle] = useState("");
-  const [templateMode, setTemplateMode] = useState<"executive" | "analytical" | "operational">("executive");
-  const [detailLevel, setDetailLevel] = useState<"summary" | "standard" | "comprehensive">("standard");
-  const [calendarMode, setCalendarMode] = useState<"jalali" | "gregorian">("jalali");
+  const [dashTitle, setDashTitle] = useState(initialSettings?.title || "");
+  const [templateMode, setTemplateMode] = useState<"executive" | "analytical" | "operational">(
+    initialSettings?.template_mode || "executive"
+  );
+  const [detailLevel, setDetailLevel] = useState<"summary" | "standard" | "comprehensive">(
+    initialSettings?.detail_level || "standard"
+  );
+  const [calendarMode, setCalendarMode] = useState<"jalali" | "gregorian">(
+    initialSettings?.calendar_mode || "jalali"
+  );
   const [maxPages, setMaxPages] = useState<number>(7);
   const [themeId, setThemeId] = useState<string>("");
   const [dateStart, setDateStart] = useState("");
@@ -93,7 +150,7 @@ export function IntelligentDashboardStudio({
     apiFetch<any[]>("/datasets")
       .then((list) => {
         setDatasets(list || []);
-        if (!initialDatasetId && list?.[0]?.id) {
+        if (!initialDatasetId && !datasetId && list?.[0]?.id) {
           setDatasetId(list[0].id);
         }
       })
@@ -101,7 +158,7 @@ export function IntelligentDashboardStudio({
     apiFetch<any[]>("/ai/semantic-classes")
       .then((cls) => setSemanticClasses(cls || []))
       .catch(() => {});
-  }, [initialDatasetId]);
+  }, [initialDatasetId, datasetId]);
 
   useEffect(() => {
     if (themes.length > 0 && !themeId) {
@@ -109,54 +166,111 @@ export function IntelligentDashboardStudio({
     }
   }, [themes, themeId]);
 
-  const loadRecommendation = useCallback(async (dsId: string, forceRefresh = false) => {
-    if (!dsId) return;
-    setLoading(true);
-    try {
-      const res = await apiFetch<any>(`/ai/recommend/${dsId}${forceRefresh ? "?refresh=true" : ""}`);
-      setAnalysis(res);
+  const loadRecommendation = useCallback(
+    async (dsId: string, forceRefresh = false, relIds: string[] = relatedDatasetIds, calMode: string = calendarMode) => {
+      if (!dsId) return;
+      setLoading(true);
+      try {
+        const qp = new URLSearchParams();
+        if (forceRefresh) qp.set("refresh", "true");
+        if (relIds.length > 0) qp.set("related_dataset_ids", relIds.join(","));
+        qp.set("calendar_mode", calMode);
+        const qs = qp.toString();
+        const res = await apiFetch<any>(`/ai/recommend/${dsId}${qs ? `?${qs}` : ""}`);
+        setAnalysis(res);
 
-      // Initialize selected KPIs from engine's dynamic selection
-      const selIds = new Set<string>((res?.kpis?.selected || []).map((k: any) => k.id));
-      setSelectedKpiIds(selIds);
+        // Merge standard computable KPIs + discovered business KPIs cleanly
+        const stdAll: KpiDefinition[] = res?.kpis?.standard || [];
+        const allBizRaw: KpiDefinition[] = res?.kpis?.all_business || [];
+        const seen = new Set<string>();
+        const mergedBiz: KpiDefinition[] = [];
+        for (const k of [...stdAll.filter((s) => s.computability_status === "computable" || s.computability_status === "computable_with_warning"), ...allBizRaw]) {
+          if (!seen.has(k.id)) {
+            seen.add(k.id);
+            mergedBiz.push(k);
+          }
+        }
 
-      const editInit: Record<string, any> = {};
-      for (const k of (res?.kpis?.all_business || [])) {
-        editInit[k.id] = {
-          name: k.name,
-          formula: k.formula,
-          target_value: k.target_value != null ? String(k.target_value) : "",
-          is_favorite: Boolean(k.is_favorite),
-          value: k.value,
-          formatted_value: k.formatted_value,
-        };
-      }
-      setKpiEdits(editInit);
+        const editInit: Record<string, KpiEditState> = {};
+        mergedBiz.forEach((k, idx) => {
+          const fmt = k.display_format || k.format_type || "number";
+          editInit[k.id] = {
+            name: k.name,
+            formula: k.formula,
+            display_format: fmt,
+            unit: k.unit || (fmt === "percentage" ? "%" : ""),
+            comparison_mode: k.comparison_mode || "none",
+            target_value: k.target_value != null ? String(k.target_value) : "",
+            priority: Number(k.priority || idx + 1),
+            is_favorite: Boolean(k.is_favorite),
+            value: k.value,
+            formatted_value: k.formatted_value,
+          };
+        });
 
-      const fInit: Record<string, any> = {};
-      for (const f of (res?.field_classifications || [])) {
-        fInit[f.field_name] = {
-          semantic_class: f.semantic_class,
-          display_name: f.display_name,
-          target_value: f.target_value != null ? String(f.target_value) : "",
-        };
+        // If editing an existing dashboard, restore exact prior confirmed KPIs & any custom ones!
+        if (initialConfirmedKpis && initialConfirmedKpis.length > 0) {
+          const confirmedIds = new Set<string>();
+          const extraCustoms: KpiDefinition[] = [];
+          initialConfirmedKpis.forEach((ck, idx) => {
+            confirmedIds.add(ck.id);
+            const fmt = ck.display_format || ck.format_type || "number";
+            if (!seen.has(ck.id)) {
+              extraCustoms.push({ ...ck, category: ck.category || "custom", computability_status: "computable" });
+            }
+            editInit[ck.id] = {
+              name: ck.name,
+              formula: ck.formula,
+              display_format: fmt,
+              unit: ck.unit || (fmt === "percentage" ? "%" : ""),
+              comparison_mode: ck.comparison_mode || (ck.target_value ? "target" : "none"),
+              target_value: ck.target_value != null ? String(ck.target_value) : "",
+              priority: Number(ck.priority || idx + 1),
+              is_favorite: Boolean(ck.is_favorite),
+              value: ck.value ?? editInit[ck.id]?.value,
+              formatted_value: ck.formatted_value ?? editInit[ck.id]?.formatted_value,
+            };
+          });
+          setCustomKpis(extraCustoms);
+          setSelectedKpiIds(confirmedIds);
+        } else {
+          // Initialize suggested selection (user still must explicitly review & confirm before Generate!)
+          const defaultSel = new Set<string>((res?.kpis?.selected || []).map((k: any) => k.id));
+          if (defaultSel.size === 0 && mergedBiz.length > 0) {
+            mergedBiz.slice(0, 4).forEach((k) => defaultSel.add(k.id));
+          }
+          setSelectedKpiIds(defaultSel);
+        }
+
+        setKpiEdits(editInit);
+
+        const fInit: Record<string, any> = {};
+        for (const f of res?.field_classifications || []) {
+          fInit[f.field_name] = {
+            semantic_class: f.semantic_class,
+            display_name: f.display_name,
+            target_value: f.target_value != null ? String(f.target_value) : "",
+          };
+        }
+        setFieldEdits(fInit);
+        if (!dashTitle && !initialSettings?.title && res?.dataset_name) {
+          setDashTitle(`داشبورد هوشمند ${res.dataset_name}`);
+        }
+      } catch (err: any) {
+        showToast(err.message || "خطا در پروفایل داده");
+      } finally {
+        setLoading(false);
       }
-      setFieldEdits(fInit);
-      if (!dashTitle && res?.dataset_name) {
-        setDashTitle(`داشبورد هوشمند ${res.dataset_name}`);
-      }
-    } catch (err: any) {
-      showToast(err.message || "خطا در پروفایل داده");
-    } finally {
-      setLoading(false);
-    }
-  }, [showToast]);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [showToast]
+  );
 
   useEffect(() => {
     if (datasetId) {
-      loadRecommendation(datasetId, false);
+      loadRecommendation(datasetId, false, relatedDatasetIds, calendarMode);
     }
-  }, [datasetId, loadRecommendation]);
+  }, [datasetId, calendarMode, relatedDatasetIds, loadRecommendation]);
 
   const handleSaveFieldOverrides = async () => {
     if (!datasetId) return;
@@ -173,7 +287,7 @@ export function IntelligentDashboardStudio({
         body: JSON.stringify({ overrides }),
       });
       showToast(isFa ? "تنظیمات معنایی فیلدها ذخیره و بازتحلیل شد" : "Field overrides saved & re-analyzed");
-      await loadRecommendation(datasetId, true);
+      await loadRecommendation(datasetId, true, relatedDatasetIds, calendarMode);
     } catch (err: any) {
       showToast(err.message);
     } finally {
@@ -181,18 +295,24 @@ export function IntelligentDashboardStudio({
     }
   };
 
-  const handlePreviewKpiFormula = async (kpiId: string, formulaStr: string, nameStr: string) => {
+  const handlePreviewKpiFormula = async (kpiId: string, formulaStr: string, nameStr: string, fmt?: string) => {
     if (!datasetId || !formulaStr.trim()) return;
     try {
       const res = await apiFetch<any>(`/ai/datasets/${datasetId}/kpis/preview`, {
         method: "POST",
-        body: JSON.stringify({ formula: formulaStr, name: nameStr }),
+        body: JSON.stringify({
+          formula: formulaStr,
+          name: nameStr,
+          format_type: fmt || kpiEdits[kpiId]?.display_format || "number",
+          calendar_mode: calendarMode,
+          related_dataset_ids: relatedDatasetIds.length ? relatedDatasetIds : undefined,
+        }),
       });
       setKpiEdits((prev) => ({
         ...prev,
         [kpiId]: { ...prev[kpiId], value: res.value, formatted_value: res.formatted_value },
       }));
-      showToast(isFa ? `مقدار محاسبه‌شده: ${res.formatted_value}` : `Value: ${res.formatted_value}`);
+      showToast(isFa ? `فرمول معتبر است · مقدار: ${res.formatted_value}` : `Valid formula · Value: ${res.formatted_value}`);
     } catch (err: any) {
       showToast(err.message);
     }
@@ -209,20 +329,32 @@ export function IntelligentDashboardStudio({
           formula: newKpiFormula.trim(),
           format_type: newKpiFormat,
           target_value: newKpiTarget ? Number(newKpiTarget) : undefined,
+          calendar_mode: calendarMode,
+          related_dataset_ids: relatedDatasetIds.length ? relatedDatasetIds : undefined,
         }),
       });
       const cid = `custom_${Date.now()}`;
-      const created = {
+      const unit = newKpiFormat === "percentage" ? "%" : newKpiFormat === "currency" ? "ریال" : "";
+      const created: KpiDefinition = {
         id: cid,
         name: newKpiName.trim(),
         formula: newKpiFormula.trim(),
+        base_fields: res.base_fields || [],
         format_type: newKpiFormat,
+        display_format: newKpiFormat,
+        unit,
         target_value: newKpiTarget ? Number(newKpiTarget) : undefined,
+        comparison_mode: newKpiTarget ? "target" : "none",
         value: res.value,
         formatted_value: res.formatted_value,
         category: "custom",
+        priority: 1,
         confidence: 0.99,
         score: 99,
+        computability_status: "computable",
+        computability_status_fa: "قابل محاسبه",
+        source: analysis?.dataset_name,
+        source_datasets: [analysis?.dataset_name].filter(Boolean),
       };
       setCustomKpis((prev) => [created, ...prev]);
       setSelectedKpiIds((prev) => new Set([...Array.from(prev), cid]));
@@ -231,7 +363,11 @@ export function IntelligentDashboardStudio({
         [cid]: {
           name: created.name,
           formula: created.formula,
+          display_format: newKpiFormat,
+          unit,
+          comparison_mode: newKpiTarget ? "target" : "none",
           target_value: newKpiTarget,
+          priority: 1,
           value: res.value,
           formatted_value: res.formatted_value,
           is_favorite: true,
@@ -240,7 +376,7 @@ export function IntelligentDashboardStudio({
       setNewKpiName("");
       setNewKpiFormula("");
       setNewKpiTarget("");
-      showToast(isFa ? `شاخص سفارشی با مقدار ${res.formatted_value} افزوده شد` : `Custom KPI added (${res.formatted_value})`);
+      showToast(isFa ? `شاخص سفارشی با مقدار ${res.formatted_value} تأیید و افزوده شد` : `Custom KPI added (${res.formatted_value})`);
     } catch (err: any) {
       showToast(err.message);
     } finally {
@@ -248,35 +384,154 @@ export function IntelligentDashboardStudio({
     }
   };
 
+  const handleActivateManualTargetKpi = async (nk: KpiDefinition) => {
+    const rawT = manualTargetsByKpi[nk.id];
+    const numT = Number(rawT);
+    if (!rawT || !Number.isFinite(numT) || numT <= 0) {
+      showToast(isFa ? "لطفاً یک مقدار هدف مثبت وارد کنید" : "Please enter a valid positive target value");
+      return;
+    }
+    const baseField = nk.base_fields?.[0] || analysis?.field_classifications?.find((f: any) => f.data_type === "numeric" && f.sum_allowed)?.field_name;
+    if (!baseField) {
+      showToast(isFa ? "ستون عددی پایه برای تحقق هدف یافت نشد" : "No numeric base field found");
+      return;
+    }
+    const formula = `COALESCE(SUM("${baseField}"), 0) * 100.0 / NULLIF(${numT}, 0)`;
+    try {
+      const prev = await apiFetch<any>(`/ai/datasets/${datasetId}/kpis/preview`, {
+        method: "POST",
+        body: JSON.stringify({ name: nk.name, formula, format_type: "percentage", unit: "%", target_value: numT }),
+      });
+      const promoted: KpiDefinition = {
+        ...nk,
+        formula,
+        base_fields: [baseField],
+        target_value: numT,
+        comparison_mode: "target",
+        display_format: "percentage",
+        format_type: "percentage",
+        unit: "%",
+        value: prev.value,
+        formatted_value: prev.formatted_value,
+        computability_status: "computable_with_warning",
+        computability_status_fa: "قابل محاسبه (هدف دستی)",
+        warnings_fa: [`مقدار هدف دستی (${numT.toLocaleString()}) ثبت شد.`],
+      };
+      setCustomKpis((p) => [promoted, ...p.filter((x) => x.id !== nk.id)]);
+      setKpiEdits((p) => ({
+        ...p,
+        [nk.id]: {
+          name: promoted.name,
+          formula,
+          display_format: "percentage",
+          unit: "%",
+          comparison_mode: "target",
+          target_value: String(numT),
+          priority: nk.priority || 6,
+          is_favorite: false,
+          value: prev.value,
+          formatted_value: prev.formatted_value,
+        },
+      }));
+      setSelectedKpiIds((p) => new Set([...Array.from(p), nk.id]));
+      setKpiSubTab("business");
+      showToast(isFa ? `شاخص «${nk.name}» با هدف دستی فعال و انتخاب شد (${prev.formatted_value})` : `Activated "${nk.name}"`);
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
+  // All computable business + standard KPIs + user custom KPIs
+  const allBusinessKpis = useMemo(() => {
+    const stdAll: KpiDefinition[] = analysis?.kpis?.standard || [];
+    const base: KpiDefinition[] = analysis?.kpis?.all_business || [];
+    const merged: KpiDefinition[] = [];
+    const seen = new Set<string>();
+
+    for (const k of [
+      ...customKpis,
+      ...stdAll.filter((s) => s.computability_status === "computable" || s.computability_status === "computable_with_warning"),
+      ...base,
+    ]) {
+      if (!seen.has(k.id)) {
+        seen.add(k.id);
+        merged.push(k);
+      }
+    }
+    return merged;
+  }, [analysis, customKpis]);
+
+  const filteredBusinessKpis = useMemo(() => {
+    const q = kpiSearch.trim().toLowerCase();
+    if (!q) return allBusinessKpis;
+    return allBusinessKpis.filter(
+      (k) =>
+        k.name.toLowerCase().includes(q) ||
+        k.formula.toLowerCase().includes(q) ||
+        (k.source || "").toLowerCase().includes(q)
+    );
+  }, [allBusinessKpis, kpiSearch]);
+
+  const needsDataKpis: KpiDefinition[] = useMemo(() => {
+    const customIds = new Set(customKpis.map((c) => c.id));
+    const list: KpiDefinition[] = analysis?.kpis?.needs_data || [];
+    return list.filter((k) => !customIds.has(k.id));
+  }, [analysis, customKpis]);
+
+  const dqKpis: KpiDefinition[] = analysis?.kpis?.data_quality || [];
+  const rejectedKpis: KpiDefinition[] = analysis?.kpis?.uncomputable || [];
+
+  // Build final confirmed KPIs payload strictly from checked computable KPIs
+  const confirmedPayloadList = useMemo(() => {
+    const byId = new Map<string, KpiDefinition>(allBusinessKpis.map((k) => [k.id, k]));
+    const items: any[] = [];
+    selectedKpiIds.forEach((id) => {
+      const k = byId.get(id);
+      if (!k) return;
+      const ed = kpiEdits[id];
+      const fmt = ed?.display_format || k.display_format || k.format_type || "number";
+      items.push({
+        id: k.id,
+        slug: k.slug || k.id,
+        name: ed?.name || k.name,
+        formula: ed?.formula || k.formula,
+        base_fields: k.base_fields || k.required_fields || [],
+        display_format: fmt,
+        format_type: fmt,
+        unit: ed?.unit ?? k.unit ?? (fmt === "percentage" ? "%" : ""),
+        priority: Number(ed?.priority ?? k.priority ?? items.length + 1),
+        comparison_mode: ed?.comparison_mode || k.comparison_mode || "none",
+        target_value: ed?.target_value ? Number(ed.target_value) : k.target_value ?? null,
+        is_standard: Boolean(k.is_standard),
+        category: k.category || "custom",
+        multi_source_agg: k.multi_source_agg || undefined,
+        pre_agg_grain: k.pre_agg_grain || undefined,
+        time_field: k.time_field || undefined,
+        source_datasets: k.source_datasets || [analysis?.dataset_name].filter(Boolean),
+        is_confirmed: true,
+      });
+    });
+    return items.sort((a, b) => a.priority - b.priority);
+  }, [allBusinessKpis, selectedKpiIds, kpiEdits, analysis?.dataset_name]);
+
   const handleRegisterSelectedSemantic = async () => {
-    if (!datasetId) return;
+    if (!datasetId || confirmedPayloadList.length === 0) return;
     setRegistering(true);
     try {
-      const allKpis = [...customKpis, ...(analysis?.kpis?.all_business || [])];
-      const chosen = allKpis.filter((k) => selectedKpiIds.has(k.id)).map((k) => {
-        const ed = kpiEdits[k.id];
-        return {
-          id: k.id,
-          slug: k.slug || k.id,
-          name: ed?.name || k.name,
-          formula: ed?.formula || k.formula,
-          format_type: k.format_type || "number",
-          unit: k.unit || "",
-          category: k.category || "analytical",
-          confidence: k.confidence || 0.9,
-          target_value: ed?.target_value ? Number(ed.target_value) : k.target_value,
-          is_favorite: ed?.is_favorite ?? k.is_favorite ?? false,
-          limitations: k.limitations || [],
-          comparison_basis: k.comparison_basis,
-          source_datasets: k.source_datasets || [analysis?.dataset_name],
-          score: k.score,
-        };
-      });
+      const chosen = confirmedPayloadList.map((k) => ({
+        ...k,
+        is_favorite: kpiEdits[k.id]?.is_favorite ?? false,
+      }));
       const res = await apiFetch<any>(`/ai/datasets/${datasetId}/kpis/register`, {
         method: "POST",
-        body: JSON.stringify({ kpis: chosen }),
+        body: JSON.stringify({
+          kpis: chosen,
+          related_dataset_ids: relatedDatasetIds.length ? relatedDatasetIds : undefined,
+        }),
       });
-      showToast(isFa ? `${res.count} شاخص با موفقیت در Semantic Layer ثبت شد` : `${res.count} KPIs registered in Semantic Layer`);
+      showToast(
+        isFa ? `${res.count} شاخص با موفقیت در Semantic Layer ثبت شد` : `${res.count} KPIs registered in Semantic Layer`
+      );
     } catch (err: any) {
       showToast(err.message);
     } finally {
@@ -284,49 +539,39 @@ export function IntelligentDashboardStudio({
     }
   };
 
-  const handleGenerate = async (autoOneClick = false) => {
+  const handleGenerateConfirmed = async () => {
     if (!datasetId) return;
+    if (confirmedPayloadList.length === 0) {
+      showToast(
+        isFa
+          ? "حداقل یک KPI معتبر را انتخاب و تأیید کنید پیش از تولید داشبورد."
+          : "Please select and confirm at least one valid KPI first."
+      );
+      return;
+    }
     setGenerating(true);
     try {
-      const allKnown = [...(analysis?.kpis?.all_business || [])];
-      const modifiedCustom: any[] = [...customKpis];
       const targetValues: Record<string, number> = {};
-      const selList = Array.from(selectedKpiIds);
-
-      if (!autoOneClick) {
-        for (const k of allKnown) {
-          const ed = kpiEdits[k.id];
-          if (ed && ed.target_value && !Number.isNaN(Number(ed.target_value))) {
-            targetValues[k.id] = Number(ed.target_value);
-          }
-          if (ed && selectedKpiIds.has(k.id) && (ed.formula !== k.formula || ed.name !== k.name)) {
-            modifiedCustom.push({
-              id: k.id,
-              name: ed.name,
-              formula: ed.formula,
-              format_type: k.format_type,
-              unit: k.unit,
-              target_value: ed.target_value ? Number(ed.target_value) : k.target_value,
-            });
-          }
+      for (const ck of confirmedPayloadList) {
+        if (ck.target_value != null && !Number.isNaN(Number(ck.target_value))) {
+          targetValues[ck.id] = Number(ck.target_value);
         }
       }
-
-      const payload: any = autoOneClick
-        ? { dataset_id: datasetId }
-        : {
-            dataset_id: datasetId,
-            title: dashTitle || undefined,
-            template_mode: templateMode,
-            detail_level: detailLevel,
-            calendar_mode: calendarMode,
-            max_pages: maxPages,
-            theme_id: themeId || undefined,
-            selected_kpi_ids: selList.length > 0 ? selList : undefined,
-            custom_kpis: modifiedCustom.length > 0 ? modifiedCustom : undefined,
-            target_values: Object.keys(targetValues).length > 0 ? targetValues : undefined,
-            date_range: dateStart || dateEnd ? { start: dateStart || undefined, end: dateEnd || undefined } : undefined,
-          };
+      const payload: any = {
+        dataset_id: datasetId,
+        dashboard_id: editingDashboardId || undefined,
+        title: dashTitle || undefined,
+        template_mode: templateMode,
+        detail_level: detailLevel,
+        calendar_mode: calendarMode,
+        max_pages: maxPages,
+        theme_id: themeId || undefined,
+        confirmed_kpis: confirmedPayloadList,
+        selected_kpi_ids: confirmedPayloadList.map((c) => c.id),
+        target_values: Object.keys(targetValues).length > 0 ? targetValues : undefined,
+        related_dataset_ids: relatedDatasetIds.length ? relatedDatasetIds : undefined,
+        date_range: dateStart || dateEnd ? { start: dateStart || undefined, end: dateEnd || undefined } : undefined,
+      };
 
       const res = await apiFetch<{ dashboard_id: string; pages_count?: number; widgets_count?: number }>(
         "/ai/generate-dashboard",
@@ -336,9 +581,13 @@ export function IntelligentDashboardStudio({
         }
       );
       showToast(
-        isFa
-          ? `داشبورد هوشمند (${res.pages_count || 1} صفحه، ${res.widgets_count || ""} ویجت) ساخته شد!`
-          : `Intelligent Dashboard (${res.pages_count || 1} pages) created!`
+        editingDashboardId
+          ? isFa
+            ? `KPIهای داشبورد با موفقیت به‌روزرسانی شد (${confirmedPayloadList.length} شاخص)!`
+            : `Dashboard KPIs updated (${confirmedPayloadList.length} KPIs)!`
+          : isFa
+          ? `داشبورد با ${confirmedPayloadList.length} KPI تأییدشده (${res.pages_count || 1} صفحه) ساخته شد!`
+          : `Dashboard built with ${confirmedPayloadList.length} confirmed KPIs!`
       );
       if (onGenerated) {
         onGenerated(res.dashboard_id);
@@ -352,41 +601,65 @@ export function IntelligentDashboardStudio({
     }
   };
 
-  const allBusinessKpis = useMemo(() => {
-    const base = analysis?.kpis?.all_business || [];
-    return [...customKpis, ...base];
-  }, [analysis, customKpis]);
-
-  const dqKpis = analysis?.kpis?.data_quality || [];
-  const rejectedKpis = analysis?.kpis?.uncomputable || [];
   const domain = analysis?.domain_detection;
   const deepProf = analysis?.deep_profile;
   const fieldsCls = analysis?.field_classifications || [];
+  const otherDatasets = datasets.filter((d) => d.id !== datasetId);
 
   return (
-    <div dir={isFa ? "rtl" : "ltr"} className="bi-card p-4 sm:p-5 space-y-4 border-2 border-violet-500/30">
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b" style={{ borderColor: "var(--bi-border)" }}>
-        <div className="flex items-center gap-2.5">
-          <div className="w-9 h-9 rounded-xl bg-violet-500/15 text-violet-500 flex items-center justify-center shrink-0">
-            <Sparkles className="w-5 h-5" />
+    <div dir={isFa ? "rtl" : "ltr"} className="bi-card p-4 sm:p-5 space-y-4 border-2 border-violet-500/35">
+      {/* Header + 3-Step Workflow Indicator */}
+      <div className="flex flex-wrap items-start justify-between gap-3 pb-3 border-b" style={{ borderColor: "var(--bi-border)" }}>
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-violet-500/15 text-violet-500 flex items-center justify-center shrink-0">
+              <Sparkles className="w-5 h-5" />
+            </div>
+            <div>
+              <h2 className="text-sm sm:text-base font-bold">
+                {editingDashboardId
+                  ? isFa
+                    ? "ویرایش، انتخاب و تأیید مجدد KPIهای داشبورد"
+                    : "Edit & Re-Confirm Dashboard KPIs"
+                  : isFa
+                  ? "انتخاب و تأیید KPIها قبل از تولید داشبورد"
+                  : "KPI Selection & Confirmation"}
+              </h2>
+              <p className="text-[11px]" style={{ color: "var(--bi-muted)" }}>
+                {isFa
+                  ? "مرحله اجباری پیش از ساخت داشبورد: بررسی فرمول، مبنای محاسبه، هدف، فرمت نمایش و تأیید نهایی شاخص‌ها"
+                  : "Mandatory confirmation step before dashboard generation: verify formulas, targets, display formats & priorities"}
+              </p>
+            </div>
           </div>
-          <div>
-            <h2 className="text-sm sm:text-base font-bold">
-              {isFa ? "موتور هوشمند کشف KPI و تولید داشبورد چندصفحه‌ای" : "Intelligent 5-Stage KPI & Multi-Page Dashboard Studio"}
-            </h2>
-            <p className="text-[11px]" style={{ color: "var(--bi-muted)" }}>
-              {isFa
-                ? "پروفایل عمیق، طبقه‌بندی ۲۲گانه فیلدها، تشخیص حوزه، اعتبارسنجی AST و شخصی‌سازی KPI قبل از ساخت داشبورد"
-                : "Deep profiling, 22-class semantic typing, AST-guarded KPI formulas & customizable multi-page generation"}
-            </p>
+
+          {/* 3-Step Progress Stepper */}
+          <div className="flex flex-wrap items-center gap-1.5 text-[11px] pt-1">
+            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-semibold">
+              <CheckCircle2 className="w-3 h-3" /> ۱. تحلیل منبع داده
+            </span>
+            <span className="opacity-40">←</span>
+            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-violet-600 text-white font-bold shadow-sm">
+              ۲. انتخاب و تأیید KPIها ({confirmedPayloadList.length})
+            </span>
+            <span className="opacity-40">←</span>
+            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full border opacity-75" style={{ borderColor: "var(--bi-border)" }}>
+              ۳. تولید داشبورد چندصفحه‌ای
+            </span>
           </div>
         </div>
+
         <div className="flex flex-wrap items-center gap-2">
           <select
+            aria-label={isFa ? "انتخاب منبع داده" : "Select Dataset"}
             value={datasetId}
-            onChange={(e) => setDatasetId(e.target.value)}
-            className="px-3 py-1.5 rounded-lg border text-xs font-medium min-w-[180px]"
+            disabled={Boolean(editingDashboardId)}
+            onChange={(e) => {
+              setDatasetId(e.target.value);
+              setRelatedDatasetIds([]);
+              setCustomKpis([]);
+            }}
+            className="px-3 py-1.5 rounded-lg border text-xs font-medium min-w-[180px] disabled:opacity-70"
             style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
           >
             {datasets.map((d) => (
@@ -395,9 +668,21 @@ export function IntelligentDashboardStudio({
               </option>
             ))}
           </select>
+
           <button
             type="button"
-            onClick={() => loadRecommendation(datasetId, true)}
+            onClick={() => setCalendarMode((m) => (m === "jalali" ? "gregorian" : "jalali"))}
+            className="px-2.5 py-1.5 rounded-lg border text-xs flex items-center gap-1 hover:bg-violet-500/10"
+            style={{ borderColor: "var(--bi-border)" }}
+            title={isFa ? "تغییر تقویم مبنای رشد ماهانه و روندها" : "Toggle calendar alignment"}
+          >
+            <Calendar className="w-3.5 h-3.5 text-violet-500" />
+            {calendarMode === "jalali" ? "تقویم شمسی" : "تقویم میلادی"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => loadRecommendation(datasetId, true, relatedDatasetIds, calendarMode)}
             disabled={loading || !datasetId}
             className="px-2.5 py-1.5 rounded-lg border text-xs flex items-center gap-1 hover:bg-blue-500/10"
             style={{ borderColor: "var(--bi-border)" }}
@@ -405,27 +690,50 @@ export function IntelligentDashboardStudio({
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
             {isFa ? "تحلیل مجدد" : "Re-Analyze"}
           </button>
-          <button
-            type="button"
-            onClick={() => handleGenerate(true)}
-            disabled={generating || !datasetId}
-            className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 flex items-center gap-1 disabled:opacity-60"
-          >
-            <Wand2 className="w-3.5 h-3.5" />
-            {generating ? "..." : isFa ? "ساخت سریع ۱-کلیکی" : "1-Click Auto"}
-          </button>
+
           {onClose && (
-            <button type="button" onClick={onClose} className="p-1.5 rounded-lg hover:bg-red-500/10 text-red-500">
+            <button type="button" onClick={onClose} aria-label="Close" className="p-1.5 rounded-lg hover:bg-red-500/10 text-red-500">
               <X className="w-4 h-4" />
             </button>
           )}
         </div>
       </div>
 
+      {/* Multi-Source Join Selector (optional partner datasets) */}
+      {otherDatasets.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 text-[11px] px-3 py-2 rounded-xl border" style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}>
+          <span className="font-semibold flex items-center gap-1 opacity-80">
+            <Link2 className="w-3.5 h-3.5 text-blue-500" />
+            {isFa ? "اتصال منابع مرتبط (جلوگیری از Fan-out):" : "Related Sources (Key-grain pre-agg):"}
+          </span>
+          {otherDatasets.slice(0, 6).map((od) => {
+            const active = relatedDatasetIds.includes(od.id);
+            return (
+              <button
+                key={od.id}
+                type="button"
+                onClick={() =>
+                  setRelatedDatasetIds((prev) =>
+                    prev.includes(od.id) ? prev.filter((x) => x !== od.id) : [...prev, od.id]
+                  )
+                }
+                className={`px-2 py-0.5 rounded-full border text-[10px] font-semibold transition ${
+                  active ? "bg-blue-600 text-white border-blue-600" : "hover:bg-blue-500/10"
+                }`}
+                style={{ borderColor: active ? undefined : "var(--bi-border)" }}
+              >
+                {active ? "✓ " : "+ "}
+                {od.name}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       {loading && (
         <div className="py-10 flex items-center justify-center gap-2 text-xs font-semibold" style={{ color: "var(--bi-muted)" }}>
           <Loader2 className="w-4 h-4 animate-spin text-violet-500" />
-          {isFa ? "در حال اجرای موتور ۵ مرحله‌ای پروفایل و استخراج KPI..." : "Running 5-stage profiling & KPI discovery..."}
+          {isFa ? "در حال تحلیل ساختار داده و ارزیابی ۷ KPI استاندارد و شاخص‌های حوزه..." : "Analyzing schema & evaluating KPIs..."}
         </div>
       )}
 
@@ -439,24 +747,28 @@ export function IntelligentDashboardStudio({
               <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>اطمینان {Math.round((domain?.confidence || 0) * 100)}%</div>
             </div>
             <div className="p-2.5 rounded-lg border" style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}>
-              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>تعداد رکورد / ستون</div>
+              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>ابعاد منبع داده</div>
               <div className="font-bold mt-0.5">{(deepProf?.row_count || 0).toLocaleString()} × {deepProf?.field_count || 0}</div>
-              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>{deepProf?.is_approximate ? "نمونه‌برداری هوشمند" : "پروفایل دقیق کامل"}</div>
+              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>{deepProf?.is_approximate ? "نمونه‌برداری" : "پروفایل کامل"}</div>
             </div>
             <div className="p-2.5 rounded-lg border" style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}>
-              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>تکمیل بودن داده</div>
-              <div className="font-bold mt-0.5 text-emerald-500">{deepProf?.completeness_pct}%</div>
+              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>کیفیت داده</div>
+              <div className="font-bold mt-0.5 text-emerald-500">{deepProf?.completeness_pct}% تکمیل</div>
               <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>تکراری: {deepProf?.duplicate_row_count || 0}</div>
             </div>
             <div className="p-2.5 rounded-lg border" style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}>
-              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>KPIهای کشف‌شده</div>
-              <div className="font-bold mt-0.5">{selectedKpiIds.size} منتخب / {allBusinessKpis.length} کل</div>
-              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>ردشده: {rejectedKpis.length}</div>
+              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>KPIهای قابل محاسبه / نیازمند داده</div>
+              <div className="font-bold mt-0.5">
+                {confirmedPayloadList.length} تأییدشده / {allBusinessKpis.length} آماده
+              </div>
+              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>
+                نیازمند داده: {needsDataKpis.length} · نامعتبر: {rejectedKpis.length}
+              </div>
             </div>
             <div className="p-2.5 rounded-lg border" style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}>
-              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>ساختار پیشنهادی</div>
-              <div className="font-bold mt-0.5">{(analysis?.recommended_pages || []).length} صفحه تحلیلی</div>
-              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>{(analysis?.suggested_widgets || []).length} ویجت معتبر</div>
+              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>صفحات خروجی داشبورد</div>
+              <div className="font-bold mt-0.5">{Math.min(maxPages, (analysis?.recommended_pages || []).length)} صفحه تحلیلی</div>
+              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>+ صفحه Drill-Through جزئیات</div>
             </div>
           </div>
 
@@ -485,7 +797,7 @@ export function IntelligentDashboardStudio({
               style={{ borderColor: "var(--bi-border)" }}
             >
               <BarChart3 className="w-3.5 h-3.5" />
-              {isFa ? `بررسی، ویرایش و انتخاب KPIها (${selectedKpiIds.size})` : `Review & Edit KPIs (${selectedKpiIds.size})`}
+              {isFa ? `انتخاب و تأیید KPIها (${confirmedPayloadList.length})` : `Select & Confirm KPIs (${confirmedPayloadList.length})`}
             </button>
             <button
               type="button"
@@ -496,7 +808,7 @@ export function IntelligentDashboardStudio({
               style={{ borderColor: "var(--bi-border)" }}
             >
               <Database className="w-3.5 h-3.5" />
-              {isFa ? `پروفایل عمیق و طبقه‌بندی ۲۲گانه (${fieldsCls.length})` : `Deep Profile & Semantic Classes`}
+              {isFa ? `ستون‌ها و نقش معنایی (${fieldsCls.length})` : `Schema & Semantic Classes (${fieldsCls.length})`}
             </button>
             <button
               type="button"
@@ -511,10 +823,10 @@ export function IntelligentDashboardStudio({
             </button>
           </div>
 
-          {/* TAB 1: KPI SELECTION, FORMULA EDITING & TARGETS */}
+          {/* TAB 1: KPI SELECTION, FORMULA EDITING & CONFIRMATION */}
           {activeTab === "kpis" && (
             <div className="space-y-4">
-              {/* Sub-tabs */}
+              {/* Sub-tabs + Semantic Register */}
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex flex-wrap gap-1.5 text-xs">
                   <button
@@ -523,7 +835,15 @@ export function IntelligentDashboardStudio({
                     className={`px-2.5 py-1 rounded-md font-semibold ${kpiSubTab === "business" ? "bg-blue-600 text-white" : "border"}`}
                     style={{ borderColor: "var(--bi-border)" }}
                   >
-                    شاخص‌های کسب‌وکار ({allBusinessKpis.length})
+                    KPIهای قابل محاسبه ({allBusinessKpis.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setKpiSubTab("needs_data")}
+                    className={`px-2.5 py-1 rounded-md font-semibold ${kpiSubTab === "needs_data" ? "bg-amber-600 text-white" : "border"}`}
+                    style={{ borderColor: "var(--bi-border)" }}
+                  >
+                    نیازمند تکمیل داده ({needsDataKpis.length})
                   </button>
                   <button
                     type="button"
@@ -539,100 +859,174 @@ export function IntelligentDashboardStudio({
                     className={`px-2.5 py-1 rounded-md font-semibold ${kpiSubTab === "rejected" ? "bg-rose-600 text-white" : "border"}`}
                     style={{ borderColor: "var(--bi-border)" }}
                   >
-                    غیرقابل محاسبه / ردشده ({rejectedKpis.length})
+                    غیرقابل محاسبه ({rejectedKpis.length})
                   </button>
                 </div>
 
                 <button
                   type="button"
                   onClick={handleRegisterSelectedSemantic}
-                  disabled={registering || selectedKpiIds.size === 0}
+                  disabled={registering || confirmedPayloadList.length === 0}
                   className="px-3 py-1.5 rounded-lg border border-emerald-500/40 text-emerald-600 dark:text-emerald-400 text-xs font-semibold flex items-center gap-1 hover:bg-emerald-500/10 disabled:opacity-50"
                 >
                   <BookmarkCheck className="w-3.5 h-3.5" />
-                  {registering ? "..." : isFa ? "ثبت KPIهای منتخب در Semantic Layer" : "Save Selected to Semantic Layer"}
+                  {registering ? "..." : isFa ? "ذخیره KPIهای منتخب در Semantic Layer" : "Save Selected to Semantic Layer"}
                 </button>
               </div>
 
               {kpiSubTab === "business" && (
                 <div className="space-y-3">
-                  {/* Add Custom KPI Row */}
-                  <div className="p-3 rounded-xl border border-dashed grid grid-cols-1 md:grid-cols-12 gap-2 text-xs" style={{ borderColor: "var(--bi-border)" }}>
-                    <input
-                      value={newKpiName}
-                      onChange={(e) => setNewKpiName(e.target.value)}
-                      placeholder="نام KPI سفارشی (مثلاً حاشیه سود خالص)"
-                      className="md:col-span-3 px-2.5 py-1.5 rounded-lg border bg-transparent"
-                      style={{ borderColor: "var(--bi-border)" }}
-                    />
-                    <input
-                      dir="ltr"
-                      value={newKpiFormula}
-                      onChange={(e) => setNewKpiFormula(e.target.value)}
-                      placeholder='فرمول SQL: e.g. SUM("revenue") / NULLIF(SUM("cost"), 0)'
-                      className="md:col-span-4 px-2.5 py-1.5 rounded-lg border bg-transparent font-mono text-[11px]"
-                      style={{ borderColor: "var(--bi-border)" }}
-                    />
-                    <select
-                      value={newKpiFormat}
-                      onChange={(e) => setNewKpiFormat(e.target.value)}
-                      className="md:col-span-2 px-2 py-1.5 rounded-lg border text-xs"
-                      style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
-                    >
-                      <option value="number">عددی</option>
-                      <option value="currency">مالی</option>
-                      <option value="percentage">درصد (%)</option>
-                      <option value="duration">مدت زمان</option>
-                    </select>
-                    <input
-                      type="number"
-                      value={newKpiTarget}
-                      onChange={(e) => setNewKpiTarget(e.target.value)}
-                      placeholder="هدف (اختیاری)"
-                      className="md:col-span-1 px-2 py-1.5 rounded-lg border bg-transparent"
-                      style={{ borderColor: "var(--bi-border)" }}
-                    />
-                    <button
-                      type="button"
-                      onClick={handleAddCustomKpi}
-                      disabled={previewingFormula || !newKpiName || !newKpiFormula}
-                      className="md:col-span-2 px-3 py-1.5 rounded-lg bg-violet-600 text-white font-semibold flex items-center justify-center gap-1 disabled:opacity-50"
-                    >
-                      <Plus className="w-3.5 h-3.5" /> افزودن KPI
-                    </button>
+                  {/* Search & Bulk Toggle Row */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border flex-1 min-w-[200px] max-w-sm" style={{ borderColor: "var(--bi-border)" }}>
+                      <Search className="w-3.5 h-3.5 opacity-60 shrink-0" />
+                      <input
+                        value={kpiSearch}
+                        onChange={(e) => setKpiSearch(e.target.value)}
+                        placeholder={isFa ? "جستجوی KPI یا نام ستون..." : "Filter KPIs..."}
+                        className="bg-transparent outline-none flex-1 min-w-0"
+                      />
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedKpiIds(new Set(allBusinessKpis.slice(0, 7).map((k) => k.id)))}
+                        className="px-2.5 py-1 rounded-md border hover:bg-violet-500/10"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        انتخاب شاخص‌های کلیدی
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedKpiIds(new Set())}
+                        className="px-2.5 py-1 rounded-md border hover:bg-rose-500/10 text-rose-500"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        پاک کردن انتخاب
+                      </button>
+                    </div>
                   </div>
 
-                  {/* Business KPI Cards */}
-                  <div className="space-y-2 max-h-[380px] overflow-y-auto pr-1">
-                    {allBusinessKpis.map((k: any) => {
+                  {/* Add Custom KPI Row */}
+                  <div className="p-3 rounded-xl border border-dashed space-y-2 text-xs" style={{ borderColor: "var(--bi-border)" }}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold text-[11px] flex items-center gap-1">
+                        <Plus className="w-3.5 h-3.5 text-violet-500" /> افزودن KPI سفارشی جدید (با تست زنده قبل از تأیید)
+                      </span>
+                      <div className="flex flex-wrap gap-1 text-[10px]">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const numF = fieldsCls.find((f: any) => f.data_type === "numeric" && f.sum_allowed)?.field_name || "revenue";
+                            const ordF = fieldsCls.find((f: any) => /order|invoice|tx/.test(f.field_name.toLowerCase()))?.field_name || "order_id";
+                            setNewKpiFormula(`AOV("${numF}", "${ordF}")`);
+                            setNewKpiFormat("currency");
+                            if (!newKpiName) setNewKpiName("میانگین ارزش سفارش");
+                          }}
+                          className="px-2 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-500/20"
+                        >
+                          + الگوی AOV دومرحله‌ای
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const numF = fieldsCls.find((f: any) => f.data_type === "numeric" && f.sum_allowed)?.field_name || "revenue";
+                            const dtF = fieldsCls.find((f: any) => f.data_type === "date" || f.semantic_class === "Date/Time")?.field_name || "order_date";
+                            setNewKpiFormula(`MOM_CALENDAR("${numF}", "${dtF}")`);
+                            setNewKpiFormat("percentage");
+                            if (!newKpiName) setNewKpiName("رشد ماهانه تقویمی");
+                          }}
+                          className="px-2 py-0.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400 hover:bg-violet-500/20"
+                        >
+                          + الگوی رشد ماهانه
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-12 gap-2">
+                      <input
+                        value={newKpiName}
+                        onChange={(e) => setNewKpiName(e.target.value)}
+                        placeholder="نام KPI سفارشی (مثلاً حاشیه سود خالص)"
+                        className="md:col-span-3 px-2.5 py-1.5 rounded-lg border bg-transparent"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      />
+                      <input
+                        dir="ltr"
+                        value={newKpiFormula}
+                        onChange={(e) => setNewKpiFormula(e.target.value)}
+                        placeholder='SUM("revenue") / NULLIF(SUM("cost"), 0)'
+                        className="md:col-span-4 px-2.5 py-1.5 rounded-lg border bg-transparent font-mono text-[11px]"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      />
+                      <select
+                        value={newKpiFormat}
+                        onChange={(e) => setNewKpiFormat(e.target.value)}
+                        className="md:col-span-2 px-2 py-1.5 rounded-lg border text-xs"
+                        style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+                      >
+                        {FORMAT_OPTIONS.map((fo) => (
+                          <option key={fo.value} value={fo.value}>
+                            {isFa ? fo.labelFa : fo.labelEn}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="number"
+                        value={newKpiTarget}
+                        onChange={(e) => setNewKpiTarget(e.target.value)}
+                        placeholder="هدف (اختیاری)"
+                        className="md:col-span-1 px-2 py-1.5 rounded-lg border bg-transparent"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      />
+                      <button
+                        type="button"
+                        onClick={handleAddCustomKpi}
+                        disabled={previewingFormula || !newKpiName || !newKpiFormula}
+                        className="md:col-span-2 px-3 py-1.5 rounded-lg bg-violet-600 text-white font-semibold flex items-center justify-center gap-1 disabled:opacity-50"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> تست و افزودن
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Business & Standard KPI Cards */}
+                  <div className="space-y-2.5 max-h-[420px] overflow-y-auto pr-1">
+                    {filteredBusinessKpis.map((k) => {
                       const isChecked = selectedKpiIds.has(k.id);
-                      const ed = kpiEdits[k.id] || {
+                      const ed: KpiEditState = kpiEdits[k.id] || {
                         name: k.name,
                         formula: k.formula,
-                        target_value: "",
-                        is_favorite: false,
+                        display_format: k.display_format || k.format_type || "number",
+                        unit: k.unit || "",
+                        comparison_mode: k.comparison_mode || "none",
+                        target_value: k.target_value != null ? String(k.target_value) : "",
+                        priority: k.priority || 10,
+                        is_favorite: Boolean(k.is_favorite),
                         formatted_value: k.formatted_value,
                       };
+                      const hasWarn = k.computability_status === "computable_with_warning" || (k.warnings_fa && k.warnings_fa.length > 0);
                       return (
                         <div
                           key={k.id}
                           className={`p-3 rounded-xl border text-xs space-y-2 transition ${
-                            isChecked ? "border-violet-500/50 bg-violet-500/5" : ""
+                            isChecked ? "border-violet-500/60 bg-violet-500/5" : ""
                           }`}
                           style={{ borderColor: isChecked ? undefined : "var(--bi-border)" }}
                         >
                           <div className="flex flex-wrap items-center justify-between gap-2">
-                            <div className="flex items-center gap-2 flex-1 min-w-[200px]">
+                            <div className="flex items-center gap-2 flex-1 min-w-[210px]">
                               <input
                                 type="checkbox"
                                 checked={isChecked}
+                                aria-label={`Select KPI ${ed.name}`}
                                 onChange={() => {
                                   const next = new Set(selectedKpiIds);
                                   if (next.has(k.id)) next.delete(k.id);
                                   else next.add(k.id);
                                   setSelectedKpiIds(next);
                                 }}
-                                className="w-4 h-4 accent-violet-600"
+                                className="w-4 h-4 accent-violet-600 cursor-pointer"
                               />
                               <input
                                 value={ed.name}
@@ -653,25 +1047,36 @@ export function IntelligentDashboardStudio({
                               </button>
                             </div>
                             <div className="flex flex-wrap items-center gap-1.5">
+                              {k.is_standard && (
+                                <span className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-600 dark:text-indigo-300 font-bold text-[10px]">
+                                  KPI استاندارد
+                                </span>
+                              )}
                               <span className="px-2 py-0.5 rounded bg-blue-500/10 text-blue-500 font-semibold text-[10px]">
-                                {CATEGORY_LABELS_FA[k.category] || k.category}
+                                {CATEGORY_LABELS_FA[k.category || ""] || k.category}
                               </span>
-                              <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-bold text-[11px]">
-                                {ed.formatted_value || k.formatted_value}
+                              <span
+                                className={`px-2 py-0.5 rounded font-bold text-[11px] ${
+                                  hasWarn
+                                    ? "bg-amber-500/15 text-amber-600 dark:text-amber-300"
+                                    : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                                }`}
+                              >
+                                {ed.formatted_value || k.formatted_value || "—"}
                               </span>
-                              <span className="px-1.5 py-0.5 rounded bg-slate-500/15 text-[10px]">
-                                امتیاز: {k.score}
-                              </span>
-                              {k.status === "needs_confirmation" && (
-                                <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 text-[10px] font-semibold">
-                                  نیازمند تأیید
+                              {k.computability_status_fa && (
+                                <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                  hasWarn ? "bg-amber-500/15 text-amber-600" : "bg-emerald-500/10 text-emerald-600"
+                                }`}>
+                                  {k.computability_status_fa}
                                 </span>
                               )}
                             </div>
                           </div>
 
+                          {/* Formula + Format + Comparison + Target + Priority */}
                           <div className="grid grid-cols-1 md:grid-cols-12 gap-2 items-center">
-                            <div className="md:col-span-7 flex items-center gap-1">
+                            <div className="md:col-span-5 flex items-center gap-1">
                               <input
                                 dir="ltr"
                                 value={ed.formula}
@@ -683,44 +1088,158 @@ export function IntelligentDashboardStudio({
                               />
                               <button
                                 type="button"
-                                onClick={() => handlePreviewKpiFormula(k.id, ed.formula, ed.name)}
+                                onClick={() => handlePreviewKpiFormula(k.id, ed.formula, ed.name, ed.display_format)}
                                 className="px-2 py-1 rounded border text-[10px] font-semibold hover:bg-blue-500/10 shrink-0 flex items-center gap-0.5"
                                 style={{ borderColor: "var(--bi-border)" }}
-                                title="محاسبه و تست فرمول"
+                                title="تست زنده فرمول"
                               >
                                 <Play className="w-3 h-3" /> تست
                               </button>
                             </div>
-                            <div className="md:col-span-3 flex items-center gap-1">
+                            <div className="md:col-span-2">
+                              <select
+                                aria-label="Display format"
+                                value={ed.display_format}
+                                onChange={(e) =>
+                                  setKpiEdits((p) => ({ ...p, [k.id]: { ...ed, display_format: e.target.value } }))
+                                }
+                                className="w-full px-1.5 py-1 rounded border text-[11px]"
+                                style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+                              >
+                                {FORMAT_OPTIONS.map((fo) => (
+                                  <option key={fo.value} value={fo.value}>
+                                    {isFa ? fo.labelFa : fo.labelEn}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="md:col-span-2">
+                              <select
+                                aria-label="Comparison mode"
+                                value={ed.comparison_mode}
+                                onChange={(e) =>
+                                  setKpiEdits((p) => ({ ...p, [k.id]: { ...ed, comparison_mode: e.target.value } }))
+                                }
+                                className="w-full px-1.5 py-1 rounded border text-[11px]"
+                                style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+                              >
+                                {COMPARISON_OPTIONS.map((co) => (
+                                  <option key={co.value} value={co.value}>
+                                    {isFa ? co.labelFa : co.labelEn}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="md:col-span-2 flex items-center gap-1">
                               <Target className="w-3.5 h-3.5 opacity-60 shrink-0" />
                               <input
                                 type="number"
                                 value={ed.target_value ?? ""}
                                 onChange={(e) =>
-                                  setKpiEdits((p) => ({ ...p, [k.id]: { ...ed, target_value: e.target.value } }))
+                                  setKpiEdits((p) => ({
+                                    ...p,
+                                    [k.id]: {
+                                      ...ed,
+                                      target_value: e.target.value,
+                                      comparison_mode: e.target.value ? "target" : ed.comparison_mode,
+                                    },
+                                  }))
                                 }
-                                placeholder="هدف (اختیاری)"
+                                placeholder="هدف (Target)"
                                 className="w-full px-2 py-1 rounded border bg-transparent text-[11px]"
                                 style={{ borderColor: "var(--bi-border)" }}
                               />
                             </div>
-                            <div className="md:col-span-2 text-[10px] truncate" style={{ color: "var(--bi-muted)" }} title={k.source}>
-                              منبع: {k.source}
+                            <div className="md:col-span-1 flex items-center gap-1" title="اولویت نمایش (۱ = بالاترین)">
+                              <span className="text-[10px] opacity-60">#</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={99}
+                                value={ed.priority}
+                                onChange={(e) =>
+                                  setKpiEdits((p) => ({
+                                    ...p,
+                                    [k.id]: { ...ed, priority: Math.max(1, Number(e.target.value) || 1) },
+                                  }))
+                                }
+                                className="w-full px-1.5 py-1 rounded border bg-transparent text-[11px] text-center"
+                                style={{ borderColor: "var(--bi-border)" }}
+                              />
                             </div>
                           </div>
 
-                          {(k.comparison_basis || (k.limitations && k.limitations.length > 0)) && (
-                            <div className="text-[10px] flex flex-wrap gap-2" style={{ color: "var(--bi-muted)" }}>
-                              {k.comparison_basis && <span>مبنا: {k.comparison_basis}</span>}
-                              {k.limitations?.length > 0 && (
-                                <span className="text-amber-600 dark:text-amber-400">محدودیت: {k.limitations.join(" | ")}</span>
-                              )}
-                            </div>
-                          )}
+                          {/* Explanations, Source, Eligible/Delayed rules & Warnings */}
+                          <div className="text-[10px] flex flex-wrap items-center gap-x-3 gap-y-1" style={{ color: "var(--bi-muted)" }}>
+                            <span>منبع: <b>{k.source || analysis?.dataset_name}</b></span>
+                            {k.comparison_basis && <span>مبنا: {k.comparison_basis}</span>}
+                            {k.eligible_definition_fa && (
+                              <span className="text-blue-500">واجد شرایط: {k.eligible_definition_fa}</span>
+                            )}
+                            {k.delayed_definition_fa && (
+                              <span className="text-indigo-500">شرط تأخیر: {k.delayed_definition_fa}</span>
+                            )}
+                            {(k.warnings_fa || k.limitations || []).length > 0 && (
+                              <span className="text-amber-600 dark:text-amber-400 font-medium">
+                                ⚠ {(k.warnings_fa || k.limitations || []).join(" | ")}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       );
                     })}
                   </div>
+                </div>
+              )}
+
+              {/* NEEDS DATA SUB-TAB */}
+              {kpiSubTab === "needs_data" && (
+                <div className="space-y-2.5 text-xs">
+                  {needsDataKpis.length === 0 ? (
+                    <div className="p-4 text-center rounded-xl border" style={{ borderColor: "var(--bi-border)", color: "var(--bi-muted)" }}>
+                      تمام شاخص‌های استاندارد برای این منبع داده کامل هستند.
+                    </div>
+                  ) : (
+                    needsDataKpis.map((nk) => (
+                      <div key={nk.id} className="p-3 rounded-xl border border-amber-500/40 bg-amber-500/5 space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="font-bold flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+                            <HelpCircle className="w-4 h-4" /> {nk.name}
+                          </span>
+                          <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-600 text-[10px] font-bold">
+                            نیازمند تکمیل داده (در داشبورد تولید نمی‌شود تا تکمیل شود)
+                          </span>
+                        </div>
+                        <div className="text-[11px]">{nk.rejection_reason_fa || nk.description}</div>
+                        {nk.missing_fields_fa && nk.missing_fields_fa.length > 0 && (
+                          <div className="text-[11px] font-semibold">
+                            فیلدهای مورد نیاز: {nk.missing_fields_fa.join("، ")}
+                          </div>
+                        )}
+                        {nk.id === "std_target_achievement" && (
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
+                            <input
+                              type="number"
+                              value={manualTargetsByKpi[nk.id] || ""}
+                              onChange={(e) =>
+                                setManualTargetsByKpi((p) => ({ ...p, [nk.id]: e.target.value }))
+                              }
+                              placeholder="مقدار هدف دستی کل دوره را وارد کنید (مثلاً 1000000)"
+                              className="px-2.5 py-1.5 rounded-lg border bg-transparent text-xs min-w-[260px]"
+                              style={{ borderColor: "var(--bi-border)" }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleActivateManualTargetKpi(nk)}
+                              className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-semibold"
+                            >
+                              ثبت هدف دستی و فعال‌سازی این KPI
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  )}
                 </div>
               )}
 
@@ -755,7 +1274,7 @@ export function IntelligentDashboardStudio({
                           </span>
                           <span className="text-[10px] font-mono opacity-70" dir="ltr">{rk.formula}</span>
                         </div>
-                        <div className="text-[11px]">{rk.rejection_reason_fa}</div>
+                        <div className="text-[11px]">{rk.rejection_reason_fa || rk.errors_fa?.join(" | ")}</div>
                       </div>
                     ))
                   )}
@@ -974,7 +1493,7 @@ export function IntelligentDashboardStudio({
               {/* Pages Preview */}
               <div className="p-3 rounded-xl border space-y-2" style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}>
                 <div className="font-bold flex items-center gap-1.5">
-                  <Layers className="w-4 h-4 text-violet-500" /> صفحات پیشنهادی تولیدشونده
+                  <Layers className="w-4 h-4 text-violet-500" /> صفحات خروجی داشبورد
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
                   {(analysis?.recommended_pages || []).slice(0, maxPages).map((p: any, idx: number) => (
@@ -990,21 +1509,61 @@ export function IntelligentDashboardStudio({
             </div>
           )}
 
-          {/* Footer Generate Button */}
-          <div className="pt-3 border-t flex flex-wrap items-center justify-between gap-2" style={{ borderColor: "var(--bi-border)" }}>
-            <span className="text-[11px] flex items-center gap-1.5" style={{ color: "var(--bi-muted)" }}>
-              <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-              تمامی ویجت‌ها قبل از ایجاد با DuckDB و سیاست‌های RLS/CLS راستی‌آزمایی می‌شوند.
-            </span>
-            <button
-              type="button"
-              onClick={() => handleGenerate(false)}
-              disabled={generating || !datasetId}
-              className="px-5 py-2.5 rounded-xl text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 flex items-center gap-2 disabled:opacity-60"
-            >
-              <Sparkles className="w-4 h-4" />
-              {generating ? "در حال تولید داشبورد چندصفحه‌ای..." : "تولید داشبورد هوشمند با KPIها و تنظیمات انتخابی"}
-            </button>
+          {/* Pre-Generation Confirmed KPIs Summary & Strict Confirmation CTA */}
+          <div className="pt-3 border-t space-y-2.5" style={{ borderColor: "var(--bi-border)" }}>
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+              <span className="font-bold flex items-center gap-1 text-violet-600 dark:text-violet-300">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                {isFa
+                  ? `خلاصه KPIهای تأییدشده برای ساخت داشبورد (${confirmedPayloadList.length}):`
+                  : `Confirmed KPIs Summary (${confirmedPayloadList.length}):`}
+              </span>
+              {confirmedPayloadList.length === 0 ? (
+                <span className="text-rose-500 font-semibold">
+                  {isFa
+                    ? "هیچ KPI انتخاب نشده است — لطفاً حداقل یک KPI معتبر انتخاب کنید."
+                    : "No KPIs selected — select at least 1 valid KPI to proceed."}
+                </span>
+              ) : (
+                confirmedPayloadList.map((ck) => (
+                  <span
+                    key={ck.id}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-700 dark:text-violet-200 font-medium"
+                  >
+                    <span className="opacity-70">#{ck.priority}</span> {ck.name}
+                    <span className="opacity-65">({ck.display_format})</span>
+                  </span>
+                ))
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[11px] flex items-center gap-1.5" style={{ color: "var(--bi-muted)" }}>
+                <ShieldCheck className="w-4 h-4 text-emerald-500 shrink-0" />
+                {isFa
+                  ? "تنها KPIهای تأییدشده در بالا روی داشبورد ساخته می‌شوند (همراه با Drill-Down و RBAC/RLS/CLS)."
+                  : "Only explicitly confirmed KPIs above are generated into the dashboard with Drill-Down & RBAC/RLS/CLS."}
+              </span>
+              <button
+                type="button"
+                onClick={handleGenerateConfirmed}
+                disabled={generating || !datasetId || confirmedPayloadList.length === 0}
+                className="px-5 py-2.5 rounded-xl text-xs font-bold text-white bg-violet-600 hover:bg-violet-700 flex items-center gap-2 disabled:opacity-50"
+              >
+                <Sparkles className="w-4 h-4" />
+                {generating
+                  ? isFa
+                    ? "در حال ساخت داشبورد با KPIهای تأییدشده..."
+                    : "Building Dashboard..."
+                  : editingDashboardId
+                  ? isFa
+                    ? `تأیید و بازساخت داشبورد (${confirmedPayloadList.length} KPI)`
+                    : `Confirm & Rebuild Dashboard (${confirmedPayloadList.length} KPIs)`
+                  : isFa
+                  ? `تأیید KPIها و تولید داشبورد (${confirmedPayloadList.length} KPI)`
+                  : `Confirm KPIs & Generate Dashboard (${confirmedPayloadList.length} KPIs)`}
+              </button>
+            </div>
           </div>
         </>
       )}

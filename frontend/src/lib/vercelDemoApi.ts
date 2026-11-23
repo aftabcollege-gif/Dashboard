@@ -2,6 +2,11 @@ import rawDemoData from "@/lib/vercelDemoData.json";
 import { parseSpreadsheetBuffer } from "@/lib/excelParser";
 import { DEFAULT_PROCUREMENT_BPMN_GRAPH, inferBpmnFieldMapping } from "@/lib/bpmnParser";
 import { handleDemoDescriptiveBuilder } from "@/lib/vercelDemoDescriptiveBuilder";
+import {
+  evaluateDemoKpiFormula,
+  evaluateDemoStandardAndBusinessKpis,
+  formatKpiVal,
+} from "@/lib/vercelDemoKpi";
 
 const demoData = rawDemoData as any;
 
@@ -138,8 +143,27 @@ function executeVisualSpec(
   const yField = spec?.y_field || "revenue";
   const secField = spec?.secondary_y_field || null;
   const sizeField = spec?.size_field || null;
+  const calMode = spec?.calendar_mode || "jalali";
+  const msa = spec?.multi_source_agg || null;
+  const rightRowsForMsa = msa?.right_dataset_id
+    ? applyRlsAndFilters(getTableForDataset(msa.right_dataset_id, extraDatasets).rows, username, [])
+    : undefined;
 
   if (!xField) {
+    if (spec?.formula || msa) {
+      const fVal = evaluateDemoKpiFormula(
+        spec?.formula || "",
+        filtered,
+        calMode,
+        msa,
+        rightRowsForMsa
+      );
+      return {
+        columns: ["value"],
+        rows: [{ value: fVal !== null ? Math.round(fVal * 10000) / 10000 : null }],
+        row_count: 1,
+      };
+    }
     const val = aggregateGroup(filtered, yField, agg);
     return {
       columns: ["value"],
@@ -161,7 +185,12 @@ function executeVisualSpec(
     const sample = grp[0];
     const row: Row = { [xField]: sample[xField] };
     if (seriesField) row[seriesField] = sample[seriesField];
-    row.value = Math.round(aggregateGroup(grp, yField, agg) * 100) / 100;
+    if (spec?.formula) {
+      const fVal = evaluateDemoKpiFormula(spec.formula, grp, calMode, null);
+      row.value = fVal !== null ? Math.round(fVal * 100) / 100 : null;
+    } else {
+      row.value = Math.round(aggregateGroup(grp, yField, agg) * 100) / 100;
+    }
     if (secField) {
       row.secondary_value = Math.round(aggregateGroup(grp, secField, spec?.secondary_aggregation || agg) * 100) / 100;
     }
@@ -1886,6 +1915,52 @@ export async function handleVercelDemoApi(
       ),
     };
   }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "drill-details") {
+    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
+    let foundWidget: any = null;
+    for (const d of customDashes) {
+      const hit = (d?.widgets || []).find((x: any) => x.id === segments[2]);
+      if (hit) { foundWidget = hit; break; }
+    }
+    if (!foundWidget) {
+      foundWidget = findWidget(segments[2])?.widget || null;
+    }
+    if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
+    const dsId = foundWidget.dataset_id;
+    const dsObj = getEffectiveDatasets(extraDatasets).find((d: any) => d.id === dsId);
+    const { dimCols } = dsObj ? getDemoDatasetSchema(dsObj) : { dimCols: [] };
+    const hier = (foundWidget.drill_rule?.hierarchy || []).map((h: any) => h?.field).filter(Boolean);
+    const availableDims = Array.from(new Set([...hier, ...dimCols])).filter(Boolean) as string[];
+    const chosenDim = body?.breakdown_dimension && availableDims.includes(body.breakdown_dimension)
+      ? body.breakdown_dimension
+      : (availableDims[0] || null);
+
+    const combinedFilters = [
+      ...(body?.active_filters || []),
+      ...(body?.cross_filters || []).filter((c: any) => c?.source_widget_id !== foundWidget.id),
+    ];
+    const limit = Math.max(10, Math.min(Number(body?.limit || 100), 200));
+    const rawRes = executeVisualSpec(dsId, { ...(foundWidget.query?.visual_spec || {}), limit }, username, combinedFilters, null, true, extraDatasets);
+    const bdRes = chosenDim && !foundWidget.query?.visual_spec?.multi_source_agg
+      ? executeVisualSpec(dsId, { ...(foundWidget.query?.visual_spec || {}), limit: 25 }, username, combinedFilters, chosenDim, false, extraDatasets)
+      : { columns: [], rows: [] };
+    return {
+      status: 200,
+      body: {
+        widget_id: foundWidget.id,
+        title: foundWidget.title,
+        formula: foundWidget.query?.visual_spec?.formula || null,
+        drill_through_page_id: foundWidget.drill_rule?.drill_through_page_id || null,
+        available_dimensions: availableDims,
+        breakdown_dimension: chosenDim,
+        breakdown_columns: bdRes.columns,
+        breakdown_rows: bdRes.rows,
+        columns: rawRes.columns,
+        rows: rawRes.rows,
+        row_count: rawRes.row_count,
+      },
+    };
+  }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "switch-chart") {
     const found = findWidget(segments[2]);
     const targetType = body?.target_chart_type || found?.widget?.chart_type || "bar";
@@ -2283,8 +2358,10 @@ export async function handleVercelDemoApi(
         },
       };
     });
-    const numCls = fieldClassifications.filter((f: any) => f.data_type === "numeric");
-    const kpis = numCls.slice(0, 6).map((f: any, idx: number) => {
+    const calMode = searchParams.get("calendar_mode") || "jalali";
+    const evalStd = evaluateDemoStandardAndBusinessKpis(ds, rows, calMode, {});
+    const numCls = fieldClassifications.filter((f: any) => f.data_type === "numeric" && f.semantic_class !== "Identifier");
+    const extraKpis = numCls.slice(0, 6).map((f: any, idx: number) => {
       const vals = rows.map((r: any) => Number(r[f.field_name])).filter((v: number) => !Number.isNaN(v));
       const sum = vals.reduce((a: number, b: number) => a + b, 0);
       const val = f.sum_allowed ? sum : vals.length ? sum / vals.length : 0;
@@ -2298,19 +2375,27 @@ export async function handleVercelDemoApi(
         slug: `${f.field_name}_${f.default_aggregation.toLowerCase()}`,
         name: `${f.sum_allowed ? "مجموع" : "میانگین"} ${f.display_name}`,
         formula: `${f.default_aggregation}("${f.field_name}")`,
+        base_fields: [f.field_name],
         format_type: fmt,
+        display_format: fmt,
         unit: fmt === "percentage" ? "%" : "",
         value: Math.round(val * 100) / 100,
-        formatted_value: fmt === "percentage" ? `${(Math.round(val * 10) / 10)}%` : Math.round(val).toLocaleString("en-US"),
+        formatted_value: formatKpiVal(val, fmt, fmt === "percentage" ? "%" : ""),
         category: idx === 0 ? "domain" : "aggregate",
-        score: 95 - idx * 4,
+        score: 88 - idx * 4,
         confidence: 0.92,
-        status: "selected",
+        status: "suggested",
+        computability_status: "computable",
+        computability_status_fa: "قابل محاسبه",
         source: ds.name,
+        source_datasets: [ds.name],
         comparison_basis: "کل دوره داده‌ها",
         limitations: [],
       };
     });
+    const stdSigs = new Set(evalStd.computableStandard.map((k) => k.formula.toLowerCase().replace(/\s+/g, "")));
+    const filteredExtra = extraKpis.filter((k: any) => !stdSigs.has(k.formula.toLowerCase().replace(/\s+/g, "")));
+    const allBiz = [...evalStd.computableStandard, ...filteredExtra];
     return {
       status: 200,
       body: {
@@ -2331,9 +2416,11 @@ export async function handleVercelDemoApi(
         },
         field_classifications: fieldClassifications,
         kpis: {
-          selected: kpis.slice(0, 5),
-          suggested: kpis.slice(5),
+          standard: evalStd.standard,
+          selected: allBiz.slice(0, 5),
+          suggested: allBiz.slice(5),
           needs_confirmation: [],
+          needs_data: evalStd.needsData,
           data_quality: [
             {
               id: "dq_completeness",
@@ -2342,17 +2429,18 @@ export async function handleVercelDemoApi(
               formatted_value: "99.6%",
             },
           ],
-          uncomputable: [],
-          all_business: kpis,
+          uncomputable: evalStd.uncomputable,
+          all_business: allBiz,
+          all_candidates: [...evalStd.standard, ...filteredExtra],
         },
         recommended_pages: [
-          { title: "۱. خلاصه مدیریتی", widgets_count: 6, chart_types: ["kpi", "bullet", "grouped_bar", "bar", "pie"] },
-          { title: "۲. تحلیل روند و زمان", widgets_count: 3, chart_types: ["line", "area", "calendar_heatmap"] },
-          { title: "۳. مقایسه و تفکیک ابعادی", widgets_count: 3, chart_types: ["grouped_bar", "treemap"] },
-          { title: "۴. توزیع و شاخص‌های آماری", widgets_count: 2, chart_types: ["histogram", "scatter"] },
-          { title: "۵. جزئیات رکوردها و کیفیت داده", widgets_count: 2, chart_types: ["table", "kpi"] },
+          { title: "۱. خلاصه مدیریتی و KPIها", page_key: "executive_summary", widgets_count: 6, chart_types: ["kpi", "bullet", "grouped_bar", "bar", "pie"] },
+          { title: "۲. تحلیل روند و زمان", page_key: "trends", widgets_count: 3, chart_types: ["line", "area", "calendar_heatmap"] },
+          { title: "۳. مقایسه و تفکیک ابعادی", page_key: "breakdown", widgets_count: 3, chart_types: ["grouped_bar", "treemap"] },
+          { title: "۴. توزیع و شاخص‌های آماری", page_key: "statistical", widgets_count: 2, chart_types: ["histogram", "scatter"] },
+          { title: "۵. جزئیات رکوردها و کیفیت داده", page_key: "details", widgets_count: 2, chart_types: ["table", "kpi"] },
         ],
-        suggested_widgets: kpis.map((k: any) => ({ title: k.name, chart_type: "kpi" })),
+        suggested_widgets: allBiz.map((k: any) => ({ title: k.name, chart_type: "kpi" })),
       },
     };
   }
@@ -2365,25 +2453,20 @@ export async function handleVercelDemoApi(
     const table = ds ? getTableForDataset(ds.id, extraDatasets) : { rows: [] };
     const rows = table.rows || [];
     const formula = String(body?.formula || "");
-    const m = formula.match(/(SUM|AVG|MIN|MAX|COUNT)\s*\(\s*"?([A-Za-z0-9_]+)"?\s*\)/i);
-    let val = rows.length;
-    if (m) {
-      const fn = m[1].toUpperCase();
-      const col = m[2];
-      const nums = rows.map((r: any) => Number(r[col])).filter((v: number) => !Number.isNaN(v));
-      if (fn === "SUM") val = nums.reduce((a: number, b: number) => a + b, 0);
-      else if (fn === "AVG") val = nums.length ? nums.reduce((a: number, b: number) => a + b, 0) / nums.length : 0;
-      else if (fn === "MIN") val = nums.length ? Math.min(...nums) : 0;
-      else if (fn === "MAX") val = nums.length ? Math.max(...nums) : 0;
-      else if (fn === "COUNT") val = nums.length || rows.length;
-    }
+    const msa = body?.multi_source_agg || null;
+    const rightRows = msa?.right_dataset_id ? getTableForDataset(msa.right_dataset_id, extraDatasets).rows : undefined;
+    const val = evaluateDemoKpiFormula(formula, rows, body?.calendar_mode || "jalali", msa, rightRows);
+    const fmt = body?.format_type || "number";
     return {
       status: 200,
       body: {
+        valid: true,
         name: body?.name || "Custom KPI",
         formula,
-        value: Math.round(val * 100) / 100,
-        formatted_value: Math.round(val).toLocaleString("en-US"),
+        value: val !== null ? Math.round(val * 10000) / 10000 : null,
+        formatted_value: formatKpiVal(val, fmt, body?.unit || (fmt === "percentage" ? "%" : "")),
+        target_value: body?.target_value,
+        warnings: [],
       },
     };
   }
@@ -2391,20 +2474,148 @@ export async function handleVercelDemoApi(
     return { status: 200, body: { status: "ok", count: Array.isArray(body?.kpis) ? body.kpis.length : 0 } };
   }
   if (method === "POST" && path === "/ai/generate-dashboard") {
+    const hasConfirmed = Array.isArray(body?.confirmed_kpis) && body.confirmed_kpis.length > 0;
+    const hasSelIds = Array.isArray(body?.selected_kpi_ids) && body.selected_kpi_ids.length > 0;
+    const isAuto = Boolean(body?.auto_generate_kpis);
+    if (!hasConfirmed && !hasSelIds && !isAuto) {
+      return {
+        status: 400,
+        body: {
+          detail: "انتخاب و تأیید KPIها پیش از تولید داشبورد الزامی است. لطفاً حداقل یک KPI را تأیید کنید.",
+        },
+      };
+    }
+
     const allDs = getEffectiveDatasets(extraDatasets);
     const targetDs = allDs.find((d) => d.id === body?.dataset_id) || allDs[0];
     if (targetDs) {
       const [friendly] = friendlyDemoDatasetLabel(targetDs);
       const title = body?.title || `داشبورد ${friendly.split("(")[0].trim()}`;
       const built = buildDemoFullDashboard(targetDs, title, "executive_full", body?.theme_id || null);
+      const dash: any = built.created_dashboard;
+      if (body?.dashboard_id) {
+        dash.id = String(body.dashboard_id);
+      }
+      const dsRows = getTableForDataset(targetDs.id, extraDatasets).rows || [];
+      const calMode = body?.calendar_mode || "jalali";
+      const stdEval = evaluateDemoStandardAndBusinessKpis(targetDs, dsRows, calMode, body?.target_values || {});
+
+      // Resolve final confirmed KPI list
+      let finalKpis: any[] = [];
+      if (hasConfirmed) {
+        finalKpis = body.confirmed_kpis;
+      } else if (hasSelIds) {
+        const byId = new Map<string, any>(stdEval.computableStandard.map((k) => [k.id, k]));
+        for (const ck of body.custom_kpis || []) byId.set(ck.id, ck);
+        finalKpis = body.selected_kpi_ids.map((id: string) => byId.get(id)).filter(Boolean);
+      }
+      if (!finalKpis.length && isAuto) {
+        finalKpis = stdEval.computableStandard.slice(0, 4);
+      }
+
+      // Add hidden drill-through Details page
+      const detPageId = `page_${dash.id}_details`;
+      const mainPageId = dash.pages[0]?.id;
+      const nonKpiWidgets = (dash.widgets || []).filter((w: any) => w.chart_type !== "kpi" && w.chart_type !== "table");
+      const rawTableWidget = (dash.widgets || []).find((w: any) => w.chart_type === "table") || {
+        id: `w_${dash.id}_raw`,
+        dashboard_id: dash.id,
+        page_id: detPageId,
+        title: `جزئیات رکوردهای ${targetDs.name}`,
+        description: "رکوردهای خام جهت تحلیل عمیق (Drill-Through)",
+        chart_type: "table",
+        dataset_id: targetDs.id,
+        layout: { x: 0, y: 0, w: 12, h: 10 },
+        config: { style: {}, visualization: {}, interactions: { cross_filter: false }, advanced: { ai_generated: true } },
+        query: { query_mode: "visual", sql_text: null, visual_spec: { aggregation: "RAW", limit: 200 }, parameters: {} },
+        drill_rule: { hierarchy: [], level_rules: [], drill_through_page_id: null },
+        widget_filters: [],
+        permissions: { view: true, edit: true, delete: true, drill_down: true },
+      };
+      rawTableWidget.page_id = detPageId;
+      rawTableWidget.layout = { x: 0, y: 0, w: 12, h: 10 };
+
+      // Build confirmed KPI widgets cleanly at top of Page 1
+      const { dimCols } = getDemoDatasetSchema(targetDs);
+      const hier = dimCols.slice(0, 2).map((f: string) => ({ field: f }));
+      const kpiWidgets = finalKpis.slice(0, 9).map((k: any, idx: number) => {
+        const fmt = k.display_format || k.format_type || "number";
+        const useGauge = Boolean(k.target_value && Number(k.target_value) > 0 && idx === 0 && (fmt === "percentage" || fmt === "percent" || k.chart_type === "gauge"));
+        const col = idx % 3;
+        const row = Math.floor(idx / 3);
+        return {
+          id: `w_${dash.id}_kpi_${idx + 1}`,
+          dashboard_id: dash.id,
+          page_id: mainPageId,
+          title: k.name,
+          description: k.formula || "",
+          chart_type: useGauge ? "gauge" : "kpi",
+          dataset_id: targetDs.id,
+          dataset_freshness: { status: "fresh", last_refreshed_at: new Date().toISOString(), row_count: targetDs.row_count || 0, data_version: 1 },
+          layout: { x: col * 4, y: row * 4, w: 4, h: useGauge ? 5 : 4 },
+          config: {
+            style: {
+              number_format: fmt === "percentage" ? "percent" : fmt,
+              unit: k.unit || "",
+              target_value: k.target_value ?? undefined,
+              previous_value: k.previous_value ?? undefined,
+            },
+            visualization: { show_legend: false, show_tooltip: true },
+            interactions: { cross_filter: false, drill_down: true },
+            advanced: { ai_generated: true, formula: k.formula, kpi_id: k.id, sources_used: k.source_datasets || [targetDs.name] },
+          },
+          query: {
+            query_mode: "visual",
+            sql_text: null,
+            visual_spec: {
+              formula: k.formula,
+              calendar_mode: calMode,
+              multi_source_agg: k.multi_source_agg || undefined,
+              pre_agg_grain: k.pre_agg_grain || undefined,
+              time_field: k.time_field || undefined,
+            },
+            parameters: {},
+          },
+          drill_rule: { hierarchy: hier, level_rules: [], drill_through_page_id: detPageId },
+          widget_filters: [],
+          permissions: { view: true, edit: true, delete: true, drill_down: true },
+        };
+      });
+
+      const kpiRowsCount = kpiWidgets.length > 0 ? Math.ceil(kpiWidgets.length / 3) * 4 + 1 : 0;
+      const shiftedCharts = nonKpiWidgets.map((w: any) => ({
+        ...w,
+        dashboard_id: dash.id,
+        layout: { ...w.layout, y: (w.layout?.y || 0) + kpiRowsCount },
+        drill_rule: { ...(w.drill_rule || { hierarchy: hier, level_rules: [] }), drill_through_page_id: detPageId },
+      }));
+
+      dash.widgets = [...kpiWidgets, ...shiftedCharts, rawTableWidget];
+      dash.pages = [
+        { ...dash.pages[0], is_drill_through: false },
+        { id: detPageId, title: "جزئیات رکوردها و تحلیل", page_order: 1, is_drill_through: true, layout_settings: { columns_count: 12, row_height: 42, gap_px: 16, grid_enabled: true } },
+      ];
+      dash.settings = {
+        ai_generated: true,
+        kpi_config: {
+          dataset_id: targetDs.id,
+          confirmed_kpis: finalKpis,
+          selected_kpi_ids: finalKpis.map((k: any) => k.id),
+          calendar_mode: calMode,
+          template_mode: body?.template_mode || "executive",
+          detail_level: body?.detail_level || "standard",
+        },
+      };
+
       return {
         status: 200,
         body: {
-          dashboard_id: built.created_dashboard.id,
-          title: built.created_dashboard.title,
-          pages_count: built.created_dashboard.pages?.length || 1,
-          widgets_count: built.created_dashboard.widgets?.length || 0,
-          created_dashboard: built.created_dashboard,
+          dashboard_id: dash.id,
+          title: dash.title,
+          pages_count: dash.pages.length,
+          widgets_count: dash.widgets.length,
+          confirmed_kpis_count: finalKpis.length,
+          created_dashboard: dash,
         },
       };
     }

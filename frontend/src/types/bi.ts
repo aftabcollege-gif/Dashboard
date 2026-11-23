@@ -118,6 +118,7 @@ export interface DashboardDetail {
   description: string;
   theme_id: string | null;
   theme: BiTheme | null;
+  settings?: Record<string, any>;
   is_public: boolean;
   is_template: boolean;
   embed_token: string | null;
@@ -169,4 +170,65 @@ export interface DatasetInfo {
     is_calculated: boolean;
     expression: string | null;
   }[];
+}
+
+export type KpiComputabilityStatus =
+  | "computable"
+  | "computable_with_warning"
+  | "needs_data"
+  | "uncomputable";
+
+export interface KpiDefinition {
+  id: string;
+  slug?: string;
+  name: string;
+  description?: string;
+  is_standard?: boolean;
+  category?: string;
+  formula: string;
+  compiled_sql?: string;
+  base_fields?: string[];
+  required_fields?: string[];
+  missing_fields?: string[];
+  missing_fields_fa?: string[];
+  source_datasets?: string[];
+  source?: string;
+  format_type?: string;
+  display_format?: string;
+  unit?: string;
+  priority?: number;
+  comparison_mode?: "none" | "previous_period" | "target" | string;
+  target_value?: number | null;
+  value?: number | null;
+  formatted_value?: string;
+  previous_value?: number | null;
+  computability_status?: KpiComputabilityStatus;
+  computability_status_fa?: string;
+  warnings_fa?: string[];
+  errors_fa?: string[];
+  rejection_reason_fa?: string;
+  eligible_definition_fa?: string;
+  delayed_definition_fa?: string;
+  comparison_basis?: string;
+  score?: number;
+  confidence?: number;
+  is_favorite?: boolean;
+  limitations?: string[];
+  multi_source_agg?: Record<string, any> | null;
+  pre_agg_grain?: Record<string, any> | null;
+  time_field?: string | null;
+}
+
+export interface WidgetDrillDetailsResponse {
+  widget_id: string;
+  title: string;
+  formula?: string | null;
+  drill_through_page_id?: string | null;
+  available_dimensions: string[];
+  breakdown_dimension: string | null;
+  breakdown_columns: string[];
+  breakdown_rows: Record<string, any>[];
+  columns: string[];
+  rows: Record<string, any>[];
+  row_count: number;
 }

@@ -9,6 +9,11 @@ import {
   saveDemoUploadedDataset,
 } from "@/lib/demoStore";
 import { parseSpreadsheetBuffer } from "@/lib/excelParser";
+import {
+  evaluateDemoKpiFormula,
+  evaluateDemoStandardAndBusinessKpis,
+  formatKpiVal,
+} from "@/lib/vercelDemoKpi";
 
 const TOKEN_KEY = "bi_access_token";
 const CSRF_COOKIE_NAME = "bi_csrf_token";
@@ -209,6 +214,140 @@ export async function apiFetch<T = any>(
           return { status: "deleted" } as unknown as T;
         }
       }
+
+      const mRec = path.match(/^\/ai\/recommend\/([^/?]+)(\?.*)?$/);
+      if (method === "GET" && mRec) {
+        const hit = uploaded.find((d) => d.id === mRec[1]);
+        if (hit) {
+          const sp = new URLSearchParams((mRec[2] || "").replace(/^\?/, ""));
+          const calMode = sp.get("calendar_mode") || "jalali";
+          const evalRes = evaluateDemoStandardAndBusinessKpis(hit, hit.rows || [], calMode, {});
+          const fieldsCls = (hit.fields || []).map((f) => {
+            const isNum = ["int", "integer", "float", "double", "decimal", "numeric", "number"].includes(
+              String(f.data_type || "").toLowerCase()
+            );
+            const vals = isNum
+              ? (hit.rows || []).map((r) => Number(r[f.field_name])).filter((v) => !Number.isNaN(v))
+              : [];
+            const avg = vals.length ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100 : undefined;
+            return {
+              field_name: f.field_name,
+              display_name: f.display_name || f.field_name,
+              data_type: isNum ? "numeric" : String(f.data_type).includes("date") ? "date" : "categorical",
+              raw_type: f.data_type,
+              semantic_class: isNum ? "Additive Measure" : "Category",
+              confidence: 0.9,
+              needs_user_confirmation: false,
+              default_aggregation: isNum ? "SUM" : "COUNT",
+              sum_allowed: isNum,
+              stats: {
+                avg,
+                median: avg,
+                stddev: avg ? Math.round(avg * 0.25 * 100) / 100 : undefined,
+                null_pct: 0,
+                distinct_count: new Set((hit.rows || []).map((r) => r[f.field_name])).size,
+                iqr_outlier_count: 0,
+              },
+            };
+          });
+          const numExtra = fieldsCls
+            .filter((f) => f.data_type === "numeric")
+            .slice(0, 4)
+            .map((f, idx) => {
+              const form = `SUM("${f.field_name}")`;
+              const val = evaluateDemoKpiFormula(form, hit.rows || [], calMode);
+              return {
+                id: `demo_${f.field_name}`,
+                slug: `${f.field_name}_sum`,
+                name: `مجموع ${f.display_name}`,
+                formula: form,
+                base_fields: [f.field_name],
+                format_type: "number",
+                display_format: "number",
+                unit: "",
+                value: val !== null ? Math.round(val * 100) / 100 : null,
+                formatted_value: formatKpiVal(val, "number", ""),
+                category: idx === 0 ? "domain" : "aggregate",
+                score: 88 - idx * 3,
+                confidence: 0.9,
+                status: "suggested",
+                computability_status: "computable",
+                computability_status_fa: "قابل محاسبه",
+                source: hit.name,
+                comparison_basis: "کل دوره داده‌ها",
+                limitations: [],
+              };
+            });
+          const stdSigs = new Set(evalRes.computableStandard.map((k) => k.formula.toLowerCase().replace(/\s+/g, "")));
+          const extraClean = numExtra.filter((k) => !stdSigs.has(k.formula.toLowerCase().replace(/\s+/g, "")));
+          const allBiz = [...evalRes.computableStandard, ...extraClean];
+          return {
+            dataset_id: hit.id,
+            dataset_name: hit.name,
+            domain_detection: {
+              primary_domain: "sales_marketing",
+              primary_domain_fa: "تحلیل داده فایل آپلودی",
+              confidence: 0.88,
+              evidence_fa: `تحلیل ${hit.row_count} ردیف و ${hit.columns_count} ستون`,
+            },
+            deep_profile: {
+              row_count: hit.row_count,
+              field_count: hit.columns_count,
+              duplicate_row_count: 0,
+              completeness_pct: 100,
+              is_approximate: false,
+            },
+            field_classifications: fieldsCls,
+            kpis: {
+              standard: evalRes.standard,
+              selected: allBiz.slice(0, 5),
+              suggested: allBiz.slice(5),
+              needs_confirmation: [],
+              needs_data: evalRes.needsData,
+              data_quality: [
+                {
+                  id: "dq_completeness_pct",
+                  name: "درصد تکمیل داده‌ها",
+                  formula: "100.0",
+                  formatted_value: "100%",
+                },
+              ],
+              uncomputable: evalRes.uncomputable,
+              all_business: allBiz,
+              all_candidates: [...evalRes.standard, ...extraClean],
+            },
+            recommended_pages: [
+              { title: "۱. خلاصه مدیریتی و KPIها", page_key: "executive_summary", widgets_count: 6, chart_types: ["kpi", "area", "bar"] },
+              { title: "۲. تحلیل روند زمانی", page_key: "trends", widgets_count: 2, chart_types: ["line", "area"] },
+              { title: "۳. تفکیک و مقایسه ابعادی", page_key: "breakdown", widgets_count: 3, chart_types: ["grouped_bar", "pie"] },
+            ],
+            suggested_widgets: [],
+          } as unknown as T;
+        }
+      }
+
+      const mKpiPrev = path.match(/^\/ai\/datasets\/([^/]+)\/kpis\/preview$/);
+      if (method === "POST" && mKpiPrev && typeof options.body === "string") {
+        const hit = uploaded.find((d) => d.id === mKpiPrev[1]);
+        if (hit) {
+          const pBody = JSON.parse(options.body);
+          const val = evaluateDemoKpiFormula(
+            pBody.formula || "",
+            hit.rows || [],
+            pBody.calendar_mode || "jalali",
+            pBody.multi_source_agg || null
+          );
+          return {
+            valid: true,
+            name: pBody.name || "Custom KPI",
+            formula: pBody.formula,
+            value: val !== null ? Math.round(val * 10000) / 10000 : null,
+            formatted_value: formatKpiVal(val, pBody.format_type || "number", pBody.unit || ""),
+            target_value: pBody.target_value,
+            warnings: [],
+          } as unknown as T;
+        }
+      }
     }
   }
 
@@ -243,30 +382,34 @@ export async function apiFetch<T = any>(
       path.startsWith("/queries/") ||
       path.includes("/execute-batch") ||
       path.includes("/filter-options") ||
-      (path.startsWith("/dashboards/widgets/") && path.endsWith("/data")))
+      (path.startsWith("/dashboards/widgets/") && (path.endsWith("/data") || path.endsWith("/drill-details"))))
   ) {
     try {
       const parsedBody = JSON.parse(effectiveBody);
       const uploaded = getDemoUploadedDatasets();
       const customDashes = getDemoCreatedDashboards();
       if (uploaded.length > 0 && !parsedBody.demo_uploaded_datasets) {
-        const stripRowsForSchemaOnly = (u: DemoUploadedDataset) => ({
+        const capRowsForServerDemo = (u: DemoUploadedDataset) => ({
           ...u,
           is_uploaded_excel: true,
-          rows: u.rows.slice(0, 5),
+          rows: (u.rows || []).slice(0, 5000),
         });
         if (path === "/ai/generate-dashboard") {
-          const target = parsedBody.dataset_id
-            ? uploaded.filter((u) => u.id === parsedBody.dataset_id)
+          const wantedIds = new Set<string>([
+            ...(parsedBody.dataset_id ? [parsedBody.dataset_id] : []),
+            ...(Array.isArray(parsedBody.related_dataset_ids) ? parsedBody.related_dataset_ids : []),
+          ]);
+          const target = wantedIds.size > 0
+            ? uploaded.filter((u) => wantedIds.has(u.id))
             : uploaded;
-          parsedBody.demo_uploaded_datasets = target.map(stripRowsForSchemaOnly);
+          parsedBody.demo_uploaded_datasets = target.map(capRowsForServerDemo);
         } else if (path.startsWith("/ai/")) {
-          parsedBody.demo_uploaded_datasets = uploaded;
+          parsedBody.demo_uploaded_datasets = uploaded.map(capRowsForServerDemo);
         } else if (parsedBody.dataset_id) {
           const one = uploaded.find((u) => u.id === parsedBody.dataset_id);
-          if (one) parsedBody.demo_uploaded_datasets = [one];
+          if (one) parsedBody.demo_uploaded_datasets = [capRowsForServerDemo(one)];
         } else {
-          parsedBody.demo_uploaded_datasets = uploaded;
+          parsedBody.demo_uploaded_datasets = uploaded.map(capRowsForServerDemo);
         }
       }
       if (customDashes.length > 0 && !parsedBody.demo_context?.custom_dashboards) {

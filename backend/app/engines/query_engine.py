@@ -376,6 +376,242 @@ def build_visual_query_sql(
         sql = f"WITH {base_ctes} SELECT {sel_sql} FROM _base{order_sql} LIMIT {lim}"
         return sql, params, "visual_select"
 
+    alias_name = str(visual_spec.get("y_alias") or "value")
+    if not IDENT_RE.match(alias_name):
+        alias_name = "value"
+    lim = max(1, min(int(visual_spec.get("limit", 1000)), settings.MAX_QUERY_ROWS))
+    top_n = compiled_filters.get("top_n")
+
+    # ------------------------------------------------------------------
+    # 1. Key-grain Pre-Aggregated Multi-Source Join CTEs (zero fan-out)
+    # ------------------------------------------------------------------
+    msa = visual_spec.get("multi_source_agg")
+    if isinstance(msa, dict) and msa.get("right_dataset_id"):
+        r_ds_id = str(msa["right_dataset_id"])
+        right_ds = db.query(Dataset).filter(Dataset.id == r_ds_id, Dataset.organization_id == dataset.organization_id).first()
+        if not right_ds:
+            raise PermissionError("Right dataset not found or belongs to another organization")
+        if public_mode:
+            r_sc = build_public_data_security_context(db, right_ds.organization_id, right_ds.id)
+        else:
+            if not permission_resolver.resolve(db, user, "dataset", right_ds.id, "view").allowed:
+                raise PermissionError(f"Permission denied for dataset '{right_ds.name}'")
+            r_sc = build_data_security_context(db, user, right_ds.id)
+
+        r_cols_meta = warehouse.describe_table(right_ds.warehouse_table)
+        r_sub_sql, r_sub_params, r_vis_cols = build_security_projection_and_where(
+            right_ds.warehouse_table, r_cols_meta, r_sc, source_schema="main"
+        )
+        r_vis_set = set(r_vis_cols)
+
+        l_key = str(msa.get("left_key") or "").strip()
+        r_key = str(msa.get("right_key") or "").strip()
+        l_field = str(msa.get("left_field") or "").strip()
+        r_field = str(msa.get("right_field") or "").strip()
+        l_agg = str(msa.get("left_agg") or "SUM").upper()
+        r_agg = str(msa.get("right_agg") or "SUM").upper()
+        jtype = "LEFT JOIN" if str(msa.get("join_type") or "INNER").upper() == "LEFT" else "INNER JOIN"
+
+        allowed_aggs = {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNT_DISTINCT"}
+        if l_agg not in allowed_aggs or r_agg not in allowed_aggs:
+            raise ValueError("Unsupported aggregation in multi_source_agg")
+        if not (IDENT_RE.match(l_key) and IDENT_RE.match(r_key) and IDENT_RE.match(l_field) and IDENT_RE.match(r_field)):
+            raise ValueError("Invalid column identifier in multi_source_agg")
+        if l_key in merged_hidden or l_key not in avail_cols:
+            raise PermissionError(f"Access denied to column '{l_key}'")
+        if l_field in merged_hidden or l_field not in avail_cols:
+            raise PermissionError(f"Access denied to column '{l_field}'")
+        if r_key in r_sc.hidden_columns or r_key not in r_vis_set:
+            raise PermissionError(f"Access denied to right column '{r_key}'")
+        if r_field in r_sc.hidden_columns or r_field not in r_vis_set:
+            raise PermissionError(f"Access denied to right column '{r_field}'")
+
+        final_expr = str(msa.get("final_expr") or "COALESCE(SUM(_l_val), 0)").strip()
+        validate_formula_ast(final_expr, allowed_columns={"_l_val", "_r_val", "_l_cnt", "_r_cnt"})
+
+        l_agg_sql = f'COUNT(DISTINCT "{l_field}")' if l_agg == "COUNT_DISTINCT" else f'COALESCE({l_agg}("{l_field}"), 0)'
+        r_agg_sql = f'COUNT(DISTINCT "{r_field}")' if r_agg == "COUNT_DISTINCT" else f'COALESCE({r_agg}("{r_field}"), 0)'
+
+        x_valid = bool(x_field and IDENT_RE.match(x_field) and x_field in avail_cols)
+        if x_valid and x_field == l_key:
+            ms_left_sql = (
+                f'SELECT "{l_key}" AS _jk, {l_agg_sql} AS _l_val, COUNT(*) AS _l_cnt '
+                f'FROM _base WHERE "{l_key}" IS NOT NULL GROUP BY 1'
+            )
+            ms_right_sql = (
+                f'SELECT "{r_key}" AS _jk, {r_agg_sql} AS _r_val, COUNT(*) AS _r_cnt '
+                f'FROM ({r_sub_sql}) AS _ms_r_raw WHERE "{r_key}" IS NOT NULL GROUP BY 1'
+            )
+            ms_outer = (
+                f'SELECT _ms_left._jk AS "{x_field}", ({final_expr}) AS "{alias_name}" '
+                f'FROM _ms_left {jtype} _ms_right ON _ms_left._jk = _ms_right._jk '
+                f'GROUP BY _ms_left._jk ORDER BY 2 DESC LIMIT {lim}'
+            )
+        elif x_valid:
+            ms_left_sql = (
+                f'SELECT "{x_field}" AS _gx, "{l_key}" AS _jk, {l_agg_sql} AS _l_val, COUNT(*) AS _l_cnt '
+                f'FROM _base WHERE "{l_key}" IS NOT NULL GROUP BY 1, 2'
+            )
+            ms_right_sql = (
+                f'SELECT "{r_key}" AS _jk, {r_agg_sql} AS _r_val, COUNT(*) AS _r_cnt '
+                f'FROM ({r_sub_sql}) AS _ms_r_raw WHERE "{r_key}" IS NOT NULL GROUP BY 1'
+            )
+            ms_outer = (
+                f'SELECT _ms_left._gx AS "{x_field}", ({final_expr}) AS "{alias_name}" '
+                f'FROM _ms_left {jtype} _ms_right ON _ms_left._jk = _ms_right._jk '
+                f'GROUP BY _ms_left._gx ORDER BY 2 DESC LIMIT {lim}'
+            )
+        else:
+            ms_left_sql = (
+                f'SELECT "{l_key}" AS _jk, {l_agg_sql} AS _l_val, COUNT(*) AS _l_cnt '
+                f'FROM _base WHERE "{l_key}" IS NOT NULL GROUP BY 1'
+            )
+            ms_right_sql = (
+                f'SELECT "{r_key}" AS _jk, {r_agg_sql} AS _r_val, COUNT(*) AS _r_cnt '
+                f'FROM ({r_sub_sql}) AS _ms_r_raw WHERE "{r_key}" IS NOT NULL GROUP BY 1'
+            )
+            ms_outer = (
+                f'SELECT ({final_expr}) AS "{alias_name}" '
+                f'FROM _ms_left {jtype} _ms_right ON _ms_left._jk = _ms_right._jk'
+            )
+
+        all_params = list(params) + list(r_sub_params)
+        sql = f"WITH {base_ctes}, _ms_left AS ({ms_left_sql}), _ms_right AS ({ms_right_sql}) {ms_outer}"
+        return sql, all_params, "visual_multi_source_agg"
+
+    # ------------------------------------------------------------------
+    # 2. Order-Level Two-Stage Pre-Aggregation: AOV(amount, order_id)
+    # ------------------------------------------------------------------
+    raw_formula = str(visual_spec.get("formula") or "").strip()
+    aov_match = re.match(
+        r'^AOV\(\s*"?([A-Za-z0-9_]+)"?\s*,\s*"?([A-Za-z0-9_]+)"?\s*\)$',
+        raw_formula,
+        flags=re.IGNORECASE,
+    )
+    pre_grain = visual_spec.get("pre_agg_grain")
+    if aov_match or (isinstance(pre_grain, dict) and pre_grain.get("grain_field") and pre_grain.get("measure_field")):
+        if aov_match:
+            amt_col = aov_match.group(1)
+            ord_col = aov_match.group(2)
+            g_agg = "SUM"
+        else:
+            amt_col = str(pre_grain["measure_field"]).strip()
+            ord_col = str(pre_grain["grain_field"]).strip()
+            g_agg = str(pre_grain.get("grain_agg", "SUM")).upper()
+        if g_agg not in {"SUM", "AVG", "MIN", "MAX"}:
+            g_agg = "SUM"
+        if not IDENT_RE.match(amt_col) or not IDENT_RE.match(ord_col):
+            raise ValueError("Invalid column name in AOV / pre_agg_grain")
+        if amt_col in merged_hidden or amt_col not in avail_cols:
+            raise PermissionError(f"Access denied to column '{amt_col}'")
+        if ord_col in merged_hidden or ord_col not in avail_cols:
+            raise PermissionError(f"Access denied to column '{ord_col}'")
+
+        grp_cols_raw: list[str] = []
+        if x_field and IDENT_RE.match(x_field) and x_field != ord_col:
+            grp_cols_raw.append(x_field)
+        if series_field and IDENT_RE.match(series_field) and series_field not in (x_field, ord_col):
+            grp_cols_raw.append(series_field)
+
+        grp_select = ", ".join(f'"{c}"' for c in grp_cols_raw)
+        grp_prefix = f"{grp_select}, " if grp_select else ""
+        outer_grp = f"GROUP BY {grp_select}" if grp_select else ""
+        outer_ord = ""
+        if top_n:
+            lim = min(top_n["limit"], settings.MAX_QUERY_ROWS)
+            outer_ord = f'ORDER BY "{alias_name}" {top_n["direction"]}'
+        elif x_field and any(k in x_field.lower() for k in ("year", "quarter", "month", "day", "date")):
+            outer_ord = f'ORDER BY "{x_field}" ASC'
+        elif grp_cols_raw:
+            outer_ord = f'ORDER BY "{alias_name}" DESC'
+
+        sql = (
+            f"WITH {base_ctes}, "
+            f'_grain_agg AS (SELECT {grp_prefix}"{ord_col}" AS _grain_key, COALESCE({g_agg}("{amt_col}"), 0) AS _grain_val '
+            f'FROM _base WHERE "{ord_col}" IS NOT NULL GROUP BY {grp_prefix}"{ord_col}") '
+            f'SELECT {grp_prefix}AVG(_grain_val) AS "{alias_name}" FROM _grain_agg {outer_grp} {outer_ord} LIMIT {lim}'
+        )
+        return sql, params, "visual_aov_pre_agg"
+
+    # ------------------------------------------------------------------
+    # 3. Calendar-Aligned Monthly Growth: MOM_CALENDAR(measure, time_col)
+    #    or scalar MOM(measure) with time_col & no x_field
+    # ------------------------------------------------------------------
+    mom_cal_match = re.match(
+        r'^MOM_CALENDAR\(\s*"?([A-Za-z0-9_]+)"?\s*,\s*"?([A-Za-z0-9_]+)"?\s*\)$',
+        raw_formula,
+        flags=re.IGNORECASE,
+    )
+    mom_short_match = (
+        re.match(r'^MOM\(\s*"?([A-Za-z0-9_]+)"?\s*\)$', raw_formula, flags=re.IGNORECASE)
+        if (not x_field and time_col)
+        else None
+    )
+    if mom_cal_match or mom_short_match:
+        if mom_cal_match:
+            m_col = mom_cal_match.group(1)
+            t_col = mom_cal_match.group(2)
+        else:
+            m_col = mom_short_match.group(1)  # type: ignore[union-attr]
+            t_col = str(time_col)
+        if not IDENT_RE.match(m_col) or not IDENT_RE.match(t_col):
+            raise ValueError("Invalid column name in MOM_CALENDAR")
+        if m_col in merged_hidden or m_col not in avail_cols:
+            raise PermissionError(f"Access denied to column '{m_col}'")
+        if t_col in merged_hidden or t_col not in avail_cols:
+            raise PermissionError(f"Access denied to column '{t_col}'")
+
+        cal_mode = str(visual_spec.get("calendar_mode", "gregorian")).lower()
+        if cal_mode == "jalali":
+            m_idx_expr = expand_jalali_sql_calls(f'(JALALI_YEAR("{t_col}") * 12 + JALALI_MONTH("{t_col}"))')
+        else:
+            m_idx_expr = f'(EXTRACT(YEAR FROM TRY_CAST("{t_col}" AS DATE)) * 12 + EXTRACT(MONTH FROM TRY_CAST("{t_col}" AS DATE)))'
+
+        is_time_x = bool(
+            x_field and (
+                x_field == t_col
+                or any(k in x_field.lower() for k in ("year", "quarter", "month", "day", "date", "week", "period"))
+            )
+        )
+        if not x_field:
+            sql = (
+                f"WITH {base_ctes}, "
+                f'_mom_monthly AS (SELECT ({m_idx_expr}) AS _m_idx, COALESCE(SUM("{m_col}"), 0) AS _m_val '
+                f'FROM _base WHERE TRY_CAST("{t_col}" AS DATE) IS NOT NULL GROUP BY 1), '
+                f"_mom_bounds AS (SELECT MAX(_m_idx) AS _curr_idx FROM _mom_monthly), "
+                f"_mom_vals AS ("
+                f"SELECT MAX(CASE WHEN _m_idx = _curr_idx THEN _m_val END) AS _curr_val, "
+                f"MAX(CASE WHEN _m_idx = (_curr_idx - 1) THEN _m_val END) AS _prev_val "
+                f"FROM _mom_monthly, _mom_bounds) "
+                f'SELECT ((_curr_val - _prev_val) * 100.0) / NULLIF(ABS(_prev_val), 0) AS "{alias_name}" FROM _mom_vals'
+            )
+            return sql, params, "visual_mom_calendar"
+        elif is_time_x:
+            # Monthly/time grouped series: compare against previous month row safely
+            compiled_expr = FormulaCompiler.compile_measure(f"MOM({m_col})", time_col=t_col, order_col=x_field)
+            _assert_expr_no_hidden_cols(compiled_expr, merged_hidden, avail_cols)
+            sql = (
+                f"WITH {base_ctes} "
+                f'SELECT "{x_field}", {compiled_expr} AS "{alias_name}" FROM _base GROUP BY "{x_field}" ORDER BY "{x_field}" ASC LIMIT {lim}'
+            )
+            return sql, params, "visual_agg"
+        else:
+            # Non-time dimension breakdown (e.g., KPI Drill-Down by region/category)
+            sql = (
+                f"WITH {base_ctes}, "
+                f'_mom_monthly AS (SELECT "{x_field}" AS _gx, ({m_idx_expr}) AS _m_idx, COALESCE(SUM("{m_col}"), 0) AS _m_val '
+                f'FROM _base WHERE TRY_CAST("{t_col}" AS DATE) IS NOT NULL GROUP BY 1, 2), '
+                f"_mom_bounds AS (SELECT MAX(_m_idx) AS _curr_idx FROM _mom_monthly), "
+                f"_mom_dim AS ("
+                f"SELECT _gx, "
+                f"MAX(CASE WHEN _m_idx = _curr_idx THEN _m_val END) AS _curr_val, "
+                f"MAX(CASE WHEN _m_idx = (_curr_idx - 1) THEN _m_val END) AS _prev_val "
+                f"FROM _mom_monthly, _mom_bounds GROUP BY _gx) "
+                f'SELECT _gx AS "{x_field}", ((_curr_val - _prev_val) * 100.0) / NULLIF(ABS(_prev_val), 0) AS "{alias_name}" '
+                f'FROM _mom_dim ORDER BY 2 DESC NULLS LAST LIMIT {lim}'
+            )
+            return sql, params, "visual_mom_calendar"
+
     group_fields: list[str] = []
     select_parts: list[str] = []
 

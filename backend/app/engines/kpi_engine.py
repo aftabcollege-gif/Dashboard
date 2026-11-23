@@ -35,7 +35,7 @@ from app.engines.descriptive_builder import (
     _fmt_num,
     analyze_dataset_relationships,
 )
-from app.engines.formula_engine import validate_and_compile_formula
+from app.engines.formula_engine import expand_jalali_sql_calls, validate_and_compile_formula
 from app.engines.query_engine import build_visual_query_sql
 from app.engines.warehouse import sanitize_identifier, warehouse
 from app.models.dashboard import (
@@ -194,7 +194,1125 @@ def _format_kpi_value(val: Optional[float], format_type: str = "number", unit: s
     if format_type == "duration":
         u = unit or "ساعت"
         return f"{val:,.2f} {u}".strip()
+    if format_type == "count":
+        return f"{int(round(val)):,} {unit}".strip()
     return f"{_fmt_num(val)} {unit}".strip()
+
+
+COMPUTABILITY_STATUS_FA: dict[str, str] = {
+    "computable": "قابل محاسبه",
+    "computable_with_warning": "قابل محاسبه با هشدار",
+    "needs_data": "نیازمند تکمیل داده",
+    "uncomputable": "غیرقابل محاسبه",
+}
+
+
+def _default_display_format(format_type: str, unit: str = "") -> str:
+    ft = (format_type or "number").lower()
+    if ft in ("percentage", "currency", "count", "number"):
+        return ft
+    if ft in ("integer",):
+        return "count"
+    return "number"
+
+
+def _default_comparison_mode(k: dict[str, Any]) -> str:
+    if k.get("target_value") is not None or k.get("id") == "std_target_achievement" or k.get("category") == "comparison":
+        return "target"
+    if k.get("previous_value") is not None or k.get("category") == "growth" or k.get("id") == "std_mom_growth":
+        return "previous_period"
+    return "none"
+
+
+def _enrich_kpi_metadata(k: dict[str, Any], idx_priority: int = 10) -> dict[str, Any]:
+    """Ensure every KPI carries standardized diagnostic, display, comparison, and confirmation metadata."""
+    c_status = k.get("computability_status")
+    if not c_status:
+        if k.get("status") == "uncomputable" or k.get("rejection_reason_fa"):
+            c_status = "uncomputable"
+        elif k.get("limitations"):
+            c_status = "computable_with_warning"
+        else:
+            c_status = "computable"
+    k["computability_status"] = c_status
+    k["computability_status_fa"] = COMPUTABILITY_STATUS_FA.get(c_status, c_status)
+    k.setdefault("is_standard", False)
+    k.setdefault("base_fields", list(k.get("required_fields") or ([] if not k.get("field") or k.get("field") == "*" else [k["field"]])))
+    k.setdefault("missing_fields", [])
+    k.setdefault("missing_fields_fa", [])
+    k.setdefault("description", k.get("comparison_basis") or f"محاسبه شاخص «{k.get('name', '')}» بر اساس فرمول {k.get('formula', '')}")
+    fmt = k.get("display_format") or _default_display_format(k.get("format_type", "number"), k.get("unit", ""))
+    k["display_format"] = fmt
+    k.setdefault("comparison_mode", _default_comparison_mode(k))
+    k.setdefault("priority", idx_priority)
+    k.setdefault("suggested_selected", c_status in ("computable", "computable_with_warning") and k.get("status") == "selected")
+    if "diagnostics" not in k:
+        warns = list(k.get("limitations") or [])
+        errs = [k["rejection_reason_fa"]] if k.get("rejection_reason_fa") else []
+        k["diagnostics"] = {
+            "fields_exist": c_status != "needs_data",
+            "types_compatible": c_status != "uncomputable" or "نوع" not in " ".join(errs),
+            "join_valid": True,
+            "nulls_and_zeros_handled": True,
+            "time_basis_clear": bool(k.get("period")),
+            "warnings_fa": warns,
+            "errors_fa": errs,
+            "data_quality_summary_fa": (
+                errs[0] if errs else (warns[0] if warns else "تمامی فیلدها، نوع داده و شروط محاسبه بدون خطا تأیید شدند.")
+            ),
+        }
+    return k
+
+
+def _match_field_tokens(c: dict[str, Any], tokens: tuple[str, ...]) -> int:
+    fn = str(c.get("field_name") or "").lower()
+    dn = str(c.get("display_name") or "").lower()
+    desc = str(c.get("description") or "").lower()
+    score = 0
+    for t in tokens:
+        tl = t.lower()
+        if fn == tl:
+            score += 6
+        elif tl in fn:
+            score += 4
+        if tl in dn:
+            score += 3
+        elif tl in desc:
+            score += 1
+    return score
+
+
+def _evaluate_standard_kpis(
+    db: Session,
+    ds: Dataset,
+    user: Optional[User],
+    deep_profile: dict[str, Any],
+    classifications: list[dict[str, Any]],
+    sub_sql: str,
+    sub_params: list[Any],
+    partner_ids: list[str],
+    eff_targets: dict[str, float],
+    calendar_mode: str = "gregorian",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Dynamically discovers & computes the 7 Core Standard Business KPIs with full diagnostics:
+      1. std_total_sales        (مجموع فروش)
+      2. std_profit_margin      (حاشیه سود)
+      3. std_mom_growth         (رشد ماهانه)
+      4. std_aov                (میانگین مبلغ سفارش - Order-level two-stage pre-aggregation)
+      5. std_unique_customers   (تعداد مشتریان یکتا)
+      6. std_target_achievement (درصد تحقق هدف - multi-source fan-out safe + manual target support)
+      7. std_delay_rate         (نرخ تأخیر - explicit eligible & delayed definitions)
+    """
+    row_count = int(deep_profile.get("row_count") or 0)
+    dup_count = int(deep_profile.get("duplicate_row_count") or 0)
+
+    # Build unified visible field pool across primary dataset + accessible related datasets
+    pool: list[dict[str, Any]] = []
+    for c in classifications:
+        pool.append({
+            **c,
+            "_dataset_id": ds.id,
+            "_dataset_name": ds.name,
+            "_is_primary": True,
+            "_join": None,
+        })
+
+    rel_plan: dict[str, Any] = {"ready_for_join": False, "resolved_joins": [], "blocked_relationships": []}
+    join_by_target_ds: dict[str, dict[str, Any]] = {}
+    if partner_ids and user is not None:
+        try:
+            rel_plan = analyze_dataset_relationships(db, user, [ds.id, *partner_ids], primary_dataset_id=ds.id)
+            for j in rel_plan.get("resolved_joins") or []:
+                join_by_target_ds[j["target_dataset_id"]] = j
+        except Exception:
+            pass
+
+    for pid in partner_ids:
+        if pid == ds.id:
+            continue
+        pds = db.query(Dataset).filter(Dataset.id == pid, Dataset.organization_id == ds.organization_id).first()
+        if not pds:
+            continue
+        if user is not None and not permission_resolver.resolve(db, user, "dataset", pds.id, "view").allowed:
+            continue
+        psc = build_data_security_context(db, user, pds.id) if user is not None else DataSecurityContext("sys", [], [], set(), {}, "sys")
+        p_fields = db.query(DatasetField).filter(DatasetField.dataset_id == pds.id).all()
+        p_join = join_by_target_ds.get(pds.id)
+        for pf in p_fields:
+            if pf.field_name in psc.hidden_columns:
+                continue
+            dt = (pf.data_type or "string").lower()
+            is_num = dt in ("integer", "double", "float", "decimal", "numeric")
+            is_dt = dt in ("date", "datetime", "timestamp")
+            sem_cls = pf.semantic_class or (
+                "Date/Time" if is_dt else ("Identifier" if pf.semantic_role == "id" else ("Revenue" if is_num else "Category"))
+            )
+            pool.append({
+                "field_name": pf.field_name,
+                "display_name": pf.display_name or pf.field_name,
+                "description": pf.description or "",
+                "data_type": "numeric" if is_num else ("date" if is_dt else "categorical"),
+                "raw_type": pf.data_type or "string",
+                "semantic_class": sem_cls,
+                "semantic_role": pf.semantic_role or "dimension",
+                "sum_allowed": bool(SEMANTIC_CLASS_META.get(sem_cls, {}).get("sum_allowed", is_num)),
+                "stats": {},
+                "_dataset_id": pds.id,
+                "_dataset_name": pds.name,
+                "_is_primary": False,
+                "_join": p_join,
+            })
+
+    def _pick_best(candidates_list: list[tuple[int, dict[str, Any]]]) -> Optional[dict[str, Any]]:
+        if not candidates_list:
+            return None
+        candidates_list.sort(key=lambda item: (1 if item[1]["_is_primary"] else 0, item[0]), reverse=True)
+        return candidates_list[0][1]
+
+    def _pick_numeric(
+        include_classes: tuple[str, ...],
+        pos_tokens: tuple[str, ...],
+        neg_tokens: tuple[str, ...] = (),
+        *,
+        require_token: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for c in pool:
+            if c.get("data_type") != "numeric" or c.get("semantic_class") == "Identifier":
+                continue
+            if c.get("semantic_class") in ("Percentage", "Ratio", "Unit Price") and "unit_price" not in pos_tokens:
+                continue
+            fn_low = c["field_name"].lower()
+            if any(nt in fn_low for nt in neg_tokens):
+                continue
+            tok_sc = _match_field_tokens(c, pos_tokens)
+            if require_token and tok_sc <= 0:
+                continue
+            sc = tok_sc
+            if c.get("semantic_class") in include_classes:
+                sc += 5
+            if sc > 0:
+                scored.append((sc, c))
+        return _pick_best(scored)
+
+    sales_f = _pick_numeric(
+        ("Revenue", "Actual", "Currency"),
+        ("total_sales", "sales_amount", "sale_amount", "revenue", "sales", "turnover", "gmv", "income", "net_sales", "amount", "فروش", "درآمد", "مبلغ"),
+        neg_tokens=("cost", "expense", "cogs", "target", "budget", "quota", "discount", "unit_price", "profit", "margin", "tax", "هزینه", "بها", "هدف", "بودجه", "تخفیف", "سود"),
+    )
+    cost_f = _pick_numeric(
+        ("Cost",),
+        ("total_cost", "cost_amount", "cogs", "cost", "expense", "spend", "بهای تمام", "بها", "هزینه"),
+        neg_tokens=("target", "budget", "unit_cost_pct", "ratio"),
+    )
+    profit_f = _pick_numeric(
+        ("Profit",),
+        ("net_profit", "gross_profit", "profit", "margin_amount", "سود"),
+        neg_tokens=("margin_pct", "profit_pct", "rate", "ratio", "درصد"),
+    )
+    target_f = _pick_numeric(
+        ("Target",),
+        ("target_revenue", "target_sales", "sales_target", "target_amount", "target", "budget", "quota", "goal", "plan_amount", "هدف", "بودجه"),
+        neg_tokens=("target_date", "due_date", "rate", "pct"),
+    )
+
+    # Order ID (primary preferred, avoid row_id / customer_id)
+    order_scored: list[tuple[int, dict[str, Any]]] = []
+    for c in pool:
+        if not c["_is_primary"]:
+            continue
+        fn = c["field_name"].lower()
+        if any(bt in fn for bt in ("customer", "client", "user", "product", "item_id", "مشتری", "کالا")):
+            continue
+        sc = _match_field_tokens(c, ("order_id", "invoice_id", "bill_id", "cart_id", "transaction_id", "tx_id", "receipt_id", "ticket_id", "request_id", "order_no", "شماره سفارش", "شناسه سفارش", "کد سفارش", "فاکتور"))
+        if sc > 0:
+            order_scored.append((sc, c))
+    order_f = _pick_best(order_scored)
+
+    # Customer ID
+    cust_scored: list[tuple[int, dict[str, Any]]] = []
+    for c in pool:
+        if not c["_is_primary"]:
+            continue
+        sc = _match_field_tokens(c, ("customer_id", "client_id", "buyer_id", "account_id", "subscriber_id", "member_id", "customer_code", "customer_name", "customer", "client", "شناسه مشتری", "کد مشتری", "نام مشتری", "مشتری"))
+        if sc > 0 and c.get("data_type") != "date":
+            cust_scored.append((sc, c))
+    cust_f = _pick_best(cust_scored)
+
+    # Time field (prefer order/transaction date over delivery/due date for MoM)
+    date_candidates = [c for c in pool if c["_is_primary"] and c.get("semantic_class") == "Date/Time"]
+    date_candidates.sort(
+        key=lambda c: (
+            1 if any(k in c["field_name"].lower() for k in ("due", "delivery", "promised", "deadline", "سررسید", "تحویل")) else 0,
+            -_match_field_tokens(c, ("order_date", "tx_date", "sale_date", "invoice_date", "created_at", "date", "تاریخ")),
+        )
+    )
+    time_f = date_candidates[0] if date_candidates else None
+
+    # Delay Rate fields (delivery vs due, duration vs SLA, delay_days, or delay flag/status)
+    delivery_f = _pick_best([
+        (_match_field_tokens(c, ("actual_delivery", "delivery_date", "delivered_at", "actual_date", "shipped_date", "completed_at", "finish_date", "end_date", "تاریخ تحویل", "تحویل واقعی", "تحویل")), c)
+        for c in pool if c.get("semantic_class") == "Date/Time" and _match_field_tokens(c, ("actual_delivery", "delivery_date", "delivered_at", "actual_date", "shipped_date", "completed_at", "finish_date", "end_date", "تاریخ تحویل", "تحویل واقعی", "تحویل")) > 0
+    ])
+    due_f = _pick_best([
+        (_match_field_tokens(c, ("due_date", "promised_date", "expected_date", "planned_date", "target_date", "deadline", "sla_due", "تاریخ سررسید", "موعد تحویل", "سررسید", "موعد")), c)
+        for c in pool if c.get("semantic_class") == "Date/Time" and _match_field_tokens(c, ("due_date", "promised_date", "expected_date", "planned_date", "target_date", "deadline", "sla_due", "تاریخ سررسید", "موعد تحویل", "سررسید", "موعد")) > 0
+    ])
+    dur_f = _pick_numeric(
+        ("Duration",),
+        ("wait_minutes", "wait_hours", "duration", "lead_time", "processing_time", "cycle_time", "مدت انتظار", "زمان انتظار", "مدت"),
+        neg_tokens=("delay_days", "late_days", "overdue_days"),
+        require_token=True,
+    )
+    sla_f = _pick_numeric(
+        ("Target", "Duration", "Quantity"),
+        ("sla_limit", "sla_minutes", "sla_hours", "sla_days", "sla", "max_wait", "deadline_days", "سقف مجاز", "حد مجاز"),
+        neg_tokens=("target_revenue", "target_sales", "target_amount", "sales_target", "budget", "quota"),
+        require_token=True,
+    )
+    delay_days_f = _pick_numeric(
+        ("Duration", "Quantity", "Count Measure"),
+        ("delay_days", "late_days", "overdue_days", "delay_hours", "delay_minutes", "روز تأخیر", "میزان تأخیر", "مدت تأخیر"),
+        require_token=True,
+    )
+    delay_flag_f = _pick_best([
+        (_match_field_tokens(c, ("is_delayed", "delayed", "is_late", "overdue", "sla_breach", "delay_status", "delivery_status", "وضعیت تأخیر", "تأخیر", "تاخیر")), c)
+        for c in pool if c["_is_primary"] and c.get("semantic_class") in ("Boolean", "Status", "Category")
+        and _match_field_tokens(c, ("is_delayed", "delayed", "is_late", "overdue", "sla_breach", "delay_status", "delivery_status", "وضعیت تأخیر", "تأخیر", "تاخیر")) > 0
+    ])
+
+    # Detect cancellation status column (to exclude cancelled orders from Delay Rate denominator)
+    cancel_tokens = {"cancelled", "canceled", "void", "aborted", "rejected", "لغو", "لغوشده", "کنسل"}
+    cancel_status_col: Optional[str] = None
+    cancel_vals_sql: list[str] = []
+    for c in classifications:
+        if c.get("semantic_class") in ("Status", "Category"):
+            obs = [str(tv.get("value", "")) for tv in (c.get("stats", {}).get("top_values") or [])]
+            matched_c = [v for v in obs if v.strip().lower() in cancel_tokens]
+            if matched_c:
+                cancel_status_col = c["field_name"]
+                cancel_vals_sql = ["'" + v.replace("'", "''") + "'" for v in matched_c[:5]]
+                break
+
+    def _exec_scalar(sql_expr: str) -> Optional[float]:
+        if row_count == 0:
+            return None
+        r = warehouse.execute_query(f"SELECT ({sql_expr}) AS v FROM ({sub_sql}) AS _std_probe", sub_params, limit=1)["rows"]
+        return _safe_float(r[0]["v"]) if r else None
+
+    def _exec_multi(vspec: dict[str, Any]) -> Optional[float]:
+        if row_count == 0:
+            return None
+        jsql, jparams, _ = build_visual_query_sql(db, ds, vspec, [], [], [], user=user, enforce_join_rbac=True)
+        jr = warehouse.execute_query(jsql, jparams, limit=1)["rows"]
+        return _safe_float(jr[0].get("value")) if jr else None
+
+    def _build_msa_if_cross(left_f: dict[str, Any], right_f: dict[str, Any], final_expr: str, left_agg: str = "SUM", right_agg: str = "SUM") -> tuple[Optional[dict[str, Any]], bool, str]:
+        if left_f["_is_primary"] and right_f["_is_primary"]:
+            return None, True, ""
+        # Resolve join between primary dataset ds and the non-primary dataset
+        other_f = right_f if left_f["_is_primary"] else left_f
+        j = other_f.get("_join")
+        if not j:
+            return None, False, f"فیلد «{other_f['display_name']}» در منبع «{other_f['_dataset_name']}» است اما رابطه اتصال (Join Key) معتبری بین دو منبع وجود ندارد."
+        if left_f["_is_primary"]:
+            msa = {
+                "right_dataset_id": other_f["_dataset_id"],
+                "left_key": j["left_field"],
+                "right_key": j["right_field"],
+                "join_type": "INNER",
+                "left_agg": left_agg,
+                "left_field": left_f["field_name"],
+                "right_agg": right_agg,
+                "right_field": right_f["field_name"],
+                "final_expr": final_expr,
+            }
+        else:
+            # left_f is on partner dataset, right_f is on primary dataset -> swap aliases carefully
+            msa = {
+                "right_dataset_id": other_f["_dataset_id"],
+                "left_key": j["left_field"],
+                "right_key": j["right_field"],
+                "join_type": "INNER",
+                "left_agg": right_agg,
+                "left_field": right_f["field_name"],
+                "right_agg": left_agg,
+                "right_field": left_f["field_name"],
+                "final_expr": final_expr.replace("_l_val", "__TMP__").replace("_r_val", "_l_val").replace("__TMP__", "_r_val"),
+            }
+        note = f"تجمیع کلید-محور چندمنبعی روی کلید «{j['left_field']} ↔ {j['right_field']}» برای جلوگیری از تکرار و Fan-out اعمال شد."
+        return msa, True, note
+
+    std_kpis: list[dict[str, Any]] = []
+
+    def _make_std(
+        *,
+        kpi_id: str,
+        name: str,
+        description: str,
+        formula: str,
+        display_format: str,
+        unit: str = "",
+        direction: str = "higher_is_better",
+        base_fields: Optional[list[str]] = None,
+        missing_fields: Optional[list[str]] = None,
+        missing_fields_fa: Optional[list[str]] = None,
+        source_datasets: Optional[list[str]] = None,
+        value: Optional[float] = None,
+        previous_value: Optional[float] = None,
+        target_value: Optional[float] = None,
+        computability_status: str = "computable",
+        warnings_fa: Optional[list[str]] = None,
+        errors_fa: Optional[list[str]] = None,
+        fields_exist: bool = True,
+        types_compatible: bool = True,
+        join_valid: bool = True,
+        nulls_and_zeros_handled: bool = True,
+        time_basis_clear: bool = True,
+        comparison_basis: str = "کل بازه داده‌ها",
+        comparison_mode: str = "none",
+        priority: int = 1,
+        field_primary: Optional[str] = None,
+        time_field: Optional[str] = None,
+        eligible_definition_fa: Optional[str] = None,
+        delayed_definition_fa: Optional[str] = None,
+        multi_source_agg: Optional[dict[str, Any]] = None,
+        pre_agg_grain: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        warns = list(warnings_fa or [])
+        errs = list(errors_fa or [])
+        summary_parts = errs if errs else (warns if warns else ["تمام بررسی‌های وجود فیلد، سازگاری نوع، مدیریت NULL/صفر و اعتبار محاسبه با موفقیت تأیید شد."])
+        formatted_val = _format_kpi_value(value, display_format, unit)
+        if errs and computability_status not in ("needs_data", "uncomputable"):
+            computability_status = "uncomputable"
+        elif warns and computability_status == "computable":
+            computability_status = "computable_with_warning"
+
+        item: dict[str, Any] = {
+            "id": kpi_id,
+            "slug": kpi_id,
+            "name": name,
+            "description": description,
+            "is_standard": True,
+            "category": "standard",
+            "formula": formula,
+            "compiled_sql": formula,
+            "aggregation": "FORMULA",
+            "field": field_primary,
+            "time_field": time_field,
+            "format_type": display_format,
+            "display_format": display_format,
+            "unit": unit,
+            "direction": direction,
+            "base_fields": base_fields or [],
+            "required_fields": base_fields or [],
+            "missing_fields": missing_fields or [],
+            "missing_fields_fa": missing_fields_fa or [],
+            "source_datasets": source_datasets or [ds.name],
+            "source": " + ".join(source_datasets or [ds.name]),
+            "joins": [],
+            "multi_source_agg": multi_source_agg,
+            "pre_agg_grain": pre_agg_grain,
+            "value": round(value, 4) if value is not None else None,
+            "formatted_value": formatted_val,
+            "previous_value": round(previous_value, 4) if previous_value is not None else None,
+            "target_value": round(target_value, 4) if target_value is not None else None,
+            "period": comparison_basis,
+            "comparison_basis": comparison_basis,
+            "comparison_mode": comparison_mode,
+            "priority": priority,
+            "importance": 0.98 - (priority - 1) * 0.02,
+            "domain_fit": 0.96,
+            "confidence": 0.96 if computability_status == "computable" else (0.86 if computability_status == "computable_with_warning" else 0.0),
+            "score": round(98.0 - (priority - 1) * 1.5, 1) if computability_status in ("computable", "computable_with_warning") else 0.0,
+            "limitations": warns,
+            "rejection_reason_fa": errs[0] if errs else (f"فیلد(های) موردنیاز یافت نشد: {'، '.join(missing_fields_fa or [])}" if computability_status == "needs_data" else None),
+            "computability_status": computability_status,
+            "computability_status_fa": COMPUTABILITY_STATUS_FA[computability_status],
+            "eligible_definition_fa": eligible_definition_fa,
+            "delayed_definition_fa": delayed_definition_fa,
+            "diagnostics": {
+                "fields_exist": fields_exist,
+                "types_compatible": types_compatible,
+                "join_valid": join_valid,
+                "nulls_and_zeros_handled": nulls_and_zeros_handled,
+                "time_basis_clear": time_basis_clear,
+                "warnings_fa": warns,
+                "errors_fa": errs,
+                "data_quality_summary_fa": " | ".join(summary_parts),
+            },
+            "status": "selected" if computability_status in ("computable", "computable_with_warning") else computability_status,
+            "suggested_selected": computability_status in ("computable", "computable_with_warning"),
+            "needs_user_confirmation": False,
+            "is_data_quality": False,
+        }
+        return item
+
+    # ------------------------------------------------------------------
+    # 1. مجموع فروش (Total Sales)
+    # ------------------------------------------------------------------
+    if not sales_f:
+        std_kpis.append(_make_std(
+            kpi_id="std_total_sales",
+            name="مجموع فروش",
+            description="مجموع مبلغ فروش کل در دوره انتخاب‌شده با مدیریت مقادیر NULL.",
+            formula="COALESCE(SUM(<sales_amount>), 0)",
+            display_format="currency",
+            unit="ریال",
+            missing_fields=["sales_amount"],
+            missing_fields_fa=["فیلد مبلغ فروش / درآمد (Sales Amount)"],
+            computability_status="needs_data",
+            fields_exist=False,
+            priority=1,
+        ))
+    else:
+        s_fn = sales_f["field_name"]
+        warns: list[str] = []
+        errs: list[str] = []
+        val = None
+        if not sales_f["_is_primary"]:
+            errs.append("مجموع فروش نیازمند وجود ستون مبلغ فروش در منبع اصلی داده است.")
+        else:
+            null_pct = float(sales_f.get("stats", {}).get("null_pct") or 0)
+            if null_pct > 0:
+                warns.append(f"{null_pct}% از رکوردهای «{sales_f['display_name']}» خالی (NULL) است و با COALESCE در مجموع لحاظ نمی‌شوند.")
+            if dup_count > 0:
+                warns.append(f"{dup_count:,} ردیف تکراری در دیتاست شناسایی شد؛ در صورت تکراری بودن ردیف‌های فاکتور، جمع فروش می‌تواند بیش‌برآورد شود.")
+            if row_count == 0:
+                warns.append("جدول فاقد ردیف است؛ مقدار پیش‌فرض صفر بازگردانده شد.")
+                val = 0.0
+            else:
+                r_s = warehouse.execute_query(
+                    f'SELECT COALESCE(SUM("{s_fn}"), 0) AS s, COUNT("{s_fn}") AS nn FROM ({sub_sql}) AS _s',
+                    sub_params, limit=1,
+                )["rows"]
+                nn = int(r_s[0]["nn"] or 0) if r_s else 0
+                val = _safe_float(r_s[0]["s"]) if r_s else 0.0
+                if nn == 0:
+                    warns.append("تمامی مقادیر ستون فروش خالی (NULL) هستند.")
+        t_override = eff_targets.get("std_total_sales") or eff_targets.get(s_fn)
+        std_kpis.append(_make_std(
+            kpi_id="std_total_sales",
+            name="مجموع فروش",
+            description=f"جمع کل ستون «{sales_f['display_name']}» با حذف ایمن مقادیر NULL.",
+            formula=f'COALESCE(SUM("{s_fn}"), 0)',
+            display_format="currency",
+            unit="ریال",
+            base_fields=[s_fn],
+            source_datasets=[sales_f["_dataset_name"]],
+            value=val,
+            target_value=t_override,
+            computability_status="uncomputable" if errs else ("computable_with_warning" if warns else "computable"),
+            warnings_fa=warns,
+            errors_fa=errs,
+            comparison_mode="target" if t_override is not None else "none",
+            priority=1,
+            field_primary=s_fn,
+            time_field=time_f["field_name"] if time_f else None,
+        ))
+
+    # ------------------------------------------------------------------
+    # 2. حاشیه سود (Profit Margin %)
+    # ------------------------------------------------------------------
+    if not sales_f or (not cost_f and not profit_f):
+        miss_fa = []
+        miss_en = []
+        if not sales_f:
+            miss_fa.append("فیلد مبلغ فروش / درآمد (Sales Amount)")
+            miss_en.append("sales_amount")
+        if not cost_f and not profit_f:
+            miss_fa.append("فیلد هزینه / بهای تمام‌شده (Cost) یا سود (Profit)")
+            miss_en.append("cost_or_profit")
+        std_kpis.append(_make_std(
+            kpi_id="std_profit_margin",
+            name="حاشیه سود",
+            description="نسبت سود خالص به مجموع فروش بر حسب درصد: (فروش − هزینه) ÷ فروش × ۱۰۰",
+            formula="(COALESCE(SUM(<sales>), 0) - COALESCE(SUM(<cost>), 0)) * 100.0 / NULLIF(SUM(<sales>), 0)",
+            display_format="percentage",
+            unit="%",
+            base_fields=[f["field_name"] for f in (sales_f, cost_f, profit_f) if f],
+            missing_fields=miss_en,
+            missing_fields_fa=miss_fa,
+            computability_status="needs_data",
+            fields_exist=False,
+            priority=2,
+        ))
+    else:
+        s_fn = sales_f["field_name"]
+        warns = []
+        errs = []
+        val = None
+        msa_pm = None
+        j_valid = True
+        if cost_f and cost_f["field_name"] != s_fn:
+            c_fn = cost_f["field_name"]
+            pm_formula = f'(COALESCE(SUM("{s_fn}"), 0) - COALESCE(SUM("{c_fn}"), 0)) * 100.0 / NULLIF(SUM("{s_fn}"), 0)'
+            used_ds = list(dict.fromkeys([sales_f["_dataset_name"], cost_f["_dataset_name"]]))
+            b_fields = [s_fn, c_fn]
+            if not (sales_f["_is_primary"] and cost_f["_is_primary"]):
+                msa_pm, j_valid, j_note = _build_msa_if_cross(
+                    sales_f, cost_f,
+                    "((COALESCE(SUM(_l_val), 0) - COALESCE(SUM(_r_val), 0)) * 100.0) / NULLIF(SUM(_l_val), 0)",
+                )
+                if not j_valid:
+                    errs.append(j_note)
+                else:
+                    warns.append(j_note)
+        else:
+            p_fn = profit_f["field_name"]  # type: ignore[index]
+            pm_formula = f'COALESCE(SUM("{p_fn}"), 0) * 100.0 / NULLIF(SUM("{s_fn}"), 0)'
+            used_ds = list(dict.fromkeys([sales_f["_dataset_name"], profit_f["_dataset_name"]]))  # type: ignore[index]
+            b_fields = [s_fn, p_fn]
+            warns.append(f"بهای تمام‌شده جداگانه یافت نشد؛ حاشیه سود مستقیماً از ستون «{profit_f['display_name']}» محاسبه شد.")  # type: ignore[index]
+            if not (sales_f["_is_primary"] and profit_f["_is_primary"]):  # type: ignore[index]
+                msa_pm, j_valid, j_note = _build_msa_if_cross(
+                    sales_f, profit_f,  # type: ignore[arg-type]
+                    "(COALESCE(SUM(_r_val), 0) * 100.0) / NULLIF(SUM(_l_val), 0)",
+                )
+                if not j_valid:
+                    errs.append(j_note)
+                else:
+                    warns.append(j_note)
+
+        if dup_count > 0:
+            warns.append(f"در دیتاست {dup_count:,} ردیف تکراری وجود دارد.")
+
+        if not errs:
+            try:
+                if msa_pm:
+                    val = _exec_multi({"multi_source_agg": msa_pm, "limit": 1})
+                else:
+                    r_pm = warehouse.execute_query(
+                        f'SELECT COALESCE(SUM("{s_fn}"), 0) AS denom, ({pm_formula}) AS pm FROM ({sub_sql}) AS _pm',
+                        sub_params, limit=1,
+                    )["rows"]
+                    denom = float(r_pm[0]["denom"] or 0) if r_pm else 0.0
+                    if denom == 0.0:
+                        errs.append("مجموع فروش برابر صفر است؛ تقسیم بر صفر رخ می‌دهد و حاشیه سود قابل محاسبه نیست.")
+                    else:
+                        val = _safe_float(r_pm[0]["pm"])
+                if val is None and not errs:
+                    errs.append("مجموع فروش صفر یا نامعتبر است؛ حاشیه سود محاسبه نشد.")
+            except Exception as exc:
+                errs.append(f"خطا در محاسبه حاشیه سود: {exc}")
+
+        std_kpis.append(_make_std(
+            kpi_id="std_profit_margin",
+            name="حاشیه سود",
+            description="نسبت سود خالص به مجموع فروش بر حسب درصد با محافظت NULLIF در برابر مخرج صفر.",
+            formula=pm_formula,
+            display_format="percentage",
+            unit="%",
+            base_fields=b_fields,
+            source_datasets=used_ds,
+            value=val,
+            computability_status="uncomputable" if errs else ("computable_with_warning" if warns else "computable"),
+            warnings_fa=warns,
+            errors_fa=errs,
+            join_valid=j_valid,
+            priority=2,
+            field_primary=s_fn,
+            multi_source_agg=msa_pm,
+        ))
+
+    # ------------------------------------------------------------------
+    # 3. رشد ماهانه هم‌تراز با تقویم (MoM Growth %)
+    # ------------------------------------------------------------------
+    if not sales_f or not time_f:
+        miss_fa = []
+        miss_en = []
+        if not sales_f:
+            miss_fa.append("فیلد مبلغ فروش (Sales Amount)")
+            miss_en.append("sales_amount")
+        if not time_f:
+            miss_fa.append("ستون تاریخ / زمان (Date/Time)")
+            miss_en.append("date_field")
+        std_kpis.append(_make_std(
+            kpi_id="std_mom_growth",
+            name="رشد ماهانه",
+            description="درصد رشد فروش ماه جاری تقویمی نسبت به ماه تقویمی بلافاصله قبل.",
+            formula="MOM_CALENDAR(<sales_amount>, <date_field>)",
+            display_format="percentage",
+            unit="%",
+            base_fields=[f["field_name"] for f in (sales_f, time_f) if f],
+            missing_fields=miss_en,
+            missing_fields_fa=miss_fa,
+            computability_status="needs_data",
+            fields_exist=False,
+            time_basis_clear=False,
+            priority=3,
+        ))
+    else:
+        s_fn = sales_f["field_name"]
+        t_fn = time_f["field_name"]
+        mom_formula = f'MOM_CALENDAR("{s_fn}", "{t_fn}")'
+        warns = []
+        errs = []
+        miss_fa = []
+        miss_en = []
+        c_status = "computable"
+        val = None
+        prev_v = None
+        curr_v = None
+        comp_basis = "نیازمند حداقل ۲ ماه تقویمی متوالی"
+
+        if not sales_f["_is_primary"]:
+            errs.append("رشد ماهانه نیازمند قرار گرفتن فروش و تاریخ در منبع اصلی است.")
+            c_status = "uncomputable"
+        else:
+            if calendar_mode == "jalali":
+                m_idx_expr = expand_jalali_sql_calls(f'(JALALI_YEAR("{t_fn}") * 12 + JALALI_MONTH("{t_fn}"))')
+                m_lbl_expr = expand_jalali_sql_calls(f'SUBSTRING(JALALI_DATE("{t_fn}"), 1, 7)')
+            else:
+                m_idx_expr = f'(EXTRACT(YEAR FROM TRY_CAST("{t_fn}" AS DATE)) * 12 + EXTRACT(MONTH FROM TRY_CAST("{t_fn}" AS DATE)))'
+                m_lbl_expr = f'STRFTIME(TRY_CAST("{t_fn}" AS DATE), \'%Y-%m\')'
+            try:
+                m_rows = warehouse.execute_query(
+                    f'SELECT ({m_idx_expr}) AS idx, MIN({m_lbl_expr}) AS lbl, COALESCE(SUM("{s_fn}"), 0) AS val '
+                    f'FROM ({sub_sql}) AS _m WHERE TRY_CAST("{t_fn}" AS DATE) IS NOT NULL GROUP BY 1 ORDER BY 1 ASC',
+                    sub_params, limit=240,
+                )["rows"]
+                null_date_r = warehouse.execute_query(
+                    f'SELECT SUM(CASE WHEN TRY_CAST("{t_fn}" AS DATE) IS NULL THEN 1 ELSE 0 END) AS bad_d '
+                    f'FROM ({sub_sql}) AS _md',
+                    sub_params, limit=1,
+                )["rows"]
+                bad_dates = int((null_date_r[0]["bad_d"] or 0) if null_date_r else 0)
+                if bad_dates > 0:
+                    warns.append(f"{bad_dates:,} رکورد فاقد تاریخ معتبر بوده و در تحلیل ماهانه لحاظ نشدند.")
+
+                m_map = {int(r["idx"]): (str(r["lbl"]), float(r["val"] or 0.0)) for r in m_rows if r.get("idx") is not None}
+                if len(m_map) < 2:
+                    c_status = "needs_data"
+                    miss_en = ["consecutive_calendar_months"]
+                    miss_fa = ["حداقل ۲ ماه تقویمی متوالی در داده‌ها"]
+                    warns.append(f"فقط {len(m_map)} ماه تقویمی در داده‌ها وجود دارد؛ برای رشد ماهانه حداقل ۲ ماه متوالی لازم است.")
+                else:
+                    curr_idx = max(m_map.keys())
+                    prev_idx = curr_idx - 1
+                    curr_lbl, curr_v = m_map[curr_idx]
+                    if prev_idx not in m_map:
+                        c_status = "needs_data"
+                        miss_en = ["adjacent_previous_month"]
+                        miss_fa = [f"داده‌های ماه تقویمی بلافاصله قبل از «{curr_lbl}»"]
+                        warns.append(f"بین آخرین ماه ({curr_lbl}) و داده‌های قبلی فاصله تقویمی وجود دارد؛ ماه قبل مستقیماً در داده ثبت نشده است.")
+                    else:
+                        prev_lbl, prev_v = m_map[prev_idx]
+                        comp_basis = f"مقایسه ماه {curr_lbl} ({_fmt_num(curr_v)}) با ماه قبل {prev_lbl} ({_fmt_num(prev_v)})"
+                        if prev_v == 0:
+                            c_status = "uncomputable"
+                            errs.append(f"مقدار فروش ماه قبل ({prev_lbl}) صفر است؛ درصد رشد ماهانه به دلیل تقسیم بر صفر قابل محاسبه نیست.")
+                        else:
+                            if prev_v < 0:
+                                warns.append(f"مقدار ماه قبل ({prev_lbl}) منفی است؛ رشد نسبت به قدر مطلق دوره قبل محاسبه شد.")
+                            val = ((curr_v - prev_v) * 100.0) / abs(prev_v)
+            except Exception as exc:
+                c_status = "uncomputable"
+                errs.append(f"خطا در محاسبه رشد ماهانه هم‌تراز با تقویم: {exc}")
+
+        std_kpis.append(_make_std(
+            kpi_id="std_mom_growth",
+            name="رشد ماهانه",
+            description="درصد رشد فروش آخرین ماه تقویمی نسبت به ماه تقویمی بلافاصله قبل (با رعایت شکاف ماه‌ها و تقسیم بر صفر).",
+            formula=mom_formula,
+            display_format="percentage",
+            unit="%",
+            base_fields=[s_fn, t_fn],
+            missing_fields=miss_en,
+            missing_fields_fa=miss_fa,
+            source_datasets=[ds.name],
+            value=val,
+            previous_value=prev_v,
+            computability_status=c_status,
+            warnings_fa=warns,
+            errors_fa=errs,
+            fields_exist=(c_status != "needs_data"),
+            time_basis_clear=(c_status != "needs_data"),
+            comparison_basis=comp_basis,
+            comparison_mode="previous_period" if c_status in ("computable", "computable_with_warning") else "none",
+            priority=3,
+            field_primary=s_fn,
+            time_field=t_fn,
+        ))
+
+    # ------------------------------------------------------------------
+    # 4. میانگین مبلغ سفارش (AOV - Two-Stage Order-Level Pre-Aggregation)
+    # ------------------------------------------------------------------
+    if not sales_f or not order_f:
+        miss_fa = []
+        miss_en = []
+        if not sales_f:
+            miss_fa.append("فیلد مبلغ فروش (Sales Amount)")
+            miss_en.append("sales_amount")
+        if not order_f:
+            miss_fa.append("فیلد شناسه سفارش (Order / Invoice ID)")
+            miss_en.append("order_id")
+        std_kpis.append(_make_std(
+            kpi_id="std_aov",
+            name="میانگین مبلغ سفارش",
+            description="ابتدا جمع مبلغ هر سفارش در سطح شناسه سفارش محاسبه شده و سپس میانگین سفارش‌ها گرفته می‌شود (تجمیع دومرحله‌ای).",
+            formula="AOV(<sales_amount>, <order_id>)",
+            display_format="currency",
+            unit="ریال",
+            base_fields=[f["field_name"] for f in (sales_f, order_f) if f],
+            missing_fields=miss_en,
+            missing_fields_fa=miss_fa,
+            computability_status="needs_data",
+            fields_exist=False,
+            priority=4,
+        ))
+    else:
+        s_fn = sales_f["field_name"]
+        o_fn = order_f["field_name"]
+        aov_formula = f'AOV("{s_fn}", "{o_fn}")'
+        warns = []
+        errs = []
+        val = None
+        if not sales_f["_is_primary"]:
+            errs.append("میانگین مبلغ سفارش نیازمند حضور فیلد فروش در منبع اصلی است.")
+        else:
+            try:
+                aov_r = warehouse.execute_query(
+                    f'WITH _g AS ('
+                    f'SELECT "{o_fn}" AS _ok, COALESCE(SUM("{s_fn}"), 0) AS _ov, COUNT(*) AS _rc '
+                    f'FROM ({sub_sql}) AS _a WHERE "{o_fn}" IS NOT NULL GROUP BY 1'
+                    f') SELECT AVG(_ov) AS aov, COUNT(*) AS orders_cnt, COALESCE(SUM(_rc), 0) AS rows_cnt FROM _g',
+                    sub_params, limit=1,
+                )["rows"]
+                null_o_r = warehouse.execute_query(
+                    f'SELECT SUM(CASE WHEN "{o_fn}" IS NULL THEN 1 ELSE 0 END) AS null_o FROM ({sub_sql}) AS _no',
+                    sub_params, limit=1,
+                )["rows"]
+                null_orders = int((null_o_r[0]["null_o"] or 0) if null_o_r else 0)
+                orders_cnt = int((aov_r[0]["orders_cnt"] or 0) if aov_r else 0)
+                rows_cnt = int((aov_r[0]["rows_cnt"] or 0) if aov_r else 0)
+                val = _safe_float(aov_r[0]["aov"]) if aov_r else None
+                if orders_cnt == 0 or val is None:
+                    errs.append("هیچ شناسه سفارش معتبر (غیرخالی) برای محاسبه میانگین مبلغ سفارش وجود ندارد.")
+                else:
+                    if null_orders > 0:
+                        warns.append(f"{null_orders:,} ردیف فاقد شناسه سفارش (NULL) از مخرج و صورت محاسبه AOV کنار گذاشته شد.")
+                    if rows_cnt > orders_cnt:
+                        warns.append(f"تجمیع دومرحله‌ای روی {orders_cnt:,} سفارش یکتا (از {rows_cnt:,} ردیف/آیتم) انجام شد تا سفارش‌های چندردیفه دوبار شمرده نشوند.")
+            except Exception as exc:
+                errs.append(f"خطا در محاسبه میانگین مبلغ سفارش: {exc}")
+
+        std_kpis.append(_make_std(
+            kpi_id="std_aov",
+            name="میانگین مبلغ سفارش",
+            description=f"تجمیع دومرحله‌ای مبلغ «{sales_f['display_name']}» در سطح «{order_f['display_name']}» و سپس میانگین‌گیری از سفارش‌های معتبر.",
+            formula=aov_formula,
+            display_format="currency",
+            unit="ریال",
+            base_fields=[s_fn, o_fn],
+            source_datasets=[ds.name],
+            value=val,
+            computability_status="uncomputable" if errs else ("computable_with_warning" if warns else "computable"),
+            warnings_fa=warns,
+            errors_fa=errs,
+            priority=4,
+            field_primary=s_fn,
+            pre_agg_grain={"grain_field": o_fn, "measure_field": s_fn, "grain_agg": "SUM"},
+        ))
+
+    # ------------------------------------------------------------------
+    # 5. تعداد مشتریان یکتا (Unique Customers)
+    # ------------------------------------------------------------------
+    if not cust_f:
+        std_kpis.append(_make_std(
+            kpi_id="std_unique_customers",
+            name="تعداد مشتریان یکتا",
+            description="شمارش تعداد مشتریان متمایز بدون تکرار.",
+            formula="COUNT(DISTINCT <customer_id>)",
+            display_format="count",
+            unit="مشتری",
+            missing_fields=["customer_id"],
+            missing_fields_fa=["فیلد شناسه یا کد مشتری (Customer ID)"],
+            computability_status="needs_data",
+            fields_exist=False,
+            priority=5,
+        ))
+    else:
+        cu_fn = cust_f["field_name"]
+        cu_formula = f'COUNT(DISTINCT "{cu_fn}")'
+        warns = []
+        errs = []
+        val = None
+        try:
+            cu_r = warehouse.execute_query(
+                f'SELECT COUNT(DISTINCT "{cu_fn}") AS ucnt, '
+                f'SUM(CASE WHEN "{cu_fn}" IS NULL THEN 1 ELSE 0 END) AS ncnt, '
+                f'COUNT(*) AS tcnt FROM ({sub_sql}) AS _cu',
+                sub_params, limit=1,
+            )["rows"]
+            ucnt = int((cu_r[0]["ucnt"] or 0) if cu_r else 0)
+            ncnt = int((cu_r[0]["ncnt"] or 0) if cu_r else 0)
+            tcnt = int((cu_r[0]["tcnt"] or 0) if cu_r else 0)
+            val = float(ucnt)
+            if tcnt == 0 or ucnt == 0:
+                errs.append("هیچ مقدار معتبر غیرخالی برای شناسه مشتری یافت نشد.")
+            else:
+                if ncnt > 0:
+                    warns.append(f"{ncnt:,} رکورد فاقد شناسه مشتری (NULL) است و در شمارش مشتریان یکتا لحاظ نشد.")
+                if tcnt > ucnt:
+                    warns.append(f"{tcnt:,} رکورد به {ucnt:,} مشتری یکتا خلاصه شد (حذف تکرار مشتری).")
+        except Exception as exc:
+            errs.append(f"خطا در شمارش مشتریان یکتا: {exc}")
+
+        std_kpis.append(_make_std(
+            kpi_id="std_unique_customers",
+            name="تعداد مشتریان یکتا",
+            description=f"شمارش دقیق مقادیر متمایز در ستون «{cust_f['display_name']}».",
+            formula=cu_formula,
+            display_format="count",
+            unit="مشتری",
+            base_fields=[cu_fn],
+            source_datasets=[ds.name],
+            value=val,
+            computability_status="uncomputable" if errs else ("computable_with_warning" if warns else "computable"),
+            warnings_fa=warns,
+            errors_fa=errs,
+            priority=5,
+            field_primary=cu_fn,
+        ))
+
+    # ------------------------------------------------------------------
+    # 6. درصد تحقق هدف (Target Achievement %)
+    # ------------------------------------------------------------------
+    manual_target = _safe_float(
+        eff_targets.get("std_target_achievement")
+        or eff_targets.get("target")
+        or (eff_targets.get(sales_f["field_name"]) if sales_f else None)
+    )
+    if not sales_f or (not target_f and not (manual_target and manual_target > 0)):
+        miss_fa = []
+        miss_en = []
+        if not sales_f:
+            miss_fa.append("فیلد مبلغ فروش واقعی (Sales / Actual)")
+            miss_en.append("sales_amount")
+        if not target_f:
+            miss_fa.append("فیلد مقدار هدف (Target / Budget) یا ثبت هدف دستی")
+            miss_en.append("target_amount")
+        std_kpis.append(_make_std(
+            kpi_id="std_target_achievement",
+            name="درصد تحقق هدف",
+            description="نسبت عملکرد واقعی فروش به مقدار هدف برنامه‌ریزی‌شده (درصد).",
+            formula="COALESCE(SUM(<sales>), 0) * 100.0 / NULLIF(SUM(<target>), 0)",
+            display_format="percentage",
+            unit="%",
+            base_fields=[sales_f["field_name"]] if sales_f else [],
+            missing_fields=miss_en,
+            missing_fields_fa=miss_fa,
+            computability_status="needs_data",
+            fields_exist=False,
+            priority=6,
+        ))
+    else:
+        s_fn = sales_f["field_name"]
+        warns = []
+        errs = []
+        val = None
+        msa_ta = None
+        j_valid = True
+        t_val_num = None
+        if target_f and target_f["field_name"] != s_fn:
+            tfn = target_f["field_name"]
+            ta_formula = f'COALESCE(SUM("{s_fn}"), 0) * 100.0 / NULLIF(SUM("{tfn}"), 0)'
+            b_fields = [s_fn, tfn]
+            used_ds = list(dict.fromkeys([sales_f["_dataset_name"], target_f["_dataset_name"]]))
+            if not (sales_f["_is_primary"] and target_f["_is_primary"]):
+                msa_ta, j_valid, j_note = _build_msa_if_cross(
+                    sales_f, target_f,
+                    "(COALESCE(SUM(_l_val), 0) * 100.0) / NULLIF(SUM(_r_val), 0)",
+                )
+                if not j_valid:
+                    errs.append(j_note)
+                else:
+                    warns.append(j_note)
+            if not errs:
+                try:
+                    if msa_ta:
+                        val = _exec_multi({"multi_source_agg": msa_ta, "limit": 1})
+                        # Also probe target sum
+                        t_val_num = _exec_multi({
+                            "multi_source_agg": {**msa_ta, "final_expr": "COALESCE(SUM(_r_val), 0)"},
+                            "limit": 1,
+                        })
+                    else:
+                        r_ta = warehouse.execute_query(
+                            f'SELECT COALESCE(SUM("{s_fn}"), 0) AS a_sum, COALESCE(SUM("{tfn}"), 0) AS t_sum, ({ta_formula}) AS pct '
+                            f'FROM ({sub_sql}) AS _ta',
+                            sub_params, limit=1,
+                        )["rows"]
+                        t_val_num = _safe_float(r_ta[0]["t_sum"]) if r_ta else 0.0
+                        if not t_val_num:
+                            errs.append("مجموع مقدار هدف برابر صفر است؛ درصد تحقق هدف قابل محاسبه نیست.")
+                        else:
+                            val = _safe_float(r_ta[0]["pct"])
+                except Exception as exc:
+                    errs.append(f"خطا در محاسبه درصد تحقق هدف: {exc}")
+        else:
+            # Manual target entered by user
+            ta_formula = f'COALESCE(SUM("{s_fn}"), 0) * 100.0 / NULLIF({manual_target}, 0)'
+            b_fields = [s_fn]
+            used_ds = [sales_f["_dataset_name"]]
+            t_val_num = manual_target
+            warns.append(f"هدف دستی ({_fmt_num(manual_target)}) به عنوان مبنای محاسبه اعمال شده است.")
+            try:
+                val = _exec_scalar(ta_formula)
+            except Exception as exc:
+                errs.append(f"خطا در محاسبه درصد تحقق هدف: {exc}")
+
+        if val is None and not errs:
+            errs.append("مقدار هدف صفر یا نامعتبر است؛ درصد تحقق قابل محاسبه نیست.")
+
+        std_kpis.append(_make_std(
+            kpi_id="std_target_achievement",
+            name="درصد تحقق هدف",
+            description="درصد تحقق فروش واقعی نسبت به هدف (با پشتیبانی از هدف ستونی، منبع مرتبط بدون Fan-out یا هدف دستی).",
+            formula=ta_formula,
+            display_format="percentage",
+            unit="%",
+            base_fields=b_fields,
+            source_datasets=used_ds,
+            value=val,
+            target_value=t_val_num,
+            computability_status="uncomputable" if errs else ("computable_with_warning" if warns else "computable"),
+            warnings_fa=warns,
+            errors_fa=errs,
+            join_valid=j_valid,
+            comparison_basis="مقایسه فروش واقعی با مقدار هدف",
+            comparison_mode="target",
+            priority=6,
+            field_primary=s_fn,
+            multi_source_agg=msa_ta,
+        ))
+
+    # ------------------------------------------------------------------
+    # 7. نرخ تأخیر (Delay Rate % - with explicit eligible & delayed rules)
+    # ------------------------------------------------------------------
+    elig_cond = None
+    del_cond = None
+    elig_fa = None
+    del_fa = None
+    dr_fields: list[str] = []
+    dr_ds_list = [ds.name]
+    dr_formula = "SUM(CASE WHEN <eligible> AND <delayed> THEN 1.0 ELSE 0.0 END) * 100.0 / NULLIF(SUM(CASE WHEN <eligible> THEN 1.0 ELSE 0.0 END), 0)"
+
+    cancel_excl_sql = f' AND COALESCE(CAST("{cancel_status_col}" AS VARCHAR), \'\') NOT IN ({", ".join(cancel_vals_sql)})' if cancel_status_col and cancel_vals_sql else ""
+    cancel_note_fa = f" و وضعیت «{cancel_status_col}» لغو نباشد" if cancel_status_col else ""
+
+    if delivery_f and due_f and delivery_f["_is_primary"] and due_f["_is_primary"] and delivery_f["field_name"] != due_f["field_name"]:
+        afn, dfn = delivery_f["field_name"], due_f["field_name"]
+        elig_cond = f'TRY_CAST("{afn}" AS TIMESTAMP) IS NOT NULL AND TRY_CAST("{dfn}" AS TIMESTAMP) IS NOT NULL{cancel_excl_sql}'
+        del_cond = f'TRY_CAST("{afn}" AS TIMESTAMP) > TRY_CAST("{dfn}" AS TIMESTAMP)'
+        elig_fa = f"کلیه رکوردهای دارای تاریخ «{delivery_f['display_name']}» و تاریخ سررسید «{due_f['display_name']}» معتبر{cancel_note_fa}"
+        del_fa = f"مواردی که تاریخ «{delivery_f['display_name']}» از تاریخ «{due_f['display_name']}» دیرتر بوده است"
+        dr_fields = [afn, dfn] + ([cancel_status_col] if cancel_status_col else [])
+    elif dur_f and sla_f and dur_f["_is_primary"] and sla_f["_is_primary"] and dur_f["field_name"] != sla_f["field_name"]:
+        wfn, sfn_sla = dur_f["field_name"], sla_f["field_name"]
+        elig_cond = f'"{wfn}" IS NOT NULL AND "{sfn_sla}" IS NOT NULL AND "{sfn_sla}" > 0{cancel_excl_sql}'
+        del_cond = f'"{wfn}" > "{sfn_sla}"'
+        elig_fa = f"کلیه رکوردهای دارای مدت زمان «{dur_f['display_name']}» و سقف مجاز مثبت «{sla_f['display_name']}»{cancel_note_fa}"
+        del_fa = f"مواردی که «{dur_f['display_name']}» از سقف مجاز «{sla_f['display_name']}» بیشتر باشد"
+        dr_fields = [wfn, sfn_sla] + ([cancel_status_col] if cancel_status_col else [])
+    elif delay_days_f and delay_days_f["_is_primary"]:
+        ddfn = delay_days_f["field_name"]
+        elig_cond = f'"{ddfn}" IS NOT NULL{cancel_excl_sql}'
+        del_cond = f'"{ddfn}" > 0'
+        elig_fa = f"کلیه رکوردهای دارای مقدار غیرخالی در «{delay_days_f['display_name']}»{cancel_note_fa}"
+        del_fa = f"مواردی که «{delay_days_f['display_name']}» بزرگ‌تر از صفر باشد"
+        dr_fields = [ddfn] + ([cancel_status_col] if cancel_status_col else [])
+    elif delay_flag_f and delay_flag_f["_is_primary"]:
+        dffn = delay_flag_f["field_name"]
+        if delay_flag_f.get("data_type") == "boolean" or delay_flag_f.get("raw_type", "").lower() in ("bool", "boolean"):
+            elig_cond = f'"{dffn}" IS NOT NULL{cancel_excl_sql}'
+            del_cond = f'CAST("{dffn}" AS BOOLEAN) = TRUE'
+            elig_fa = f"کلیه رکوردهای دارای وضعیت مشخص در «{delay_flag_f['display_name']}»{cancel_note_fa}"
+            del_fa = f"مواردی که پرچم «{delay_flag_f['display_name']}» برابر True باشد"
+            dr_fields = [dffn]
+        else:
+            obs_df = [str(tv.get("value", "")) for tv in (delay_flag_f.get("stats", {}).get("top_values") or [])]
+            del_tokens = {"delayed", "late", "overdue", "breached", "1", "true", "yes", "تأخیر", "تاخیر", "تاخیردار", "تأخیردار", "بله"}
+            matched_del = [v for v in obs_df if v.strip().lower() in del_tokens]
+            if matched_del:
+                q_del = ", ".join("'" + v.replace("'", "''") + "'" for v in matched_del[:5])
+                elig_cond = f'"{dffn}" IS NOT NULL{cancel_excl_sql}'
+                del_cond = f'CAST("{dffn}" AS VARCHAR) IN ({q_del})'
+                elig_fa = f"کلیه رکوردهای دارای وضعیت مشخص در «{delay_flag_f['display_name']}»{cancel_note_fa}"
+                del_fa = f"مواردی که مقدار «{delay_flag_f['display_name']}» جزو ({'، '.join(matched_del[:3])}) باشد"
+                dr_fields = [dffn]
+
+    if not elig_cond or not del_cond:
+        std_kpis.append(_make_std(
+            kpi_id="std_delay_rate",
+            name="نرخ تأخیر",
+            description="نسبت موارد تأخیردار به کل موارد واجد شرایط (درصد).",
+            formula=dr_formula,
+            display_format="percentage",
+            unit="%",
+            direction="lower_is_better",
+            missing_fields=["delivery_and_due_date_or_sla"],
+            missing_fields_fa=["فیلدهای تاریخ تحویل واقعی و تاریخ سررسید، یا مدت انتظار و SLA، یا ستون روز/وضعیت تأخیر"],
+            computability_status="needs_data",
+            fields_exist=False,
+            eligible_definition_fa="نیازمند ستون‌های تاریخ تحویل/سررسید یا SLA برای تعریف موارد واجد شرایط",
+            delayed_definition_fa="نیازمند مبنای مقایسه جهت تشخیص تأخیر",
+            priority=7,
+        ))
+    else:
+        dr_formula = (
+            f'SUM(CASE WHEN ({elig_cond}) AND ({del_cond}) THEN 1.0 ELSE 0.0 END) * 100.0 '
+            f'/ NULLIF(SUM(CASE WHEN ({elig_cond}) THEN 1.0 ELSE 0.0 END), 0)'
+        )
+        warns = []
+        errs = []
+        val = None
+        try:
+            dr_r = warehouse.execute_query(
+                f'SELECT '
+                f'SUM(CASE WHEN ({elig_cond}) THEN 1.0 ELSE 0.0 END) AS elig_cnt, '
+                f'SUM(CASE WHEN ({elig_cond}) AND ({del_cond}) THEN 1.0 ELSE 0.0 END) AS del_cnt, '
+                f'COUNT(*) AS tot_cnt '
+                f'FROM ({sub_sql}) AS _dr',
+                sub_params, limit=1,
+            )["rows"]
+            elig_cnt = int(round(float(dr_r[0]["elig_cnt"] or 0))) if dr_r else 0
+            del_cnt = int(round(float(dr_r[0]["del_cnt"] or 0))) if dr_r else 0
+            tot_cnt = int((dr_r[0]["tot_cnt"] or 0)) if dr_r else 0
+            excl_cnt = max(0, tot_cnt - elig_cnt)
+            if elig_cnt == 0:
+                errs.append("هیچ رکورد واجد شرایطی برای محاسبه نرخ تأخیر وجود ندارد (مخرج صفر).")
+            else:
+                val = (del_cnt * 100.0) / elig_cnt
+                if excl_cnt > 0:
+                    warns.append(f"{excl_cnt:,} رکورد فاقد تاریخ معتبر یا لغوشده از مخرج مستثنی شد (واجد شرایط: {elig_cnt:,} | تأخیردار: {del_cnt:,}).")
+        except Exception as exc:
+            errs.append(f"خطا در محاسبه نرخ تأخیر: {exc}")
+
+        std_kpis.append(_make_std(
+            kpi_id="std_delay_rate",
+            name="نرخ تأخیر",
+            description="نسبت دقیق موارد تأخیردار به کل موارد واجد شرایط بر حسب درصد (مقدار کمتر بهتر است).",
+            formula=dr_formula,
+            display_format="percentage",
+            unit="%",
+            direction="lower_is_better",
+            base_fields=dr_fields,
+            source_datasets=dr_ds_list,
+            value=val,
+            computability_status="uncomputable" if errs else ("computable_with_warning" if warns else "computable"),
+            warnings_fa=warns,
+            errors_fa=errs,
+            comparison_basis="بر اساس رکوردهای واجد شرایط",
+            eligible_definition_fa=elig_fa,
+            delayed_definition_fa=del_fa,
+            priority=7,
+            field_primary=dr_fields[0] if dr_fields else None,
+        ))
+
+    return std_kpis, rel_plan
 
 
 def _normalize_formula_signature(expr: str) -> str:
@@ -917,6 +2035,7 @@ class IntelligentKpiEngine:
         domain_info: dict[str, Any],
         related_dataset_ids: Optional[list[str]] = None,
         target_values: Optional[dict[str, float]] = None,
+        calendar_mode: str = "gregorian",
     ) -> dict[str, Any]:
         t0 = time.perf_counter()
         row_count = int(deep_profile.get("row_count") or 0)
@@ -1923,13 +3042,67 @@ class IntelligentKpiEngine:
             except Exception:
                 pass
 
-        # --- 4.12 Score, Deduplicate, and Classify Statuses ---
-        all_computable = [c for c in valid_to_eval if c.get("status") != "uncomputable" and c.get("value") is not None] + growth_kpis
+        # --- 4.12 Evaluate 7 Standard KPIs, Merge, Score, Deduplicate & Classify ---
+        std_kpis, std_rel_plan = _evaluate_standard_kpis(
+            db,
+            ds,
+            user,
+            deep_profile,
+            classifications,
+            sub_sql,
+            sub_params,
+            partner_ids,
+            eff_targets,
+            calendar_mode=calendar_mode,
+        )
+        std_computable = [
+            sk for sk in std_kpis
+            if sk["computability_status"] in ("computable", "computable_with_warning") and sk.get("value") is not None
+        ]
+        std_needs_data = [sk for sk in std_kpis if sk["computability_status"] == "needs_data"]
+        std_uncomputable = [sk for sk in std_kpis if sk["computability_status"] == "uncomputable"]
+
+        # Deduplicate redundant auto-discovered KPIs against computable standard KPIs
+        std_ids_computable = {sk["id"] for sk in std_computable}
+        std_sales_field = next((sk.get("field") for sk in std_computable if sk["id"] == "std_total_sales"), None)
+        std_cust_field = next((sk.get("field") for sk in std_computable if sk["id"] == "std_unique_customers"), None)
+        superseded_ids: set[str] = set()
+        if "std_total_sales" in std_ids_computable and std_sales_field:
+            superseded_ids.add(f"sum_{std_sales_field}")
+        if "std_profit_margin" in std_ids_computable:
+            superseded_ids.add("profit_margin_pct")
+        if "std_aov" in std_ids_computable:
+            superseded_ids.add("avg_order_value")
+        if "std_unique_customers" in std_ids_computable and std_cust_field:
+            superseded_ids.add(f"distinct_{std_cust_field}")
+        if "std_target_achievement" in std_ids_computable:
+            superseded_ids.add("target_achievement_pct")
+
+        std_sigs = {_normalize_formula_signature(sk["formula"]) for sk in std_computable}
+        discovered_computable = [
+            c for c in ([x for x in valid_to_eval if x.get("status") != "uncomputable" and x.get("value") is not None] + growth_kpis)
+            if c.get("id") not in superseded_ids and (c.get("is_data_quality") or _normalize_formula_signature(c.get("formula", "")) not in std_sigs)
+        ]
+
+        # Transfer comparison sparkline/previous info onto std_total_sales when available
+        if std_sales_field:
+            for c in valid_to_eval:
+                if c.get("id") == f"sum_{std_sales_field}" and c.get("sparkline_values"):
+                    for sk in std_computable:
+                        if sk["id"] == "std_total_sales":
+                            sk.setdefault("sparkline_values", c.get("sparkline_values"))
+                            if sk.get("previous_value") is None and c.get("previous_value") is not None:
+                                sk["previous_value"] = c["previous_value"]
+                                sk["comparison_basis"] = c.get("comparison_basis") or sk["comparison_basis"]
+
+        all_computable = std_computable + discovered_computable
         for c in valid_to_eval:
             if c.get("status") != "uncomputable" and c.get("value") is None:
                 c["status"] = "uncomputable"
                 c["rejection_reason_fa"] = "مقدار خروجی به دلیل خالی بودن تمام مقادیر یا صفر بودن مخرج (NULLIF) قابل محاسبه نبود."
                 rejected_kpis.append(c)
+
+        rejected_kpis = std_uncomputable + rejected_kpis
 
         t_meta = list((deep_profile.get("temporal_summary") or {}).values())
         default_period = f"{t_meta[0]['min_date']} تا {t_meta[0]['max_date']}" if t_meta else f"کل {row_count:,} رکورد"
@@ -1944,7 +3117,7 @@ class IntelligentKpiEngine:
             ).all()
         }
 
-        for kpi in all_computable:
+        for idx_k, kpi in enumerate(all_computable):
             req_fields = kpi.get("required_fields") or []
             req_comp = (
                 min(
@@ -1955,16 +3128,17 @@ class IntelligentKpiEngine:
             )
             dq_score = deep_profile["completeness_pct"] / 100.0
             cat = kpi["category"]
-            diversity_bonus = 0.08 if cat in ("ratio", "growth", "comparison", "domain", "compound") else (0.04 if cat == "temporal" else 0.0)
-            raw_score = (
-                kpi.get("importance", 0.7) * 34.0
-                + kpi.get("domain_fit", 0.65) * 24.0
-                + dq_score * 12.0
-                + kpi.get("confidence", 0.85) * 14.0
-                + req_comp * 10.0
-                + diversity_bonus * 100.0
-            )
-            kpi["score"] = round(min(100.0, max(0.0, raw_score)), 1)
+            diversity_bonus = 0.08 if cat in ("ratio", "growth", "comparison", "domain", "compound", "standard") else (0.04 if cat == "temporal" else 0.0)
+            if not kpi.get("is_standard"):
+                raw_score = (
+                    kpi.get("importance", 0.7) * 34.0
+                    + kpi.get("domain_fit", 0.65) * 24.0
+                    + dq_score * 12.0
+                    + kpi.get("confidence", 0.85) * 14.0
+                    + req_comp * 10.0
+                    + diversity_bonus * 100.0
+                )
+                kpi["score"] = round(min(100.0, max(0.0, raw_score)), 1)
             kpi.setdefault("period", default_period)
             kpi.setdefault("source", " + ".join(kpi.get("source_datasets") or [ds.name]))
             kpi["computed_at"] = computed_at
@@ -1974,18 +3148,23 @@ class IntelligentKpiEngine:
             sm_match = existing_metrics.get((kpi.get("formula") or "").strip().lower())
             kpi["registered_metric_id"] = sm_match.id if sm_match else None
             kpi["is_favorite"] = bool((sm_match.kpi_metadata_json or {}).get("favorite")) if sm_match else False
+            _enrich_kpi_metadata(kpi, idx_priority=int(kpi.get("priority") or (10 + idx_k)))
+
+        for sk in std_needs_data + rejected_kpis:
+            sk["computed_at"] = computed_at
+            _enrich_kpi_metadata(sk, idx_priority=int(sk.get("priority") or 99))
 
         # Adaptive dynamic selection — NO arbitrary "first 3 fields" rule!
         business_kpis = [k for k in all_computable if not k.get("is_data_quality")]
         dq_kpis = [k for k in all_computable if k.get("is_data_quality")]
-        business_kpis.sort(key=lambda k: (-int(k.get("is_favorite", False)), -k["score"]))
+        business_kpis.sort(key=lambda k: (-int(k.get("is_standard", False)), -int(k.get("is_favorite", False)), int(k.get("priority", 50)), -k["score"]))
 
         # Select diverse top business KPIs scaled to dataset richness (min 2, up to 14 on rich multi-field tables)
         max_selected = min(max(4, len(measures_additive) * 2 + len(measures_semi) + 3), 14)
         selected_ids: set[str] = set()
         cat_counts: dict[str, int] = {}
 
-        # Guarantee diversity across high-scoring categories first
+        # Guarantee computable standard KPIs & diverse high-scoring categories first
         for k in business_kpis:
             if k.get("needs_user_confirmation"):
                 k["status"] = "needs_confirmation"
@@ -1994,8 +3173,8 @@ class IntelligentKpiEngine:
                 k["status"] = "suggested"
                 continue
             cat = k["category"]
-            cap_per_cat = 5 if cat in ("aggregate", "domain", "ratio") else 2
-            if cat_counts.get(cat, 0) < cap_per_cat or k["score"] >= 86.0:
+            cap_per_cat = 7 if cat in ("standard", "aggregate", "domain", "ratio") else 2
+            if k.get("is_standard") or cat_counts.get(cat, 0) < cap_per_cat or k["score"] >= 86.0:
                 k["status"] = "selected"
                 selected_ids.add(k["id"])
                 cat_counts[cat] = cat_counts.get(cat, 0) + 1
@@ -2007,16 +3186,27 @@ class IntelligentKpiEngine:
             business_kpis[0]["status"] = "selected"
             selected_ids.add(business_kpis[0]["id"])
 
+        for k in business_kpis:
+            k["suggested_selected"] = (k["status"] == "selected")
+
         for dq in dq_kpis:
             dq["status"] = "selected" if dq["id"] == "dq_completeness_pct" else "suggested"
+            _enrich_kpi_metadata(dq, idx_priority=90)
+
+        all_candidates = list(std_kpis) + [k for k in business_kpis if not k.get("is_standard")] + [
+            r for r in rejected_kpis if not r.get("is_standard")
+        ]
 
         return {
+            "standard": std_kpis,
             "selected": [k for k in business_kpis if k["status"] == "selected"],
             "suggested": [k for k in business_kpis if k["status"] == "suggested"],
             "needs_confirmation": [k for k in business_kpis if k["status"] == "needs_confirmation"],
+            "needs_data": std_needs_data,
             "data_quality": dq_kpis,
             "uncomputable": rejected_kpis,
             "all_business": business_kpis,
+            "all_candidates": all_candidates,
             "multi_source_analysis": multi_source_info,
             "kpi_engine_ms": round((time.perf_counter() - t0) * 1000, 2),
         }
@@ -2036,6 +3226,8 @@ class IntelligentKpiEngine:
         date_range: Optional[dict[str, Any]] = None,
         max_pages: int = 7,
         selected_kpi_ids: Optional[list[str]] = None,
+        confirmed_kpis: Optional[list[dict[str, Any]]] = None,
+        auto_generate_kpis: bool = False,
         custom_kpis: Optional[list[dict[str, Any]]] = None,
         target_values: Optional[dict[str, float]] = None,
         related_dataset_ids: Optional[list[str]] = None,
@@ -2048,75 +3240,218 @@ class IntelligentKpiEngine:
             db, ds, user, deep_profile, classifications, domain_info,
             related_dataset_ids=related_dataset_ids,
             target_values=target_values,
+            calendar_mode=calendar_mode,
         )
 
-        # Merge user custom KPIs (strictly AST + CLS validated)
-        all_biz = list(kpi_bundle["all_business"])
-        if custom_kpis:
-            for idx, ck in enumerate(custom_kpis):
-                c_formula = str(ck.get("formula") or "").strip()
-                c_name = str(ck.get("name") or f"شاخص سفارشی {idx + 1}").strip()
-                if not c_formula:
-                    continue
-                try:
+        # Build lookup across ALL discovered & standard KPIs
+        cand_by_id: dict[str, dict[str, Any]] = {}
+        for lst_key in ("standard", "all_business", "needs_data", "data_quality", "uncomputable"):
+            for item in (kpi_bundle.get(lst_key) or []):
+                cand_by_id.setdefault(item["id"], item)
+
+        sec_ctx_val = (
+            build_data_security_context(db, user, ds.id)
+            if user is not None
+            else DataSecurityContext("sys", [], [], set(), {}, "sys")
+        )
+        sub_sql_ck, sub_p_ck, _ = build_security_projection_and_where(
+            ds.warehouse_table, warehouse.describe_table(ds.warehouse_table), sec_ctx_val
+        )
+        all_ds_ids = [ds.id, *(related_dataset_ids or [])]
+
+        def _compile_and_eval_confirmed_kpi(ck: dict[str, Any], base: Optional[dict[str, Any]], idx: int) -> dict[str, Any]:
+            merged = dict(base or {})
+            k_id = str(ck.get("id") or merged.get("id") or f"custom_{idx + 1}")
+            k_name = str(ck.get("name") or merged.get("name") or f"شاخص {idx + 1}").strip()
+            k_formula = str(ck.get("formula") or merged.get("formula") or "").strip()
+            k_fmt = str(ck.get("display_format") or ck.get("format_type") or merged.get("display_format") or merged.get("format_type") or "number")
+            k_unit = str(ck.get("unit") if ck.get("unit") is not None else merged.get("unit") or "")
+            if k_fmt == "percentage" and not k_unit:
+                k_unit = "%"
+            elif k_fmt == "currency" and not k_unit:
+                k_unit = "ریال"
+            k_prio = int(ck.get("priority") if ck.get("priority") is not None else (merged.get("priority") or (idx + 1)))
+            k_comp_mode = str(ck.get("comparison_mode") or merged.get("comparison_mode") or "none")
+            k_target = _safe_float(ck.get("target_value") if "target_value" in ck else merged.get("target_value"))
+            k_base_fields = list(ck.get("base_fields") or merged.get("base_fields") or [])
+            k_msa = ck.get("multi_source_agg") or merged.get("multi_source_agg")
+            k_pre_grain = ck.get("pre_agg_grain") or merged.get("pre_agg_grain")
+
+            # Special case: user resolved std_target_achievement via manual target entry
+            if k_id == "std_target_achievement" and base and base.get("computability_status") == "needs_data":
+                if k_target and k_target > 0 and base.get("base_fields"):
+                    sf = base["base_fields"][0]
+                    k_formula = f'COALESCE(SUM("{sf}"), 0) * 100.0 / NULLIF({k_target}, 0)'
+                    k_comp_mode = "target"
+                    merged["computability_status"] = "computable_with_warning"
+                else:
+                    raise ValueError(f"شاخص «{k_name}» نیازمند تکمیل فیلد هدف یا وارد کردن مقدار هدف دستی معتبر است.")
+
+            formula_changed = bool(base and k_formula and _normalize_formula_signature(k_formula) != _normalize_formula_signature(base.get("formula", "")))
+            if base and base.get("computability_status") in ("needs_data", "uncomputable") and not formula_changed and not (k_id == "std_target_achievement" and k_target and k_target > 0):
+                raise ValueError(
+                    base.get("rejection_reason_fa")
+                    or f"شاخص «{k_name}» در وضعیت «{base.get('computability_status_fa', 'غیرقابل محاسبه')}» است و قابل تولید نیست."
+                )
+
+            if not k_formula:
+                raise ValueError(f"فرمول شاخص «{k_name}» نمی‌تواند خالی باشد.")
+
+            val = merged.get("value")
+            comp_sql = merged.get("compiled_sql") or k_formula
+            # Re-validate and execute whenever custom, formula modified, or manual target updated
+            if (not base) or formula_changed or (k_id == "std_target_achievement" and k_target and base and base.get("computability_status") == "needs_data"):
+                if k_msa and not formula_changed:
+                    jsql, jparams, _ = build_visual_query_sql(
+                        db, ds, {"multi_source_agg": k_msa, "calendar_mode": calendar_mode, "limit": 1},
+                        [], [], [], user=user, enforce_join_rbac=True,
+                    )
+                    jr = warehouse.execute_query(jsql, jparams, limit=1)["rows"]
+                    val = _safe_float(jr[0].get("value")) if jr else None
+                    k_msa = k_msa
+                else:
+                    k_msa = None
                     if user is not None:
                         v = validate_and_compile_formula(
                             db,
                             user,
-                            dataset_ids=[ds.id],
-                            formula=c_formula,
+                            dataset_ids=all_ds_ids,
+                            formula=k_formula,
                             calculation_type="analytical_metric",
                             qualify_with_alias=False,
                             auto_safe_divide=False,
                         )
                         comp_sql = v["compiled_sql"]
+                        if v.get("is_aov_macro"):
+                            k_pre_grain = {"grain_field": v["order_field"], "measure_field": v["amount_field"], "grain_agg": "SUM"}
+                        else:
+                            k_pre_grain = None
                     else:
-                        validate_formula_ast(c_formula, allowed_columns={f["field_name"] for f in classifications})
-                        comp_sql = c_formula
-                    sec_ctx = build_data_security_context(db, user, ds.id) if user is not None else DataSecurityContext("sys", [], [], set(), {}, "sys")
-                    sub_sql, sub_p, _ = build_security_projection_and_where(ds.warehouse_table, warehouse.describe_table(ds.warehouse_table), sec_ctx)
-                    r1 = warehouse.execute_query(f"SELECT ({comp_sql}) AS v FROM ({sub_sql}) AS _ck", sub_p, limit=1)["rows"]
-                    val = _safe_float(r1[0]["v"]) if r1 else None
-                    all_biz.insert(0, {
-                        "id": ck.get("id") or f"custom_{idx + 1}",
-                        "slug": f"custom_{idx + 1}",
-                        "name": c_name,
-                        "category": ck.get("category") or "custom",
-                        "formula": c_formula,
-                        "compiled_sql": comp_sql,
-                        "aggregation": ck.get("aggregation") or "FORMULA",
-                        "field": ck.get("field"),
-                        "format_type": ck.get("format_type") or "number",
-                        "unit": ck.get("unit") or "",
-                        "target_value": _safe_float(ck.get("target_value")),
-                        "value": round(val, 4) if val is not None else None,
-                        "formatted_value": _format_kpi_value(val, ck.get("format_type") or "number", ck.get("unit") or ""),
-                        "source_datasets": [ds.name],
-                        "source": ds.name,
-                        "period": "کل داده",
-                        "confidence": 0.99,
-                        "score": 99.0,
-                        "status": "selected",
-                        "limitations": [],
-                    })
+                        validate_formula_ast(k_formula, allowed_columns={f["field_name"] for f in classifications})
+                        comp_sql = k_formula
+
+                    # Execute via build_visual_query_sql so AOV/MOM_CALENDAR macros compile cleanly
+                    v_spec_p: dict[str, Any] = {"formula": k_formula, "calendar_mode": calendar_mode, "limit": 1}
+                    if merged.get("time_field"):
+                        v_spec_p["time_field"] = merged["time_field"]
+                    if k_pre_grain:
+                        v_spec_p["pre_agg_grain"] = k_pre_grain
+                    psql, pparams, _ = build_visual_query_sql(db, ds, v_spec_p, [], [], [], user=user)
+                    pr = warehouse.execute_query(psql, pparams, limit=1)["rows"]
+                    val = _safe_float(pr[0].get("value")) if pr else None
+
+            out = {
+                **merged,
+                "id": k_id,
+                "slug": merged.get("slug") or re.sub(r"[^a-z0-9_]+", "_", k_id.lower()).strip("_") or f"kpi_{idx + 1}",
+                "name": k_name,
+                "category": ck.get("category") or merged.get("category") or "custom",
+                "formula": k_formula,
+                "compiled_sql": comp_sql,
+                "base_fields": k_base_fields,
+                "required_fields": k_base_fields or merged.get("required_fields") or [],
+                "format_type": k_fmt,
+                "display_format": k_fmt,
+                "unit": k_unit,
+                "priority": k_prio,
+                "comparison_mode": k_comp_mode,
+                "target_value": k_target,
+                "multi_source_agg": k_msa,
+                "pre_agg_grain": k_pre_grain,
+                "value": round(val, 4) if val is not None else None,
+                "formatted_value": _format_kpi_value(val, k_fmt, k_unit),
+                "source_datasets": merged.get("source_datasets") or [ds.name],
+                "source": merged.get("source") or ds.name,
+                "period": merged.get("period") or "کل بازه داده‌ها",
+                "confidence": float(merged.get("confidence") or 0.96),
+                "score": float(merged.get("score") or 95.0),
+                "status": "selected",
+                "computability_status": merged.get("computability_status") if merged.get("computability_status") in ("computable", "computable_with_warning") else "computable",
+                "limitations": list(merged.get("limitations") or []),
+            }
+            return _enrich_kpi_metadata(out, idx_priority=k_prio)
+
+        # Merge user custom KPIs (strictly AST + CLS validated)
+        custom_resolved: list[dict[str, Any]] = []
+        if custom_kpis:
+            for idx, ck in enumerate(custom_kpis):
+                c_formula = str(ck.get("formula") or "").strip()
+                if not c_formula:
+                    continue
+                try:
+                    custom_resolved.append(_compile_and_eval_confirmed_kpi(ck, None, idx))
                 except Exception:
                     continue
 
-        if selected_kpi_ids:
-            sel_set = set(selected_kpi_ids)
-            active_kpis = [k for k in all_biz if k["id"] in sel_set]
-            if not active_kpis:
-                active_kpis = list(kpi_bundle["selected"])
+        # ------------------------------------------------------------------
+        # STRICT KPI CONFIRMATION GUARD (Zero silent auto-generation!)
+        # ------------------------------------------------------------------
+        explicitly_confirmed_mode = False
+        if confirmed_kpis is not None:
+            if len(confirmed_kpis) == 0:
+                if auto_generate_kpis:
+                    active_kpis = list(kpi_bundle["selected"])
+                else:
+                    raise ValueError(
+                        "هیچ KPI انتخاب و تأیید نشده است. لطفاً حداقل یک KPI معتبر را انتخاب کنید یا حالت تولید خودکار را صراحتاً فعال نمایید."
+                    )
+            else:
+                active_kpis = []
+                for idx, ck in enumerate(confirmed_kpis):
+                    base_match = cand_by_id.get(str(ck.get("id") or ""))
+                    active_kpis.append(_compile_and_eval_confirmed_kpi(ck, base_match, idx))
+                explicitly_confirmed_mode = True
+        elif selected_kpi_ids is not None:
+            if len(selected_kpi_ids) == 0:
+                if auto_generate_kpis:
+                    active_kpis = list(kpi_bundle["selected"])
+                else:
+                    raise ValueError(
+                        "هیچ KPI انتخاب نشده است. حداقل یک KPI را انتخاب کنید یا حالت تولید خودکار را صراحتاً فعال نمایید."
+                    )
+            else:
+                by_id_all = {**cand_by_id, **{c["id"]: c for c in custom_resolved}}
+                active_kpis = []
+                for pos, kid in enumerate(selected_kpi_ids):
+                    item = by_id_all.get(kid)
+                    if not item:
+                        continue
+                    if item.get("computability_status") in ("needs_data", "uncomputable"):
+                        if kid == "std_target_achievement" and target_values and (target_values.get(kid) or target_values.get("target")):
+                            tv = float(target_values.get(kid) or target_values.get("target"))
+                            active_kpis.append(_compile_and_eval_confirmed_kpi({"id": kid, "target_value": tv, "priority": pos + 1}, item, pos))
+                            continue
+                        raise ValueError(
+                            item.get("rejection_reason_fa")
+                            or f"شاخص «{item.get('name', kid)}» در وضعیت «{item.get('computability_status_fa')}» است و قابل تولید نیست."
+                        )
+                    cp = dict(item)
+                    cp["priority"] = cp.get("priority") or (pos + 1)
+                    active_kpis.append(cp)
+                if not active_kpis:
+                    raise ValueError("هیچ یک از KPIهای انتخاب‌شده معتبر یا قابل محاسبه نبود.")
+                explicitly_confirmed_mode = True
         else:
-            active_kpis = list(kpi_bundle["selected"])
+            if custom_resolved:
+                active_kpis = custom_resolved
+                explicitly_confirmed_mode = True
+            elif auto_generate_kpis:
+                active_kpis = list(kpi_bundle["selected"])
+            else:
+                raise ValueError(
+                    "انتخاب و تأیید KPIها پیش از تولید داشبورد الزامی است. لطفاً حداقل یک KPI را تأیید کنید یا حالت تولید خودکار را صراحتاً فعال نمایید."
+                )
 
         # Apply target overrides onto active KPIs
         if target_values:
             for k in active_kpis:
                 if k["id"] in target_values:
                     k["target_value"] = float(target_values[k["id"]])
-                elif k.get("field") in target_values:
+                elif k.get("field") and k["field"] in target_values:
                     k["target_value"] = float(target_values[k["field"]])
+
+        # Respect user priority sorting strictly
+        active_kpis.sort(key=lambda k: (int(k.get("priority") or 99), -float(k.get("score") or 0)))
 
         row_count = int(deep_profile.get("row_count") or 0)
         time_cols = [c for c in classifications if c["semantic_class"] == "Date/Time" and c.get("stats", {}).get("temporal")]
@@ -2129,8 +3464,14 @@ class IntelligentKpiEngine:
             c for c in classifications
             if c["semantic_class"] in ("Category", "Status", "Geographic") and 2 <= int(c["stats"].get("distinct_count") or 0) <= 60
         ]
-        # Prefer moderate cardinality (3..15) first for clean charts
-        dim_cols.sort(key=lambda c: (0 if 3 <= c["stats"]["distinct_count"] <= 15 else 1, c["stats"]["distinct_count"]))
+        # Prefer Customer / Product / Unit / Category / Region dimensions with clean cardinality (3..15)
+        def _dim_rank(c: dict[str, Any]) -> tuple[int, int, int]:
+            fn_l = c["field_name"].lower()
+            biz_dim = 0 if any(t in fn_l for t in ("customer", "product", "unit", "department", "category", "region", "branch", "مشتری", "محصول", "واحد", "دسته‌بندی", "منطقه")) else 1
+            card_pref = 0 if 3 <= int(c["stats"].get("distinct_count") or 0) <= 15 else 1
+            return (biz_dim, card_pref, int(c["stats"].get("distinct_count") or 0))
+
+        dim_cols.sort(key=_dim_rank)
         geo_cols = [c for c in classifications if c["semantic_class"] == "Geographic" and 2 <= int(c["stats"].get("distinct_count") or 0) <= 80]
         status_cols = [c for c in classifications if c["semantic_class"] == "Status" and 2 <= int(c["stats"].get("distinct_count") or 0) <= 20]
         meas_add = [c for c in classifications if c["sum_allowed"] and c["data_type"] == "numeric"]
@@ -2170,7 +3511,7 @@ class IntelligentKpiEngine:
         def _probe_widget_query(vspec: dict[str, Any]) -> Optional[dict[str, Any]]:
             try:
                 sql_str, q_params, _ = build_visual_query_sql(
-                    db, ds, vspec, eff_filters, [], [], user=user, enforce_join_rbac=bool(vspec.get("joins"))
+                    db, ds, vspec, eff_filters, [], [], user=user, enforce_join_rbac=bool(vspec.get("joins") or vspec.get("multi_source_agg"))
                 )
                 res = warehouse.execute_query(sql_str, q_params, limit=120)
                 if user is not None:
@@ -2192,6 +3533,7 @@ class IntelligentKpiEngine:
             narrative_fa: str = "",
             provenance: Optional[dict[str, Any]] = None,
             drill_hierarchy: Optional[list[dict[str, str]]] = None,
+            drill_through_page_key: Optional[str] = None,
             skip_probe: bool = False,
             allow_empty: bool = False,
             dedup_key: Optional[str] = None,
@@ -2224,6 +3566,7 @@ class IntelligentKpiEngine:
                 "visualization": visualization or {"show_legend": True, "show_tooltip": True},
                 "advanced": adv,
                 "drill_hierarchy": drill_hierarchy or [],
+                "drill_through_page_key": drill_through_page_key,
                 "preview_rows": probe["rows"][:25] if probe else [],
             }
 
@@ -2236,24 +3579,52 @@ class IntelligentKpiEngine:
                 return f"{d_col}_yr", f"STRFTIME(DATE_TRUNC('year', TRY_CAST({d_col} AS DATE)), '%Y')"
             return f"{d_col}_ym", f"STRFTIME(DATE_TRUNC('month', TRY_CAST({d_col} AS DATE)), '%Y-%m')"
 
+        # Derive chart measure strictly from confirmed KPIs when user explicitly confirmed KPIs!
         pm_field = primary_measure["field_name"] if primary_measure else "*"
         pm_disp = primary_measure["display_name"] if primary_measure else "تعداد رکورد"
         pm_agg = primary_measure["default_aggregation"] if primary_measure else "COUNT"
+        pm_formula_override: Optional[str] = None
+
+        active_ids_set = {k["id"] for k in active_kpis}
+        sales_oriented_active = any(
+            k["id"] in ("std_total_sales", "std_profit_margin", "std_mom_growth", "std_aov", "std_target_achievement")
+            or (primary_measure and k.get("field") == primary_measure["field_name"])
+            for k in active_kpis
+        )
+        if explicitly_confirmed_mode and not sales_oriented_active and active_kpis:
+            lead_k = active_kpis[0]
+            if lead_k.get("formula") and not lead_k.get("multi_source_agg"):
+                pm_formula_override = lead_k["formula"]
+                pm_disp = lead_k["name"]
+            elif lead_k.get("field"):
+                pm_field = lead_k["field"]
+                pm_agg = lead_k.get("aggregation", "SUM")
+                pm_disp = lead_k["name"]
+
+        def _chart_measure_spec(extra: dict[str, Any]) -> dict[str, Any]:
+            if pm_formula_override:
+                return {**extra, "formula": pm_formula_override, "calendar_mode": calendar_mode}
+            return {**extra, "y_field": pm_field, "aggregation": pm_agg}
+
         prim_dim = dim_cols[0] if dim_cols else None
         sec_dim = dim_cols[1] if len(dim_cols) > 1 else None
-
+        default_drill_hier = [{"field": d["field_name"]} for d in dim_cols[:3]]
         pages: list[dict[str, Any]] = []
 
         # ==============================================================
         # PAGE 1: نمای کلی مدیریتی (Executive Overview)
         # ==============================================================
         p1_widgets: list[dict[str, Any]] = []
-        kpi_cap = 3 if detail_level == "summary" else (6 if detail_level == "standard" else 9)
+        kpi_cap = max(len(active_kpis), 12) if explicitly_confirmed_mode else (3 if detail_level == "summary" else (6 if detail_level == "standard" else 9))
         top_kpis = active_kpis[:kpi_cap]
         cur_y = 0
 
         for idx, k in enumerate(top_kpis):
-            vspec = {"joins": k.get("joins") or [], "limit": 1}
+            vspec: dict[str, Any] = {"joins": k.get("joins") or [], "calendar_mode": calendar_mode, "limit": 1}
+            if k.get("multi_source_agg"):
+                vspec["multi_source_agg"] = k["multi_source_agg"]
+            if k.get("pre_agg_grain"):
+                vspec["pre_agg_grain"] = k["pre_agg_grain"]
             if k.get("formula"):
                 vspec["formula"] = k["formula"]
             elif k.get("field"):
@@ -2262,33 +3633,48 @@ class IntelligentKpiEngine:
             if k.get("time_field"):
                 vspec["time_field"] = k["time_field"]
 
+            eff_fmt = k.get("display_format") or k.get("format_type") or "number"
+            eff_comp = k.get("comparison_mode") or "none"
             k_style: dict[str, Any] = {
-                "number_format": k.get("format_type", "number"),
-                "decimals": 1 if k.get("format_type") in ("percentage", "duration") else 0,
-                "abbreviate": k.get("format_type") != "percentage",
+                "number_format": eff_fmt,
+                "decimals": 1 if eff_fmt in ("percentage", "duration") else 0,
+                "abbreviate": eff_fmt != "percentage",
                 "unit": k.get("unit", ""),
             }
-            if k.get("previous_value") is not None:
+            if eff_comp == "previous_period" and k.get("previous_value") is not None:
                 k_style["previous_value"] = k["previous_value"]
-            if k.get("target_value") is not None:
+            elif eff_comp == "target" and k.get("target_value") is not None:
                 k_style["target_value"] = k["target_value"]
+            elif not explicitly_confirmed_mode:
+                if k.get("previous_value") is not None:
+                    k_style["previous_value"] = k["previous_value"]
+                if k.get("target_value") is not None:
+                    k_style["target_value"] = k["target_value"]
             if k.get("sparkline_values"):
                 k_style["sparkline_values"] = k["sparkline_values"]
 
-            # Choose kpi, gauge (if percentage 0..100), or bullet (if target exists)
+            # Choose kpi, gauge (for delay rate / SLA / secondary percentage), or bullet (when target set)
             k_chart = "kpi"
-            if k.get("target_value") is not None and idx < 2 and template_mode != "operational":
-                k_chart = "bullet" if idx == 0 else "kpi"
+            if k["id"] == "std_delay_rate" or "delay" in k["id"] or "sla_breach" in k["id"]:
+                k_chart = "gauge"
+                k_style["max_value"] = 100
+            elif eff_comp == "target" and k.get("target_value") is not None and idx < 2 and template_mode != "operational":
+                k_chart = "bullet" if (idx == 0 or not explicitly_confirmed_mode) else "kpi"
                 k_style["max_value"] = max(float(k["target_value"]) * 1.25, float(k.get("value") or 0) * 1.1, 100.0)
-            elif k.get("format_type") == "percentage" and k.get("value") is not None and 0 <= float(k["value"]) <= 100 and idx >= 3:
+            elif not explicitly_confirmed_mode and k.get("target_value") is not None and idx == 0 and template_mode != "operational":
+                k_chart = "bullet"
+                k_style["max_value"] = max(float(k["target_value"]) * 1.25, float(k.get("value") or 0) * 1.1, 100.0)
+            elif eff_fmt == "percentage" and k.get("value") is not None and 0 <= float(k["value"]) <= 100 and idx >= 3:
                 k_chart = "gauge"
                 k_style["max_value"] = 100
 
-            lims_txt = f" محدودیت: {' '.join(k['limitations'])}" if k.get("limitations") else ""
+            lims_txt = f" محدودیت/هشدار: {' '.join(k['limitations'])}" if k.get("limitations") else ""
             comp_txt = f" | مبنا: {k['comparison_basis']}" if k.get("comparison_basis") else ""
+            elig_txt = ""
+            if k.get("eligible_definition_fa") and k.get("delayed_definition_fa"):
+                elig_txt = f" | واجد شرایط: {k['eligible_definition_fa']} | شرط تأخیر: {k['delayed_definition_fa']}"
             narr = (
-                f"{k['name']}: {k.get('formatted_value', '—')} (منبع: {k.get('source', ds.name)}؛ بازه: {k.get('period', 'کل داده')}؛ "
-                f"اطمینان: {int(round(k.get('confidence', 0.9) * 100))}%{comp_txt}).{lims_txt}"
+                f"{k['name']}: {k.get('formatted_value', '—')} (منبع: {k.get('source', ds.name)}؛ بازه: {k.get('period', 'کل داده')}{comp_txt}{elig_txt}).{lims_txt}"
             )
             kpi_slot = len(p1_widgets)
             w = _make_widget(
@@ -2302,14 +3688,22 @@ class IntelligentKpiEngine:
                     "kpi_id": k["id"],
                     "kpi_category": k["category"],
                     "formula": k["formula"],
+                    "base_fields": k.get("base_fields") or [],
                     "value": k.get("value"),
                     "comparison_basis": k.get("comparison_basis"),
+                    "comparison_mode": eff_comp,
+                    "display_format": eff_fmt,
+                    "priority": k.get("priority"),
                     "period": k.get("period"),
                     "confidence": k.get("confidence"),
                     "limitations": k.get("limitations", []),
+                    "eligible_definition_fa": k.get("eligible_definition_fa"),
+                    "delayed_definition_fa": k.get("delayed_definition_fa"),
                     "computed_at": k.get("computed_at"),
                     "sources_used": k.get("source_datasets") or [ds.name],
                 },
+                drill_hierarchy=default_drill_hier,
+                drill_through_page_key="details",
                 dedup_key=f"p1_kpi_{k['id']}",
             )
             if w:
@@ -2318,19 +3712,17 @@ class IntelligentKpiEngine:
         if p1_widgets:
             cur_y = ((len(p1_widgets) - 1) // 3 + 1) * 4
 
-        # Overview Primary Chart 1: Trend (if time >= 2 periods) or Primary Breakdown
+        # Overview Primary Chart 1: Monthly/Time Trend (using confirmed KPI's measure)
         row_x = 0
-        if primary_time and time_periods >= 2 and primary_measure:
+        if primary_time and time_periods >= 2 and (primary_measure or pm_formula_override):
             tx_f, tx_expr = _make_time_x(primary_time["field_name"])
-            t_spec = {
+            t_spec = _chart_measure_spec({
                 "x_field": tx_f,
                 "x_formula": tx_expr,
-                "y_field": pm_field,
-                "aggregation": pm_agg,
                 "sort_by": tx_f,
                 "sort_dir": "ASC",
                 "limit": 36,
-            }
+            })
             p_probe = _probe_widget_query(t_spec)
             if p_probe and len(p_probe["rows"]) >= 2:
                 narr_t = _build_factual_narrative_fa(
@@ -2350,20 +3742,19 @@ class IntelligentKpiEngine:
                     layout={"x": row_x, "y": cur_y, "w": 6, "h": 8},
                     narrative_fa=narr_t,
                     drill_hierarchy=[{"field": tx_f}] + ([{"field": prim_dim["field_name"]}] if prim_dim else []),
+                    drill_through_page_key="details",
                     skip_probe=True,
-                    dedup_key=f"trend_{tx_f}_{pm_field}",
+                    dedup_key=f"trend_{tx_f}_{pm_disp}",
                 )
                 if w_tr:
                     p1_widgets.append(w_tr)
                     row_x = 6
 
         if prim_dim:
-            b_spec = {
+            b_spec = _chart_measure_spec({
                 "x_field": prim_dim["field_name"],
-                "y_field": pm_field,
-                "aggregation": pm_agg,
                 "limit": 12,
-            }
+            })
             b_probe = _probe_widget_query(b_spec)
             if b_probe and len(b_probe["rows"]) >= 1:
                 narr_b = _build_factual_narrative_fa(
@@ -2383,8 +3774,9 @@ class IntelligentKpiEngine:
                     layout={"x": row_x, "y": cur_y, "w": 6 if row_x == 6 else 12, "h": 8},
                     narrative_fa=narr_b,
                     drill_hierarchy=[{"field": prim_dim["field_name"]}] + ([{"field": sec_dim["field_name"]}] if sec_dim else []),
+                    drill_through_page_key="details",
                     skip_probe=True,
-                    dedup_key=f"ov_bar_{prim_dim['field_name']}_{pm_field}",
+                    dedup_key=f"ov_bar_{prim_dim['field_name']}_{pm_disp}",
                 )
                 if w_br:
                     p1_widgets.append(w_br)
@@ -2394,6 +3786,41 @@ class IntelligentKpiEngine:
         if row_x == 6:
             row_x = 0
             cur_y += 8
+
+        # Overview Comparative Chart (Sales vs Cost/Profit or Actual vs Target) when confirmed KPIs include them
+        cost_col_ov = next((c for c in classifications if c["semantic_class"] == "Cost"), None)
+        profit_col_ov = next((c for c in classifications if c["semantic_class"] == "Profit"), None)
+        comp_sec_col = cost_col_ov or profit_col_ov or target_col
+        if sales_oriented_active and primary_measure and comp_sec_col and comp_sec_col["field_name"] != pm_field and (primary_time and time_periods >= 2 or prim_dim):
+            cx_field = f"{primary_time['field_name']}_ym" if (primary_time and time_periods >= 2) else prim_dim["field_name"]  # type: ignore[index]
+            cx_formula = _make_time_x(primary_time["field_name"])[1] if (primary_time and time_periods >= 2) else None
+            cmp_spec: dict[str, Any] = {
+                "x_field": cx_field,
+                "y_field": pm_field,
+                "aggregation": pm_agg,
+                "secondary_y_field": comp_sec_col["field_name"],
+                "secondary_aggregation": comp_sec_col["default_aggregation"],
+                "sort_by": cx_field if cx_formula else "value",
+                "sort_dir": "ASC" if cx_formula else "DESC",
+                "limit": 24,
+            }
+            if cx_formula:
+                cmp_spec["x_formula"] = cx_formula
+            cmp_pr = _probe_widget_query(cmp_spec)
+            if cmp_pr and len(cmp_pr["rows"]) >= 2:
+                w_cmp = _make_widget(
+                    title=f"مقایسه {pm_disp} در برابر {comp_sec_col['display_name']}",
+                    chart_type="combo",
+                    visual_spec=cmp_spec,
+                    layout={"x": 0, "y": cur_y, "w": 12, "h": 8},
+                    narrative_fa=f"نمودار مقایسه‌ای هم‌زمان «{pm_disp}» و «{comp_sec_col['display_name']}» بر اساس شاخص‌های منتخب داشبورد.",
+                    drill_through_page_key="details",
+                    skip_probe=True,
+                    dedup_key=f"ov_cmp_{pm_field}_{comp_sec_col['field_name']}",
+                )
+                if w_cmp:
+                    p1_widgets.append(w_cmp)
+                    cur_y += 8
 
         # Always guarantee BPMN diagram on Overview when process schema detected!
         if bpmn_cfg:
@@ -2455,12 +3882,11 @@ class IntelligentKpiEngine:
 
             # Stacked area across primary dimension over time
             if prim_dim and prim_dim["stats"]["distinct_count"] <= 10:
-                sa_spec = {
+                sa_spec = _chart_measure_spec({
                     "x_field": tx_f, "x_formula": tx_expr,
                     "series_field": prim_dim["field_name"],
-                    "y_field": pm_field, "aggregation": pm_agg,
                     "sort_by": tx_f, "sort_dir": "ASC", "limit": 200,
-                }
+                })
                 sa_pr = _probe_widget_query(sa_spec)
                 if sa_pr and len(sa_pr["rows"]) >= 2:
                     w_sa = _make_widget(
@@ -2469,6 +3895,7 @@ class IntelligentKpiEngine:
                         visual_spec=sa_spec,
                         layout={"x": 6 if p2_widgets else 0, "y": p2_y, "w": 6 if p2_widgets else 12, "h": 8},
                         narrative_fa=f"تغییرات سهم و روند هر «{prim_dim['display_name']}» در طول زمان بر اساس {len(sa_pr['rows'])} نقطه ثبت‌شده در «{ds.name}».",
+                        drill_through_page_key="details",
                         skip_probe=True,
                         dedup_key=f"p2_stacked_area_{tx_f}_{prim_dim['field_name']}",
                     )
@@ -2479,12 +3906,11 @@ class IntelligentKpiEngine:
                 p2_y += 8
 
             # Period waterfall / cumulative or second measure trend
-            if primary_measure and primary_measure["sum_allowed"]:
-                wf_spec = {
+            if (primary_measure and primary_measure["sum_allowed"]) or pm_formula_override:
+                wf_spec = _chart_measure_spec({
                     "x_field": tx_f, "x_formula": tx_expr,
-                    "y_field": pm_field, "aggregation": "SUM",
                     "sort_by": tx_f, "sort_dir": "ASC", "limit": 24,
-                }
+                })
                 wf_pr = _probe_widget_query(wf_spec)
                 if wf_pr and len(wf_pr["rows"]) >= 3:
                     w_wf = _make_widget(
@@ -2497,23 +3923,22 @@ class IntelligentKpiEngine:
                             source_names=[ds.name], x_field=tx_f, y_label=pm_disp,
                             rows=wf_pr["rows"], total_records=row_count, calendar_mode=calendar_mode,
                         ),
+                        drill_through_page_key="details",
                         skip_probe=True,
-                        dedup_key=f"p2_wf_{tx_f}_{pm_field}",
+                        dedup_key=f"p2_wf_{tx_f}_{pm_disp}",
                     )
                     if w_wf:
                         p2_widgets.append(w_wf)
                         p2_y += 8
 
-            if time_gran == "daily" and detail_level != "summary" and primary_measure:
-                cal_spec = {
+            if time_gran == "daily" and detail_level != "summary" and (primary_measure or pm_formula_override):
+                cal_spec = _chart_measure_spec({
                     "x_field": f"{primary_time['field_name']}_cal",
                     "x_formula": f"STRFTIME(TRY_CAST({primary_time['field_name']} AS DATE), '%Y-%m-%d')",
-                    "y_field": pm_field,
-                    "aggregation": pm_agg,
                     "sort_by": f"{primary_time['field_name']}_cal",
                     "sort_dir": "ASC",
                     "limit": 365,
-                }
+                })
                 cal_pr = _probe_widget_query(cal_spec)
                 if cal_pr and len(cal_pr["rows"]) >= 5:
                     w_cal = _make_widget(
@@ -2522,8 +3947,9 @@ class IntelligentKpiEngine:
                         visual_spec=cal_spec,
                         layout={"x": 0, "y": p2_y, "w": 12, "h": 7},
                         narrative_fa=f"تراکم روزانه «{pm_disp}» در {len(cal_pr['rows'])} روز ثبت‌شده در «{ds.name}».",
+                        drill_through_page_key="details",
                         skip_probe=True,
-                        dedup_key=f"p2_cal_{primary_time['field_name']}_{pm_field}",
+                        dedup_key=f"p2_cal_{primary_time['field_name']}_{pm_disp}",
                     )
                     if w_cal:
                         p2_widgets.append(w_cal)
@@ -2545,7 +3971,7 @@ class IntelligentKpiEngine:
 
             # Donut / Pie share for low-cardinality primary dimension
             if prim_dim and prim_dim["stats"]["distinct_count"] <= 9:
-                d_spec = {"x_field": prim_dim["field_name"], "y_field": pm_field, "aggregation": pm_agg, "limit": 9}
+                d_spec = _chart_measure_spec({"x_field": prim_dim["field_name"], "limit": 9})
                 d_pr = _probe_widget_query(d_spec)
                 if d_pr and len(d_pr["rows"]) >= 2:
                     w_d = _make_widget(
@@ -2558,21 +3984,20 @@ class IntelligentKpiEngine:
                             source_names=[ds.name], x_field=prim_dim["field_name"],
                             y_label=pm_disp, rows=d_pr["rows"], total_records=row_count,
                         ),
+                        drill_through_page_key="details",
                         skip_probe=True,
-                        dedup_key=f"p3_donut_{prim_dim['field_name']}_{pm_field}",
+                        dedup_key=f"p3_donut_{prim_dim['field_name']}_{pm_disp}",
                     )
                     if w_d:
                         p3_widgets.append(w_d)
 
             # Grouped Bar or Stacked Bar when 2 dimensions exist!
             if prim_dim and sec_dim:
-                gb_spec = {
+                gb_spec = _chart_measure_spec({
                     "x_field": prim_dim["field_name"],
                     "series_field": sec_dim["field_name"],
-                    "y_field": pm_field,
-                    "aggregation": pm_agg,
                     "limit": 80,
-                }
+                })
                 gb_pr = _probe_widget_query(gb_spec)
                 if gb_pr and len(gb_pr["rows"]) >= 2:
                     w_gb = _make_widget(
@@ -2581,6 +4006,7 @@ class IntelligentKpiEngine:
                         visual_spec=gb_spec,
                         layout={"x": 6 if p3_widgets else 0, "y": p3_y, "w": 6 if p3_widgets else 12, "h": 8},
                         narrative_fa=f"تحلیل تقاطعی «{prim_dim['display_name']}» و «{sec_dim['display_name']}» برای سنجش ترکیب «{pm_disp}» در {len(gb_pr['rows'])} گروه.",
+                        drill_through_page_key="details",
                         skip_probe=True,
                         dedup_key=f"p3_grouped_{prim_dim['field_name']}_{sec_dim['field_name']}",
                     )
@@ -2588,7 +4014,7 @@ class IntelligentKpiEngine:
                         p3_widgets.append(w_gb)
             elif sec_dim or (prim_dim and prim_dim["stats"]["distinct_count"] > 6):
                 t_dim = sec_dim or prim_dim
-                tm_spec = {"x_field": t_dim["field_name"], "y_field": pm_field, "aggregation": pm_agg, "limit": 20}
+                tm_spec = _chart_measure_spec({"x_field": t_dim["field_name"], "limit": 20})
                 tm_pr = _probe_widget_query(tm_spec)
                 if tm_pr and len(tm_pr["rows"]) >= 2:
                     w_tm = _make_widget(
@@ -2601,8 +4027,9 @@ class IntelligentKpiEngine:
                             source_names=[ds.name], x_field=t_dim["field_name"],
                             y_label=pm_disp, rows=tm_pr["rows"], total_records=row_count,
                         ),
+                        drill_through_page_key="details",
                         skip_probe=True,
-                        dedup_key=f"p3_treemap_{t_dim['field_name']}_{pm_field}",
+                        dedup_key=f"p3_treemap_{t_dim['field_name']}_{pm_disp}",
                     )
                     if w_tm:
                         p3_widgets.append(w_tm)
@@ -2613,7 +4040,7 @@ class IntelligentKpiEngine:
             # Geo map if geographic column exists
             if geo_cols and geo_cols[0]["field_name"] != (prim_dim["field_name"] if prim_dim else ""):
                 gf = geo_cols[0]
-                g_spec = {"x_field": gf["field_name"], "y_field": pm_field, "aggregation": pm_agg, "limit": 25}
+                g_spec = _chart_measure_spec({"x_field": gf["field_name"], "limit": 25})
                 g_pr = _probe_widget_query(g_spec)
                 if g_pr and len(g_pr["rows"]) >= 2:
                     w_geo = _make_widget(
@@ -3052,9 +4479,12 @@ class IntelligentKpiEngine:
         max_pages: int = 7,
         theme_id: Optional[str] = None,
         selected_kpi_ids: Optional[list[str]] = None,
+        confirmed_kpis: Optional[list[dict[str, Any]]] = None,
+        auto_generate_kpis: bool = False,
         custom_kpis: Optional[list[dict[str, Any]]] = None,
         target_values: Optional[dict[str, float]] = None,
         related_dataset_ids: Optional[list[str]] = None,
+        dashboard_id: Optional[str] = None,
     ) -> tuple[Dashboard, dict[str, Any]]:
         plan = IntelligentKpiEngine.build_intelligent_dashboard_plan(
             db, ds, user=user,
@@ -3064,6 +4494,8 @@ class IntelligentKpiEngine:
             date_range=date_range,
             max_pages=max_pages,
             selected_kpi_ids=selected_kpi_ids,
+            confirmed_kpis=confirmed_kpis,
+            auto_generate_kpis=auto_generate_kpis,
             custom_kpis=custom_kpis,
             target_values=target_values,
             related_dataset_ids=related_dataset_ids,
@@ -3079,41 +4511,118 @@ class IntelligentKpiEngine:
             chosen_theme = db.query(DashboardTheme).filter(DashboardTheme.organization_id == user.organization_id).first()
 
         domain_fa = plan["domain_detection"]["primary_domain_fa"]
-        dash = Dashboard(
-            workspace_id=workspace_id,
-            title=title or f"داشبورد هوشمند {ds.name}",
-            description=(
-                f"داشبورد خودکار چندصفحه‌ای ({domain_fa}) | "
-                f"{len(plan['active_kpis'])} شاخص کلیدی منتخب در {len(plan['pages'])} صفحه | "
-                f"قالب: {template_mode}"
-            ),
-            theme_id=chosen_theme.id if chosen_theme else None,
-            settings_json={
-                "ai_generated": True,
-                "engine_version": "intelligent_kpi_v2",
-                "domain": plan["domain_detection"]["primary_domain"],
-                "domain_fa": domain_fa,
+        persisted_kpi_specs = [
+            {
+                "id": k["id"],
+                "name": k["name"],
+                "formula": k["formula"],
+                "base_fields": k.get("base_fields") or [],
+                "display_format": k.get("display_format") or k.get("format_type") or "number",
+                "format_type": k.get("display_format") or k.get("format_type") or "number",
+                "unit": k.get("unit") or "",
+                "priority": int(k.get("priority") or (idx + 1)),
+                "comparison_mode": k.get("comparison_mode") or "none",
+                "target_value": k.get("target_value"),
+                "is_standard": bool(k.get("is_standard", False)),
+                "multi_source_agg": k.get("multi_source_agg"),
+                "pre_agg_grain": k.get("pre_agg_grain"),
+            }
+            for idx, k in enumerate(plan["active_kpis"])
+        ]
+        settings_payload = {
+            "ai_generated": True,
+            "engine_version": "intelligent_kpi_v3",
+            "domain": plan["domain_detection"]["primary_domain"],
+            "domain_fa": domain_fa,
+            "template_mode": template_mode,
+            "detail_level": detail_level,
+            "calendar_mode": calendar_mode,
+            "kpis_selected_count": len(plan["active_kpis"]),
+            "kpi_config": {
+                "dataset_id": ds.id,
+                "related_dataset_ids": list(related_dataset_ids or []),
+                "selected_kpi_ids": [k["id"] for k in plan["active_kpis"]],
+                "confirmed_kpis": persisted_kpi_specs,
                 "template_mode": template_mode,
                 "detail_level": detail_level,
                 "calendar_mode": calendar_mode,
-                "kpis_selected_count": len(plan["active_kpis"]),
+                "auto_generate_kpis": bool(auto_generate_kpis),
             },
-            created_by=user.id,
+        }
+        dash_desc = (
+            f"داشبورد هوشمند ({domain_fa}) | "
+            f"{len(plan['active_kpis'])} شاخص تأییدشده در {len(plan['pages'])} صفحه | "
+            f"قالب: {template_mode}"
         )
-        db.add(dash)
-        db.flush()
 
-        total_widgets = 0
+        # Support updating an existing dashboard in-place when user returns to edit KPIs
+        dash: Optional[Dashboard] = None
+        if dashboard_id:
+            from app.models.dashboard import Workspace as WsModel, WidgetFilter
+            dash = (
+                db.query(Dashboard)
+                .join(WsModel, WsModel.id == Dashboard.workspace_id)
+                .filter(Dashboard.id == dashboard_id, WsModel.organization_id == user.organization_id)
+                .first()
+            )
+            if not dash:
+                raise PermissionError("داشبورد مورد نظر برای ویرایش KPIها یافت نشد یا مجوز دسترسی ندارید.")
+            if not permission_resolver.resolve(db, user, "dashboard", dash.id, "edit").allowed:
+                raise PermissionError("مجوز ویرایش این داشبورد را ندارید.")
+
+            old_w_ids = [r[0] for r in db.query(Widget.id).filter(Widget.dashboard_id == dash.id).all()]
+            old_p_ids = [r[0] for r in db.query(DashboardPage.id).filter(DashboardPage.dashboard_id == dash.id).all()]
+            if old_w_ids:
+                db.query(DataLineage).filter(DataLineage.target_type == "widget", DataLineage.target_id.in_(old_w_ids)).delete(synchronize_session=False)
+                db.query(WidgetFilter).filter(WidgetFilter.widget_id.in_(old_w_ids)).delete(synchronize_session=False)
+                db.query(WidgetDrillRule).filter(WidgetDrillRule.widget_id.in_(old_w_ids)).delete(synchronize_session=False)
+                db.query(WidgetConfig).filter(WidgetConfig.widget_id.in_(old_w_ids)).delete(synchronize_session=False)
+                db.query(WidgetQuery).filter(WidgetQuery.widget_id.in_(old_w_ids)).delete(synchronize_session=False)
+                db.query(Widget).filter(Widget.id.in_(old_w_ids)).delete(synchronize_session=False)
+            if old_p_ids:
+                db.query(DashboardLayout).filter(DashboardLayout.page_id.in_(old_p_ids)).delete(synchronize_session=False)
+                db.query(DashboardPage).filter(DashboardPage.id.in_(old_p_ids)).delete(synchronize_session=False)
+            db.query(DashboardFilter).filter(DashboardFilter.dashboard_id == dash.id).delete(synchronize_session=False)
+
+            dash.title = title or dash.title
+            dash.description = dash_desc
+            if theme_id and chosen_theme:
+                dash.theme_id = chosen_theme.id
+            dash.settings_json = {**(dash.settings_json or {}), **settings_payload}
+            db.flush()
+        else:
+            dash = Dashboard(
+                workspace_id=workspace_id,
+                title=title or f"داشبورد هوشمند {ds.name}",
+                description=dash_desc,
+                theme_id=chosen_theme.id if chosen_theme else None,
+                settings_json=settings_payload,
+                created_by=user.id,
+            )
+            db.add(dash)
+            db.flush()
+
+        # Pass 1: Persist all DashboardPages so drill_through_page_id can reference `details` page ID
+        persisted_pages: list[tuple[DashboardPage, dict[str, Any]]] = []
+        details_page_id: Optional[str] = None
         for p_idx, page_spec in enumerate(plan["pages"]):
+            pkey = page_spec.get("page_key", f"page_{p_idx}")
+            is_det = (pkey == "details")
             page = DashboardPage(
                 dashboard_id=dash.id,
                 title=page_spec["title"],
                 page_order=p_idx,
-                settings_json={"page_key": page_spec.get("page_key", f"page_{p_idx}")},
+                is_drill_through=is_det,
+                settings_json={"page_key": pkey},
             )
             db.add(page)
             db.flush()
+            if is_det:
+                details_page_id = page.id
+            persisted_pages.append((page, page_spec))
 
+        total_widgets = 0
+        for page, page_spec in persisted_pages:
             layout_items: list[dict[str, Any]] = []
             for w_spec in page_spec["widgets"]:
                 lay = w_spec["layout"]
@@ -3148,8 +4657,15 @@ class IntelligentKpiEngine:
                         advanced_json=w_spec.get("advanced", {"ai_generated": True}),
                     )
                 )
-                if w_spec.get("drill_hierarchy"):
-                    db.add(WidgetDrillRule(widget_id=w.id, hierarchy_json=w_spec["drill_hierarchy"]))
+                dt_page_id = details_page_id if (w_spec.get("drill_through_page_key") == "details" and details_page_id and page.id != details_page_id) else None
+                if w_spec.get("drill_hierarchy") or dt_page_id:
+                    db.add(
+                        WidgetDrillRule(
+                            widget_id=w.id,
+                            hierarchy_json=w_spec.get("drill_hierarchy") or [],
+                            drill_through_page_id=dt_page_id,
+                        )
+                    )
                 db.add(
                     DataLineage(
                         source_type="dataset",
@@ -3188,11 +4704,13 @@ class IntelligentKpiEngine:
 
         db.commit()
         db.refresh(dash)
+        cache_manager.invalidate_prefix(f"dash:{user.organization_id}:{dash.id}")
         return dash, {
             "pages_count": len(plan["pages"]),
             "widgets_count": total_widgets,
             "kpis_selected": len(plan["active_kpis"]),
             "domain": plan["domain_detection"],
+            "kpi_config": settings_payload["kpi_config"],
         }
 
     # ------------------------------------------------------------------
@@ -3259,8 +4777,10 @@ class IntelligentKpiEngine:
         user: User,
         ds: Dataset,
         kpis: list[dict[str, Any]],
+        related_dataset_ids: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
         registered: list[dict[str, Any]] = []
+        ds_ids = [ds.id, *(related_dataset_ids or [])]
         for idx, k in enumerate(kpis):
             name = str(k.get("name") or f"KPI {idx + 1}").strip()[:160]
             raw_slug = str(k.get("slug") or k.get("id") or name).strip().lower()
@@ -3273,7 +4793,7 @@ class IntelligentKpiEngine:
             res = validate_and_compile_formula(
                 db,
                 user,
-                dataset_ids=[ds.id],
+                dataset_ids=ds_ids,
                 formula=formula,
                 calculation_type="analytical_metric",
                 qualify_with_alias=False,
@@ -3284,9 +4804,18 @@ class IntelligentKpiEngine:
                 SemanticMetric.slug == slug,
             ).first()
 
+            fmt_type = str(k.get("display_format") or k.get("format_type") or "number")
             meta_payload = {
                 "limitations": k.get("limitations") or [],
                 "comparison_basis": k.get("comparison_basis"),
+                "comparison_mode": k.get("comparison_mode") or "none",
+                "display_format": fmt_type,
+                "priority": int(k.get("priority") or (idx + 1)),
+                "base_fields": k.get("base_fields") or [f["field_name"] for f in res["referenced_fields"]],
+                "is_standard": bool(k.get("is_standard", False)),
+                "computability_status": k.get("computability_status") or "computable",
+                "eligible_definition_fa": k.get("eligible_definition_fa"),
+                "delayed_definition_fa": k.get("delayed_definition_fa"),
                 "source_datasets": k.get("source_datasets") or [ds.name],
                 "favorite": bool(k.get("is_favorite", False)),
                 "direction": k.get("direction", "higher_is_better"),
@@ -3296,7 +4825,7 @@ class IntelligentKpiEngine:
             if existing:
                 existing.name = name
                 existing.formula = formula
-                existing.format_type = str(k.get("format_type") or "number")
+                existing.format_type = fmt_type
                 existing.unit = str(k.get("unit") or "")
                 existing.category = str(k.get("category") or "analytical")
                 existing.confidence = float(k.get("confidence") or 1.0)
@@ -3314,7 +4843,7 @@ class IntelligentKpiEngine:
                     slug=slug,
                     description=str(k.get("description") or k.get("comparison_basis") or ""),
                     formula=formula,
-                    format_type=str(k.get("format_type") or "number"),
+                    format_type=fmt_type,
                     unit=str(k.get("unit") or ""),
                     metric_kind="kpi_engine",
                     output_data_type=res["output_data_type"],
