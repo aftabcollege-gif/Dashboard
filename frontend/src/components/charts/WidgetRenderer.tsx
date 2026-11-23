@@ -147,8 +147,9 @@ function StandardWidgetRenderer({
     const val = rows[0]?.[yField] ?? rows[0]?.[columns[0]] ?? 0;
     const numericVal = Number(val) || 0;
     const target = Number(styleConfig.target_value || 0);
+    const hasPrev = styleConfig.previous_value !== undefined && styleConfig.previous_value !== null && Number(styleConfig.previous_value) !== 0;
     const prev = Number(styleConfig.previous_value || 0);
-    const pctChange = prev > 0 ? ((numericVal - prev) / prev) * 100 : null;
+    const pctChange = hasPrev ? ((numericVal - prev) / Math.abs(prev)) * 100 : null;
     const targetPct = target > 0 ? Math.min(100, Math.round((numericVal / target) * 100)) : null;
     const statusColor =
       targetPct === null
@@ -159,12 +160,19 @@ function StandardWidgetRenderer({
         ? "#f59e0b"
         : "#ef4444";
 
-    // Generate smooth deterministic sparkline from value
-    const sparkPts = [0.68, 0.74, 0.71, 0.82, 0.79, 0.91, 1.0].map((m, idx) => ({
-      x: idx * 20,
-      y: 28 - m * 22,
-    }));
-    const poly = sparkPts.map((p) => `${p.x},${p.y}`).join(" ");
+    const rawSpark: number[] | null =
+      Array.isArray(styleConfig.sparkline_values) && styleConfig.sparkline_values.length >= 2
+        ? styleConfig.sparkline_values.map((x: any) => Number(x) || 0)
+        : null;
+    const sparkNorm = (() => {
+      if (!rawSpark) return [0.68, 0.74, 0.71, 0.82, 0.79, 0.91, 1.0];
+      const mn = Math.min(...rawSpark);
+      const mx = Math.max(...rawSpark);
+      const span = mx - mn || 1;
+      return rawSpark.map((v) => 0.15 + ((v - mn) / span) * 0.85);
+    })();
+    const stepX = sparkNorm.length > 1 ? 120 / (sparkNorm.length - 1) : 20;
+    const poly = sparkNorm.map((m, idx) => `${(idx * stepX).toFixed(1)},${(28 - m * 22).toFixed(1)}`).join(" ");
 
     return (
       <div className="h-full flex flex-col justify-between p-0.5 sm:p-1">
@@ -237,6 +245,53 @@ function StandardWidgetRenderer({
             </div>
           );
         })}
+      </div>
+    );
+  }
+
+  // ---------------- 2b. BULLET CHART ----------------
+  if (chartType === "bullet") {
+    const items = rows.slice(0, 8).map((r, idx) => {
+      const lbl = rows.length === 1 && !visualSpec.x_field ? (styleConfig.unit ? `شاخص (${styleConfig.unit})` : "عملکرد فعلی") : String(r[xField] ?? `Item ${idx + 1}`);
+      const actual = Number(r[yField] ?? r[columns[0]] ?? 0);
+      const tgt = secField ? Number(r[secField] ?? 0) : Number(styleConfig.target_value || actual * 1.15 || 100);
+      const maxScale = Math.max(actual * 1.1, tgt * 1.2, 1);
+      const actualPct = Math.min(100, Math.max(0, (actual / maxScale) * 100));
+      const targetPct = Math.min(99, Math.max(1, (tgt / maxScale) * 100));
+      const achievedPct = tgt > 0 ? Math.round((actual / tgt) * 100) : 100;
+      const barColor = achievedPct >= 95 ? "#10b981" : achievedPct >= 75 ? palette[0] : "#f59e0b";
+      return { lbl, actual, tgt, actualPct, targetPct, achievedPct, barColor, rawX: r[xField] };
+    });
+
+    return (
+      <div className="h-full overflow-y-auto flex flex-col justify-center space-y-3 pr-1">
+        {items.map((it, idx) => (
+          <div
+            key={idx}
+            className="space-y-1 cursor-pointer hover:opacity-90"
+            onClick={() => it.rawX !== undefined && onPointClick?.(xField, it.rawX)}
+          >
+            <div className="flex justify-between text-xs font-medium gap-2">
+              <span className="truncate">{it.lbl}</span>
+              <span className="shrink-0 text-[11px]">
+                {formatBIValue(it.actual, numFmt, decimals, unit, true)} / {formatBIValue(it.tgt, numFmt, decimals, unit, true)} ({it.achievedPct}%)
+              </span>
+            </div>
+            <div className="relative h-5 rounded-md overflow-hidden flex bg-slate-500/15">
+              <div className="h-full bg-slate-500/15" style={{ width: "55%" }} />
+              <div className="h-full bg-slate-500/10" style={{ width: "25%" }} />
+              <div
+                className="absolute top-1.5 bottom-1.5 left-0 rounded transition-all"
+                style={{ width: `${it.actualPct}%`, background: it.barColor }}
+              />
+              <div
+                className="absolute top-0.5 bottom-0.5 w-0.5 bg-red-500 shadow"
+                style={{ left: `${it.targetPct}%` }}
+                title={`هدف: ${it.tgt}`}
+              />
+            </div>
+          </div>
+        ))}
       </div>
     );
   }
@@ -620,6 +675,43 @@ function buildEChartsOption(ctx: {
         itemStyle: { borderRadius: [0, 4, 4, 0] },
         data: cats.map((c) => rows.filter((r) => String(r[xField]) === c).reduce((a, b) => a + Number(b[yField] ?? 0), 0)),
       }],
+    };
+  }
+
+  if (chartType === "grouped_bar") {
+    if (seriesField) {
+      const { sNames, lookup } = buildSeriesMap();
+      return {
+        textStyle: { fontFamily },
+        color: palette,
+        tooltip: baseTooltip,
+        legend: legendOpt,
+        grid: compactGrid,
+        xAxis: { type: "category", data: cats, axisLabel: xAxisLabel },
+        yAxis: { type: "value", axisLabel: yAxisLabel, splitLine },
+        series: sNames.map((s) => ({
+          name: s,
+          type: "bar",
+          barGap: "12%",
+          itemStyle: { borderRadius: [3, 3, 0, 0] },
+          data: cats.map((c) => lookup[s]?.[c] || 0),
+        })),
+      };
+    }
+    return {
+      textStyle: { fontFamily },
+      color: palette,
+      tooltip: baseTooltip,
+      legend: legendOpt,
+      grid: compactGrid,
+      xAxis: { type: "category", data: cats, axisLabel: xAxisLabel },
+      yAxis: { type: "value", axisLabel: yAxisLabel, splitLine },
+      series: [
+        { name: yField, type: "bar" as const, itemStyle: { borderRadius: [3, 3, 0, 0] }, data: rows.map((r) => Number(r[yField] ?? 0)) },
+        ...(secField
+          ? [{ name: secField, type: "bar" as const, itemStyle: { borderRadius: [3, 3, 0, 0] }, data: rows.map((r) => Number(r[secField] ?? 0)) }]
+          : []),
+      ],
     };
   }
 

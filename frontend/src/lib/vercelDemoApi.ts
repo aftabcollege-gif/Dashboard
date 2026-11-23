@@ -2200,18 +2200,210 @@ export async function handleVercelDemoApi(
       },
     };
   }
+  // Intelligent KPI & Semantic Class Discovery (Demo Preview Parity)
+  if (method === "GET" && path === "/ai/semantic-classes") {
+    return {
+      status: 200,
+      body: [
+        { id: "Additive Measure", name_fa: "سنجه جمع‌پذیر", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Semi-additive Measure", name_fa: "سنجه نیمه‌جمع‌پذیر", policy: "semi_additive", default_agg: "LAST_VALUE", sum_allowed: false },
+        { id: "Non-additive Measure", name_fa: "سنجه غیرجمع‌پذیر", policy: "non_additive", default_agg: "AVG", sum_allowed: false },
+        { id: "Count Measure", name_fa: "سنجه شمارشی", policy: "count", default_agg: "SUM", sum_allowed: true },
+        { id: "Ratio", name_fa: "نسبت", policy: "non_additive", default_agg: "AVG", sum_allowed: false },
+        { id: "Percentage", name_fa: "درصد / نرخ", policy: "non_additive", default_agg: "AVG", sum_allowed: false },
+        { id: "Currency", name_fa: "مبلغ مالی", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Duration", name_fa: "مدت زمان / تاخیر", policy: "duration", default_agg: "AVG", sum_allowed: true },
+        { id: "Date/Time", name_fa: "تاریخ و زمان", policy: "temporal", default_agg: "NONE", sum_allowed: false },
+        { id: "Identifier", name_fa: "شناسه / کد یکتا", policy: "identifier", default_agg: "COUNT_DISTINCT", sum_allowed: false },
+        { id: "Category", name_fa: "دسته‌بندی", policy: "dimension", default_agg: "COUNT_DISTINCT", sum_allowed: false },
+        { id: "Status", name_fa: "وضعیت", policy: "dimension", default_agg: "COUNT_DISTINCT", sum_allowed: false },
+        { id: "Geographic", name_fa: "موقعیت جغرافیایی", policy: "dimension", default_agg: "COUNT_DISTINCT", sum_allowed: false },
+        { id: "Boolean", name_fa: "بولی / دودویی", policy: "boolean", default_agg: "COUNT", sum_allowed: false },
+        { id: "Target", name_fa: "هدف / بودجه", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Actual", name_fa: "عملکرد واقعی", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Quantity", name_fa: "تعداد / مقدار", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Unit Price", name_fa: "قیمت واحد / فی", policy: "non_additive", default_agg: "AVG", sum_allowed: false },
+        { id: "Cost", name_fa: "هزینه", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Revenue", name_fa: "فروش / درآمد", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Profit", name_fa: "سود", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Balance", name_fa: "مانده / موجودی لحظه‌ای", policy: "semi_additive", default_agg: "LAST_VALUE", sum_allowed: false },
+      ],
+    };
+  }
+  if (method === "GET" && segments[0] === "ai" && segments[1] === "recommend" && segments[2]) {
+    const allDs = getEffectiveDatasets(extraDatasets);
+    const ds = allDs.find((d) => d.id === segments[2]) || allDs[0];
+    if (!ds) return { status: 404, body: { detail: "Dataset not found" } };
+    const table = getTableForDataset(ds.id, extraDatasets);
+    const rows = table.rows || [];
+    const fields = ds.fields || [];
+    const fieldClassifications = fields.map((f: any) => {
+      const fn = String(f.field_name || "").toLowerCase();
+      const dt = String(f.data_type || "string").toLowerCase();
+      const isNum = ["int", "integer", "float", "decimal", "numeric", "number"].includes(dt);
+      let semanticClass = isNum ? "Additive Measure" : "Category";
+      let sumAllowed = isNum;
+      let defAgg = isNum ? "SUM" : "COUNT";
+      if (/(revenue|sales|income)/.test(fn)) semanticClass = "Revenue";
+      else if (/(cost|expense)/.test(fn)) semanticClass = "Cost";
+      else if (/(profit|margin)/.test(fn) && !/pct|rate/.test(fn)) semanticClass = "Profit";
+      else if (/(pct|percent|rate|ratio)/.test(fn) && isNum) {
+        semanticClass = "Percentage";
+        sumAllowed = false;
+        defAgg = "AVG";
+      } else if (/(date|time|created)/.test(fn) || dt.includes("date")) {
+        semanticClass = "Date/Time";
+      } else if (/(region|city|province|country|state)/.test(fn)) {
+        semanticClass = "Geographic";
+      } else if (/(_id|^id$|code)/.test(fn)) {
+        semanticClass = "Identifier";
+        sumAllowed = false;
+        defAgg = "COUNT_DISTINCT";
+      }
+      const numVals = isNum ? rows.map((r: any) => Number(r[f.field_name])).filter((v: number) => !Number.isNaN(v)) : [];
+      const sum = numVals.reduce((a: number, b: number) => a + b, 0);
+      const avg = numVals.length ? Math.round((sum / numVals.length) * 100) / 100 : undefined;
+      return {
+        field_name: f.field_name,
+        display_name: f.display_name || f.field_name,
+        data_type: isNum ? "numeric" : dt.includes("date") ? "date" : "categorical",
+        raw_type: f.data_type,
+        semantic_class: semanticClass,
+        confidence: 0.9,
+        needs_user_confirmation: false,
+        default_aggregation: defAgg,
+        sum_allowed: sumAllowed,
+        stats: {
+          avg,
+          median: avg,
+          stddev: avg ? Math.round(avg * 0.25 * 100) / 100 : undefined,
+          null_pct: 0,
+          distinct_count: new Set(rows.map((r: any) => r[f.field_name])).size,
+          iqr_outlier_count: 0,
+        },
+      };
+    });
+    const numCls = fieldClassifications.filter((f: any) => f.data_type === "numeric");
+    const kpis = numCls.slice(0, 6).map((f: any, idx: number) => {
+      const vals = rows.map((r: any) => Number(r[f.field_name])).filter((v: number) => !Number.isNaN(v));
+      const sum = vals.reduce((a: number, b: number) => a + b, 0);
+      const val = f.sum_allowed ? sum : vals.length ? sum / vals.length : 0;
+      const fmt = ["Revenue", "Cost", "Profit", "Currency"].includes(f.semantic_class)
+        ? "currency"
+        : f.semantic_class === "Percentage"
+        ? "percentage"
+        : "number";
+      return {
+        id: `demo_${f.field_name}`,
+        slug: `${f.field_name}_${f.default_aggregation.toLowerCase()}`,
+        name: `${f.sum_allowed ? "مجموع" : "میانگین"} ${f.display_name}`,
+        formula: `${f.default_aggregation}("${f.field_name}")`,
+        format_type: fmt,
+        unit: fmt === "percentage" ? "%" : "",
+        value: Math.round(val * 100) / 100,
+        formatted_value: fmt === "percentage" ? `${(Math.round(val * 10) / 10)}%` : Math.round(val).toLocaleString("en-US"),
+        category: idx === 0 ? "domain" : "aggregate",
+        score: 95 - idx * 4,
+        confidence: 0.92,
+        status: "selected",
+        source: ds.name,
+        comparison_basis: "کل دوره داده‌ها",
+        limitations: [],
+      };
+    });
+    return {
+      status: 200,
+      body: {
+        dataset_id: ds.id,
+        dataset_name: ds.name,
+        domain_detection: {
+          primary_domain: "sales_ecommerce",
+          primary_domain_fa: "فروش و عملکرد سازمانی",
+          confidence: 0.88,
+          evidence_fa: `شناسایی خودکار بر اساس ستون‌های ${fields.slice(0, 4).map((x: any) => x.field_name).join("، ")}`,
+        },
+        deep_profile: {
+          row_count: rows.length || ds.row_count || 0,
+          field_count: fields.length,
+          duplicate_row_count: 0,
+          completeness_pct: 99.6,
+          is_approximate: false,
+        },
+        field_classifications: fieldClassifications,
+        kpis: {
+          selected: kpis.slice(0, 5),
+          suggested: kpis.slice(5),
+          needs_confirmation: [],
+          data_quality: [
+            {
+              id: "dq_completeness",
+              name: "درصد تکمیل داده‌ها",
+              formula: "100.0",
+              formatted_value: "99.6%",
+            },
+          ],
+          uncomputable: [],
+          all_business: kpis,
+        },
+        recommended_pages: [
+          { title: "۱. خلاصه مدیریتی", widgets_count: 6, chart_types: ["kpi", "bullet", "grouped_bar", "bar", "pie"] },
+          { title: "۲. تحلیل روند و زمان", widgets_count: 3, chart_types: ["line", "area", "calendar_heatmap"] },
+          { title: "۳. مقایسه و تفکیک ابعادی", widgets_count: 3, chart_types: ["grouped_bar", "treemap"] },
+          { title: "۴. توزیع و شاخص‌های آماری", widgets_count: 2, chart_types: ["histogram", "scatter"] },
+          { title: "۵. جزئیات رکوردها و کیفیت داده", widgets_count: 2, chart_types: ["table", "kpi"] },
+        ],
+        suggested_widgets: kpis.map((k: any) => ({ title: k.name, chart_type: "kpi" })),
+      },
+    };
+  }
+  if (method === "POST" && segments[0] === "ai" && segments[1] === "datasets" && segments[3] === "field-overrides") {
+    return { status: 200, body: { status: "ok", updated: Array.isArray(body?.overrides) ? body.overrides.length : 0 } };
+  }
+  if (method === "POST" && segments[0] === "ai" && segments[1] === "datasets" && segments[3] === "kpis" && segments[4] === "preview") {
+    const allDs = getEffectiveDatasets(extraDatasets);
+    const ds = allDs.find((d) => d.id === segments[2]) || allDs[0];
+    const table = ds ? getTableForDataset(ds.id, extraDatasets) : { rows: [] };
+    const rows = table.rows || [];
+    const formula = String(body?.formula || "");
+    const m = formula.match(/(SUM|AVG|MIN|MAX|COUNT)\s*\(\s*"?([A-Za-z0-9_]+)"?\s*\)/i);
+    let val = rows.length;
+    if (m) {
+      const fn = m[1].toUpperCase();
+      const col = m[2];
+      const nums = rows.map((r: any) => Number(r[col])).filter((v: number) => !Number.isNaN(v));
+      if (fn === "SUM") val = nums.reduce((a: number, b: number) => a + b, 0);
+      else if (fn === "AVG") val = nums.length ? nums.reduce((a: number, b: number) => a + b, 0) / nums.length : 0;
+      else if (fn === "MIN") val = nums.length ? Math.min(...nums) : 0;
+      else if (fn === "MAX") val = nums.length ? Math.max(...nums) : 0;
+      else if (fn === "COUNT") val = nums.length || rows.length;
+    }
+    return {
+      status: 200,
+      body: {
+        name: body?.name || "Custom KPI",
+        formula,
+        value: Math.round(val * 100) / 100,
+        formatted_value: Math.round(val).toLocaleString("en-US"),
+      },
+    };
+  }
+  if (method === "POST" && segments[0] === "ai" && segments[1] === "datasets" && segments[3] === "kpis" && segments[4] === "register") {
+    return { status: 200, body: { status: "ok", count: Array.isArray(body?.kpis) ? body.kpis.length : 0 } };
+  }
   if (method === "POST" && path === "/ai/generate-dashboard") {
     const allDs = getEffectiveDatasets(extraDatasets);
     const targetDs = allDs.find((d) => d.id === body?.dataset_id) || allDs[0];
     if (targetDs) {
       const [friendly] = friendlyDemoDatasetLabel(targetDs);
-      const title = `داشبورد ${friendly.split("(")[0].trim()}`;
-      const built = buildDemoFullDashboard(targetDs, title, "executive_full", null);
+      const title = body?.title || `داشبورد ${friendly.split("(")[0].trim()}`;
+      const built = buildDemoFullDashboard(targetDs, title, "executive_full", body?.theme_id || null);
       return {
         status: 200,
         body: {
           dashboard_id: built.created_dashboard.id,
           title: built.created_dashboard.title,
+          pages_count: built.created_dashboard.pages?.length || 1,
+          widgets_count: built.created_dashboard.widgets?.length || 0,
           created_dashboard: built.created_dashboard,
         },
       };

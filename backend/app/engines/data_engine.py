@@ -45,6 +45,24 @@ class FormulaCompiler:
             return f'MAX("{arg}")'
         if arg := _extract_arg("MEDIAN"):
             return f'MEDIAN("{arg}")'
+        if arg := _extract_arg("STDDEV"):
+            return f'STDDEV_SAMP("{arg}")'
+        if arg := _extract_arg("STDDEV_SAMP"):
+            return f'STDDEV_SAMP("{arg}")'
+        if arg := _extract_arg("VARIANCE"):
+            return f'VAR_SAMP("{arg}")'
+        if arg := _extract_arg("P25"):
+            return f'QUANTILE_CONT("{arg}", 0.25)'
+        if arg := _extract_arg("P75"):
+            return f'QUANTILE_CONT("{arg}", 0.75)'
+        if arg := _extract_arg("P90"):
+            return f'QUANTILE_CONT("{arg}", 0.90)'
+        if arg := _extract_arg("P95"):
+            return f'QUANTILE_CONT("{arg}", 0.95)'
+        if arg := _extract_arg("LAST_VALUE"):
+            if time_col and IDENT_RE.match(str(time_col)):
+                return f'ARG_MAX("{arg}", "{sanitize_identifier(str(time_col))}")'
+            return f'ANY_VALUE("{arg}")'
 
         if arg := _extract_arg("RANK"):
             ord_expr = f'SUM("{arg}") DESC' if arg != "*" else "COUNT(*) DESC"

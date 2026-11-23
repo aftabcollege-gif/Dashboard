@@ -32,232 +32,82 @@ class AiAnalyticsEngine:
 
     @staticmethod
     def recommend_widgets_for_dataset(
-        db: Session, dataset: Dataset, user: Optional[User] = None, include_profile: bool = True
+        db: Session,
+        dataset: Dataset,
+        user: Optional[User] = None,
+        include_profile: bool = True,
+        *,
+        related_dataset_ids: Optional[list[str]] = None,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
-        sec_ctx = build_data_security_context(db, user, dataset.id) if user is not None else None
-        hidden = sec_ctx.hidden_columns if sec_ctx else set()
-        fields = [
-            f
-            for f in db.query(DatasetField).filter(DatasetField.dataset_id == dataset.id).all()
-            if f.field_name not in hidden
-        ]
-        label_map: dict[str, str] = {}
-        if not fields:
-            # Infer from warehouse table directly
-            cols = [c for c in warehouse.describe_table(dataset.warehouse_table) if c["column_name"] not in hidden]
-            measures = [
-                c["column_name"]
-                for c in cols
-                if any(k in c["column_type"].lower() for k in ("int", "double", "float", "decimal"))
-                and not c["column_name"].endswith("_id")
-                and c["column_name"] not in ("year", "month", "quarter", "day", "line_number", "status_code")
-            ]
-            times = [
-                c["column_name"]
-                for c in cols
-                if any(k in c["column_type"].lower() or k in c["column_name"].lower() for k in ("date", "time", "month", "year", "quarter"))
-            ]
-            geos = [
-                c["column_name"]
-                for c in cols
-                if any(k in c["column_name"].lower() for k in ("country", "region", "province", "city"))
-            ]
-            dims = [
-                c["column_name"]
-                for c in cols
-                if c["column_name"] not in measures and c["column_name"] not in times and not c["column_name"].endswith("_id")
-            ]
-            for c in cols:
-                label_map[c["column_name"]] = c["column_name"].replace("_", " ").title()
-        else:
-            for f in fields:
-                label_map[f.field_name] = f.display_name or f.field_name.replace("_", " ").title()
-            measures = [f.field_name for f in fields if f.semantic_role == "measure" and f.field_name != "line_number"]
-            times = [f.field_name for f in fields if f.semantic_role == "time"]
-            geos = [f.field_name for f in fields if f.semantic_role == "geo"]
-            dims = [f.field_name for f in fields if f.semantic_role in ("dimension", "geo")]
+        from app.engines.kpi_engine import IntelligentKpiEngine
 
-        pref_log_dims = [c for c in ("level", "status_code", "service", "method", "logger", "host", "path", "region", "category", "department", "product") if c in dims]
-        dims = pref_log_dims + [c for c in dims if c not in pref_log_dims]
-        pref_log_measures = [c for c in ("revenue", "profit", "sales", "amount", "latency_ms", "duration_ms", "response_bytes", "bytes") if c in measures]
-        measures = pref_log_measures + [c for c in measures if c not in pref_log_measures]
-
-        def _lbl(col_name: Optional[str]) -> str:
-            if not col_name or col_name == "*":
-                return "تعداد"
-            return label_map.get(col_name, col_name.replace("_", " ").title())
-
-        primary_m = measures[0] if measures else "*"
-        secondary_m = measures[1] if len(measures) > 1 else None
-        primary_t = times[0] if times else None
-        primary_d = dims[0] if dims else None
-        secondary_d = dims[1] if len(dims) > 1 else (geos[0] if geos else primary_d)
-
-        specs: list[dict[str, Any]] = []
-        all_col_dicts = [{"name": k, "label": label_map.get(k, k)} for k in list(label_map.keys())]
-        bpmn_inferred = AiAnalyticsEngine._infer_bpmn_config_from_cols(all_col_dicts)
-        is_bpmn_ds = bool(bpmn_inferred and (bpmn_inferred.get("step_field") or "bpmn" in (dataset.warehouse_table or "").lower()))
-
-        if is_bpmn_ds and bpmn_inferred:
-            w_field = bpmn_inferred.get("wait_field") or primary_m
-            s_field = bpmn_inferred.get("step_field") or primary_d
-            a_field = bpmn_inferred.get("assignee_field") or secondary_d
-            specs.extend([
-                {
-                    "title": "تعداد رویدادها / درخواست‌ها",
-                    "chart_type": "kpi",
-                    "layout": {"x": 0, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": "*", "aggregation": "COUNT"},
-                    "style": {"number_format": "number"},
-                },
-                {
-                    "title": f"میانگین {_lbl(w_field)}",
-                    "chart_type": "kpi",
-                    "layout": {"x": 4, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
-                    "style": {"number_format": "number"},
-                },
-                {
-                    "title": f"بیشترین {_lbl(w_field)}",
-                    "chart_type": "kpi",
-                    "layout": {"x": 8, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": w_field, "aggregation": "MAX" if w_field != "*" else "COUNT"},
-                    "style": {"number_format": "number"},
-                },
-                {
-                    "title": f"نقشه فرآیند BPMN و گلوگاه‌ها — {dataset.name}",
-                    "chart_type": "bpmn",
-                    "layout": {"x": 0, "y": 3, "w": 12, "h": 10},
-                    "visual_spec": {
-                        "x_field": s_field,
-                        "y_field": w_field,
-                        "aggregation": "AVG" if w_field != "*" else "COUNT",
-                        "bpmn_config": {**bpmn_inferred, "process_name": dataset.name, "heatmap_enabled": True},
-                    },
-                    "style": {"number_format": "number"},
-                },
-            ])
-            if s_field:
-                specs.append({
-                    "title": f"مقایسه گلوگاه‌های {_lbl(s_field)}",
-                    "chart_type": "horizontal_bar",
-                    "layout": {"x": 0, "y": 13, "w": 6, "h": 7},
-                    "visual_spec": {"x_field": s_field, "y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
-                })
-            if a_field:
-                specs.append({
-                    "title": f"تراکم و زمان انتظار در کارتابل ({_lbl(a_field)})",
-                    "chart_type": "bar",
-                    "layout": {"x": 6, "y": 13, "w": 6, "h": 7},
-                    "visual_spec": {"x_field": a_field, "y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
-                })
-            suggested_filters = [
-                {"name": _lbl(d), "field_name": d, "filter_type": "multi_select"}
-                for d in [s_field, a_field, bpmn_inferred.get("status_field"), bpmn_inferred.get("department_field")]
-                if d
-            ][:4]
-            return {
-                "profile": DataProfiler.profile_table(dataset.warehouse_table, sec_ctx=sec_ctx) if include_profile else None,
-                "suggested_widgets": specs,
-                "suggested_filters": suggested_filters,
-            }
-
-        # Up to 3 KPI cards
-        for idx, m in enumerate(measures[:3]):
-            m_lbl = _lbl(m)
-            specs.append(
-                {
-                    "title": f"مجموع {m_lbl}" if any(ord(ch) > 127 for ch in m_lbl) else f"Total {m_lbl}",
-                    "chart_type": "kpi",
-                    "layout": {"x": idx * 4, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": m, "aggregation": "SUM"},
-                    "style": {"number_format": "currency" if any(k in f"{m} {m_lbl}".lower() for k in ("rev", "cost", "profit", "price", "amount", "مبلغ", "ریال", "تومان", "هزینه")) else "number"},
-                }
-            )
-        if not measures:
-            specs.append(
-                {
-                    "title": f"تعداد کل ({dataset.name})",
-                    "chart_type": "kpi",
-                    "layout": {"x": 0, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": "*", "aggregation": "COUNT"},
-                    "style": {"number_format": "number"},
-                }
-            )
-
-        # Time-series trend chart
-        if primary_t:
-            m_lbl = _lbl(primary_m)
-            t_lbl = _lbl(primary_t)
-            specs.append(
-                {
-                    "title": f"روند {m_lbl} بر اساس {t_lbl}" if any(ord(ch) > 127 for ch in f"{m_lbl}{t_lbl}") else f"{m_lbl} Trend Over Time",
-                    "chart_type": "area",
-                    "layout": {"x": 0, "y": 3, "w": 8, "h": 7},
-                    "visual_spec": {
-                        "x_field": primary_t,
-                        "y_field": primary_m,
-                        "aggregation": "SUM" if primary_m != "*" else "COUNT",
-                    },
-                    "drill_hierarchy": [t for t in ("year", "quarter", "month") if t in (times + dims)] or [primary_t],
-                }
-            )
-
-        # Category Breakdown Donut / Bar
-        if primary_d:
-            m_lbl = _lbl(primary_m)
-            d_lbl = _lbl(primary_d)
-            specs.append(
-                {
-                    "title": f"{m_lbl} به تفکیک {d_lbl}" if any(ord(ch) > 127 for ch in f"{m_lbl}{d_lbl}") else f"{m_lbl} by {d_lbl}",
-                    "chart_type": "bar",
-                    "layout": {"x": 8 if primary_t else 0, "y": 3, "w": 4 if primary_t else 6, "h": 7},
-                    "visual_spec": {
-                        "x_field": primary_d,
-                        "y_field": primary_m,
-                        "aggregation": "SUM" if primary_m != "*" else "COUNT",
-                    },
-                }
-            )
-
-        if secondary_d:
-            d2_lbl = _lbl(secondary_d)
-            specs.append(
-                {
-                    "title": f"سهم بر اساس {d2_lbl}" if any(ord(ch) > 127 for ch in d2_lbl) else f"Share by {d2_lbl}",
-                    "chart_type": "donut",
-                    "layout": {"x": 0, "y": 10, "w": 5, "h": 7},
-                    "visual_spec": {
-                        "x_field": secondary_d,
-                        "y_field": primary_m,
-                        "aggregation": "SUM" if primary_m != "*" else "COUNT",
-                    },
-                }
-            )
-
-        # Comparison table
-        specs.append(
-            {
-                "title": f"جدول تفکیکی — {dataset.name}" if any(ord(ch) > 127 for ch in f"{dataset.name}{_lbl(primary_d)}{_lbl(primary_m)}") else f"Detailed Breakdown — {dataset.name}",
-                "chart_type": "table",
-                "layout": {"x": 5 if secondary_d else 0, "y": 10, "w": 7 if secondary_d else 12, "h": 7},
-                "visual_spec": {
-                    "x_field": primary_d or primary_t,
-                    "y_field": primary_m,
-                    "secondary_y_field": secondary_m,
-                    "aggregation": "SUM" if primary_m != "*" else "COUNT",
-                },
-            }
+        plan = IntelligentKpiEngine.build_intelligent_dashboard_plan(
+            db,
+            dataset,
+            user=user,
+            related_dataset_ids=related_dataset_ids,
+            force_refresh=force_refresh,
         )
+        # Flatten pages into backward-compatible suggested_widgets list while exposing full 5-stage analysis
+        suggested_widgets: list[dict[str, Any]] = []
+        for page in plan["pages"]:
+            for w in page["widgets"]:
+                suggested_widgets.append({
+                    "title": w["title"],
+                    "description": w.get("description", ""),
+                    "chart_type": w["chart_type"],
+                    "layout": w["layout"],
+                    "visual_spec": w["visual_spec"],
+                    "style": w.get("style", {}),
+                    "visualization": w.get("visualization", {}),
+                    "advanced": w.get("advanced", {}),
+                    "drill_hierarchy": [d["field"] for d in (w.get("drill_hierarchy") or []) if isinstance(d, dict) and d.get("field")],
+                    "page_title": page["title"],
+                    "page_key": page.get("page_key"),
+                })
 
-        suggested_filters = [
-            {"name": _lbl(d), "field_name": d, "filter_type": "multi_select"}
-            for d in (dims + geos)[:3]
-        ]
+        sec_ctx = build_data_security_context(db, user, dataset.id) if user is not None else None
+        legacy_profile = None
+        if include_profile:
+            legacy_profile = {
+                "table_name": dataset.warehouse_table,
+                "row_count": plan["deep_profile"]["row_count"],
+                "fields": [
+                    {
+                        "field_name": f["field_name"],
+                        "raw_type": f["raw_type"],
+                        "distinct_count": f["distinct_count"],
+                        "null_count": f["null_count"],
+                        "min": f["min"],
+                        "max": f["max"],
+                        "avg": f["avg"],
+                        "median": f["median"],
+                    }
+                    for f in plan["deep_profile"]["fields"]
+                ],
+            }
+
         return {
-            "profile": DataProfiler.profile_table(dataset.warehouse_table, sec_ctx=sec_ctx) if include_profile else None,
-            "suggested_widgets": specs,
-            "suggested_filters": suggested_filters,
+            "dataset_id": dataset.id,
+            "dataset_name": dataset.name,
+            "profile": legacy_profile,
+            "deep_profile": plan["deep_profile"],
+            "field_classifications": plan["field_classifications"],
+            "domain_detection": plan["domain_detection"],
+            "kpis": plan["kpis"],
+            "recommended_pages": [
+                {
+                    "title": p["title"],
+                    "page_key": p.get("page_key"),
+                    "widgets_count": len(p["widgets"]),
+                    "chart_types": [w["chart_type"] for w in p["widgets"]],
+                }
+                for p in plan["pages"]
+            ],
+            "suggested_widgets": suggested_widgets,
+            "suggested_filters": plan["suggested_filters"],
+            "multi_source_analysis": plan["kpis"].get("multi_source_analysis", {}),
         }
 
     @staticmethod
@@ -267,86 +117,37 @@ class AiAnalyticsEngine:
         workspace_id: str,
         dataset: Dataset,
         title: Optional[str] = None,
+        *,
+        template_mode: str = "executive",
+        detail_level: str = "standard",
+        calendar_mode: str = "jalali",
+        date_range: Optional[dict[str, Any]] = None,
+        max_pages: int = 7,
+        theme_id: Optional[str] = None,
+        selected_kpi_ids: Optional[list[str]] = None,
+        custom_kpis: Optional[list[dict[str, Any]]] = None,
+        target_values: Optional[dict[str, float]] = None,
+        related_dataset_ids: Optional[list[str]] = None,
     ) -> Dashboard:
-        rec = AiAnalyticsEngine.recommend_widgets_for_dataset(db, dataset, user=user, include_profile=False)
-        dash = Dashboard(
-            workspace_id=workspace_id,
-            title=title or f"AI Executive Insights — {dataset.name}",
-            description=f"Auto-generated AI analytical dashboard from dataset '{dataset.name}'",
-            created_by=user.id,
+        from app.engines.kpi_engine import IntelligentKpiEngine
+
+        dash, _meta = IntelligentKpiEngine.generate_and_persist_dashboard(
+            db,
+            user,
+            workspace_id,
+            dataset,
+            title=title,
+            template_mode=template_mode,
+            detail_level=detail_level,
+            calendar_mode=calendar_mode,
+            date_range=date_range,
+            max_pages=max_pages,
+            theme_id=theme_id,
+            selected_kpi_ids=selected_kpi_ids,
+            custom_kpis=custom_kpis,
+            target_values=target_values,
+            related_dataset_ids=related_dataset_ids,
         )
-        db.add(dash)
-        db.flush()
-
-        page = DashboardPage(dashboard_id=dash.id, title="AI Overview", page_order=0)
-        db.add(page)
-        db.flush()
-
-        layout_items = []
-        for idx, spec in enumerate(rec["suggested_widgets"]):
-            lay = spec["layout"]
-            w = Widget(
-                dashboard_id=dash.id,
-                page_id=page.id,
-                title=spec["title"],
-                chart_type=spec["chart_type"],
-                dataset_id=dataset.id,
-                layout_x=lay["x"],
-                layout_y=lay["y"],
-                layout_w=lay["w"],
-                layout_h=lay["h"],
-            )
-            db.add(w)
-            db.flush()
-            layout_items.append({"i": w.id, **lay})
-
-            db.add(
-                WidgetConfig(
-                    widget_id=w.id,
-                    style_json=spec.get("style", {}),
-                    visualization_json={"show_legend": True, "show_tooltip": True, "data_labels": False},
-                    interactions_json={"cross_filter": True},
-                    advanced_json={"ai_generated": True},
-                )
-            )
-            db.add(
-                WidgetQuery(
-                    widget_id=w.id,
-                    dataset_id=dataset.id,
-                    query_mode="visual",
-                    visual_spec_json=spec["visual_spec"],
-                )
-            )
-            if spec.get("drill_hierarchy"):
-                db.add(
-                    WidgetDrillRule(
-                        widget_id=w.id,
-                        hierarchy_json=[{"field": f} for f in spec["drill_hierarchy"]],
-                        level_rules_json=[
-                            {"level": 0, "chart_type": "bar"},
-                            {"level": 1, "chart_type": "line"},
-                            {"level": 2, "chart_type": "area"},
-                        ],
-                    )
-                )
-
-        db.add(DashboardLayout(page_id=page.id, columns_count=12, layout_json=layout_items))
-
-        for sf in rec["suggested_filters"]:
-            db.add(
-                DashboardFilter(
-                    dashboard_id=dash.id,
-                    scope="global",
-                    name=sf["name"],
-                    field_name=sf["field_name"],
-                    dataset_id=dataset.id,
-                    filter_type=sf["filter_type"],
-                    operator="in",
-                )
-            )
-
-        db.commit()
-        db.refresh(dash)
         return dash
 
     @staticmethod

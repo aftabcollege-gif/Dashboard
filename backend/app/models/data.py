@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
-    String, Boolean, Integer, BigInteger, Text, DateTime, ForeignKey, UniqueConstraint, JSON
+    String, Boolean, Integer, BigInteger, Float, Text, DateTime, ForeignKey, UniqueConstraint, JSON
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
@@ -84,6 +84,10 @@ class DatasetField(Base, TimestampMixin):
     dependent_fields_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     access_scope: Mapped[str] = mapped_column(String(32), default="dataset", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    semantic_class: Mapped[str] = mapped_column(String(48), default="", nullable=False)
+    classification_confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    aggregation_policy: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    user_override_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_by: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -133,6 +137,10 @@ class SemanticMetric(Base, TimestampMixin):
     dependent_metrics_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     access_scope: Mapped[str] = mapped_column(String(32), default="organization", nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    category: Mapped[str] = mapped_column(String(48), default="analytical", nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    target_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    kpi_metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_by: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

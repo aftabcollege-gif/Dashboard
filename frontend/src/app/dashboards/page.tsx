@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowRight, Bot, FolderKanban, Plus, Sparkles, Trash2, Wand2 } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { PersianAssistantPanel } from "@/components/ai/PersianAssistantPanel";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
@@ -16,6 +17,7 @@ export default function DashboardsListPage() {
   const [datasets, setDatasets] = useState<any[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [showAssistant, setShowAssistant] = useState(true);
+  const [showSmartStudio, setShowSmartStudio] = useState(false);
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
 
@@ -85,6 +87,14 @@ export default function DashboardsListPage() {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowSmartStudio((s) => !s)}
+              className="px-3.5 py-2 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 flex items-center gap-1.5"
+            >
+              <Sparkles className="w-4 h-4" />
+              {showSmartStudio ? "بستن استودیوی KPI" : isFa ? "استودیوی هوشمند KPI (۷ صفحه)" : "Smart KPI Studio"}
+            </button>
             <Link
               href="/descriptive-builder"
               className="px-3.5 py-2 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 flex items-center gap-1.5"
@@ -116,6 +126,13 @@ export default function DashboardsListPage() {
             </button>
           </div>
         </div>
+
+        {showSmartStudio && (
+          <IntelligentDashboardStudio
+            initialDatasetId={datasets[0]?.id}
+            onClose={() => setShowSmartStudio(false)}
+          />
+        )}
 
         {showAssistant && (
           <PersianAssistantPanel

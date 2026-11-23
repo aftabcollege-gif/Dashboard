@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { CheckCircle2, Database, FileSpreadsheet, Play, Plus, Sparkles, Trash2, UploadCloud, XCircle } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
@@ -15,6 +16,7 @@ export default function DataSourcesPage() {
   const [supported, setSupported] = useState<{ databases: string[]; files: string[] }>({ databases: [], files: [] });
   const [lastImported, setLastImported] = useState<any>(null);
   const [buildingDash, setBuildingDash] = useState(false);
+  const [studioDatasetId, setStudioDatasetId] = useState<string>("");
 
   // New DB Connector form
   const [name, setName] = useState("");
@@ -250,18 +252,35 @@ export default function DataSourcesPage() {
                     : `Dataset "${lastImported.name}" (${lastImported.row_count} rows) imported and ready!`}
                 </span>
               </div>
-              <button
-                type="button"
-                disabled={buildingDash}
-                onClick={() => handleBuildDashboardForDataset(lastImported.dataset_id || lastImported.id)}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                {buildingDash
-                  ? locale === "fa" ? "در حال ساخت داشبورد..." : "Building..."
-                  : locale === "fa" ? "ساخت فوری داشبورد از این فایل" : "Auto-Build Dashboard"}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setStudioDatasetId(lastImported.dataset_id || lastImported.id)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-white font-semibold bg-indigo-600 hover:bg-indigo-700"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  {locale === "fa" ? "شخصی‌سازی KPIها و صفحات" : "Customize KPIs"}
+                </button>
+                <button
+                  type="button"
+                  disabled={buildingDash}
+                  onClick={() => handleBuildDashboardForDataset(lastImported.dataset_id || lastImported.id)}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  {buildingDash
+                    ? locale === "fa" ? "در حال ساخت داشبورد..." : "Building..."
+                    : locale === "fa" ? "ساخت فوری داشبورد از این فایل" : "Auto-Build Dashboard"}
+                </button>
+              </div>
             </div>
+          )}
+
+          {studioDatasetId && (
+            <IntelligentDashboardStudio
+              initialDatasetId={studioDatasetId}
+              onClose={() => setStudioDatasetId("")}
+            />
           )}
 
           {datasets.length > 0 && (

@@ -17,7 +17,7 @@ from sqlglot import exp
 from sqlalchemy.orm import Session
 from app.core.permissions import permission_resolver
 from app.core.rls_cls import build_data_security_context
-from app.core.sql_guard import SAFE_FORMULA_FUNCS, validate_formula_ast
+from app.core.sql_guard import SAFE_FORMULA_FUNCS, _node_func_name, validate_formula_ast
 from app.models.data import Dataset, DatasetField, SemanticMetric
 from app.models.identity import User
 
@@ -28,6 +28,9 @@ PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "0123
 AGGREGATE_FUNCS = {
     "sum", "avg", "count", "count_distinct", "min", "max", "median",
     "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop",
+    "percentile_cont", "quantile_cont", "corr", "skewness", "kurtosis",
+    "approx_distinct", "approx_count_distinct", "arg_max", "arg_min",
+    "first_value", "last_value", "any_value",
     "percentage", "running_total", "yoy", "mom", "ytd", "mtd", "rank",
 }
 
@@ -546,6 +549,10 @@ SQL_FUNCTION_CATALOG: list[dict[str, Any]] = [
 _FUNC_ARITY_RULES: dict[str, tuple[int, int]] = {
     "sum": (1, 1), "avg": (1, 1), "count": (1, 1), "min": (1, 1), "max": (1, 1),
     "median": (1, 1), "stddev": (1, 1), "stddev_samp": (1, 1), "variance": (1, 1),
+    "percentile_cont": (1, 2), "quantile_cont": (2, 2), "corr": (2, 2),
+    "skewness": (1, 1), "kurtosis": (1, 1), "arg_max": (2, 2), "arg_min": (2, 2),
+    "last_value": (1, 1), "first_value": (1, 1), "any_value": (1, 1),
+    "approx_distinct": (1, 1), "approx_count_distinct": (1, 1),
     "abs": (1, 1), "round": (1, 2), "ceil": (1, 1), "ceiling": (1, 1), "floor": (1, 1),
     "power": (2, 2), "sqrt": (1, 1), "mod": (2, 2), "sign": (1, 1),
     "upper": (1, 1), "lower": (1, 1), "trim": (1, 2), "ltrim": (1, 2), "rtrim": (1, 2),
@@ -719,6 +726,19 @@ def _check_dependency_cycles(
         _dfs(r, 1)
 
 
+_AGG_EXP_TYPES = tuple(
+    c for c in (
+        exp.Sum, exp.Avg, exp.Count, exp.Min, exp.Max, exp.Median, exp.Stddev, exp.Variance,
+        getattr(exp, "StddevSamp", None), getattr(exp, "StddevPop", None),
+        getattr(exp, "VarPop", None), getattr(exp, "PercentileCont", None),
+        getattr(exp, "Corr", None), getattr(exp, "Skewness", None),
+        getattr(exp, "Kurtosis", None), getattr(exp, "ArgMax", None),
+        getattr(exp, "ArgMin", None), getattr(exp, "ApproxDistinct", None),
+        getattr(exp, "AnyValue", None),
+    ) if c is not None
+)
+
+
 def _rewrite_formula_ast(
     formula: str,
     context: dict[str, Any],
@@ -802,7 +822,7 @@ def _rewrite_formula_ast(
     for node in tree.walk():
         if isinstance(node, exp.Window):
             has_window = True
-        if isinstance(node, (exp.Sum, exp.Avg, exp.Count, exp.Min, exp.Max, exp.Median, exp.Stddev, exp.Variance)):
+        if isinstance(node, _AGG_EXP_TYPES):
             has_aggregate = True
         if isinstance(node, exp.Anonymous):
             aname = (node.name or "").strip().lower()
@@ -813,12 +833,24 @@ def _rewrite_formula_ast(
                 if not (lo <= len(node.expressions) <= hi):
                     raise ValueError(f"تعداد پارامترهای تابع {aname.upper()} باید بین {lo} تا {hi} باشد")
         elif isinstance(node, exp.Func):
-            fname = (node.sql_name() or "").strip().lower() if callable(getattr(node, "sql_name", None)) else ""
+            fname = _node_func_name(node)
+            if fname in AGGREGATE_FUNCS:
+                has_aggregate = True
             if fname in _FUNC_ARITY_RULES:
                 # Inspect positional expression children cleanly
-                arg_cnt = len(getattr(node, "expressions", []) or []) + (1 if node.this is not None else 0)
+                arg_cnt = len(getattr(node, "expressions", []) or []) + (1 if node.this is not None else 0) + (
+                    1 if (getattr(node, "expression", None) is not None and not getattr(node, "expressions", None)) else 0
+                )
                 if isinstance(node, (exp.Sum, exp.Avg, exp.Count, exp.Min, exp.Max, exp.Median, exp.Abs, exp.Ceil, exp.Floor, exp.Sqrt, exp.Sign, exp.Upper, exp.Lower, exp.Length)):
                     arg_cnt = 1 if node.this is not None else 0
+                elif isinstance(node, exp.If):
+                    if isinstance(node.parent, exp.Case):
+                        continue
+                    arg_cnt = (
+                        (1 if node.this is not None else 0)
+                        + (1 if node.args.get("true") is not None else 0)
+                        + (1 if node.args.get("false") is not None else 0)
+                    )
                 elif isinstance(node, (exp.Nullif, exp.Pow)):
                     arg_cnt = (1 if node.this is not None else 0) + (1 if node.expression is not None else 0)
                 lo, hi = _FUNC_ARITY_RULES[fname]

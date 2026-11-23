@@ -1078,11 +1078,26 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                 {w.config?.advanced?.narrative_fa || w.description}
               </span>
             </div>
-            {Array.isArray(w.config?.advanced?.sources_used) && w.config.advanced.sources_used.length > 0 && (
-              <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500 font-semibold shrink-0">
-                {w.config.advanced.sources_used.join(" + ")}
-              </span>
-            )}
+            <div className="flex items-center gap-1 shrink-0">
+              {typeof w.config?.advanced?.confidence === "number" && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-semibold">
+                  {Math.round(w.config.advanced.confidence * 100)}%
+                </span>
+              )}
+              {Array.isArray(w.config?.advanced?.limitations) && w.config.advanced.limitations.length > 0 && (
+                <span
+                  className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 font-semibold cursor-help"
+                  title={w.config.advanced.limitations.join(" | ")}
+                >
+                  محدودیت
+                </span>
+              )}
+              {Array.isArray(w.config?.advanced?.sources_used) && w.config.advanced.sources_used.length > 0 && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500 font-semibold">
+                  {w.config.advanced.sources_used.join(" + ")}
+                </span>
+              )}
+            </div>
           </div>
         )}
       </div>

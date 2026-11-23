@@ -215,6 +215,31 @@ def get_builder_catalog(user: User = Depends(get_current_user)):
     }
 
 
+@router.get("/smart-kpis/{dataset_id}")
+def get_smart_kpis_for_builder(
+    dataset_id: str,
+    related_dataset_ids: Optional[str] = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Exposes Intelligent KPI Engine suggestions directly inside Descriptive Dashboard Builder."""
+    from app.engines.kpi_engine import IntelligentKpiEngine
+
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
+    rel_list = [x.strip() for x in (related_dataset_ids or "").split(",") if x.strip()]
+    plan = IntelligentKpiEngine.build_intelligent_dashboard_plan(
+        db, ds, user=user, related_dataset_ids=rel_list or None
+    )
+    return {
+        "dataset_id": ds.id,
+        "dataset_name": ds.name,
+        "domain_detection": plan["domain_detection"],
+        "field_classifications": plan["field_classifications"],
+        "kpis": plan["kpis"],
+    }
+
+
 @router.get("/datasets")
 def list_builder_datasets(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return {"datasets": list_accessible_datasets_metadata(db, user)}

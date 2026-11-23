@@ -57,11 +57,11 @@ from app.models.performance import DashboardPerformanceLog, WidgetPerformanceLog
 router = APIRouter(prefix="/dashboards", tags=["Dashboards, Designer & Interactive Analytics"])
 
 ALL_30_CHART_TYPES = {
-    "bar", "horizontal_bar", "stacked_bar", "stacked_bar_100",
+    "bar", "horizontal_bar", "grouped_bar", "stacked_bar", "stacked_bar_100",
     "line", "area", "stacked_area",
     "pie", "donut", "scatter", "bubble", "radar",
     "treemap", "sunburst", "heatmap", "waterfall", "funnel",
-    "gauge", "kpi", "progress", "table", "pivot_table", "matrix",
+    "gauge", "bullet", "kpi", "progress", "table", "pivot_table", "matrix",
     "calendar_heatmap", "histogram", "boxplot", "candlestick",
     "geo_map", "sankey", "combo", "bpmn",
 }

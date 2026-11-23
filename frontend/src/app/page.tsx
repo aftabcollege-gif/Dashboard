@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowRight, Bot, Database, FolderKanban, Layers, Plus, RefreshCw, ShieldCheck } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { PersianAssistantPanel } from "@/components/ai/PersianAssistantPanel";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
@@ -17,6 +18,7 @@ export default function HomePage() {
   const [etlMon, setEtlMon] = useState<any>(null);
   const [aiDatasetId, setAiDatasetId] = useState("");
   const [generating, setGenerating] = useState(false);
+  const [showSmartStudio, setShowSmartStudio] = useState(false);
   const [targetDashId, setTargetDashId] = useState("");
 
   const loadDashboards = useCallback(() => {
@@ -177,8 +179,22 @@ export default function HomePage() {
               >
                 {generating ? "..." : isFa ? "تولید خودکار داشبورد" : "Auto-Generate Dashboard"}
               </button>
+              <button
+                type="button"
+                onClick={() => setShowSmartStudio((s) => !s)}
+                className="px-4 py-2 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 w-full sm:w-auto shrink-0"
+              >
+                {showSmartStudio ? "بستن استودیو" : isFa ? "تنظیم KPIها و ساخت ۷ صفحه‌ای" : "Smart KPI Studio"}
+              </button>
             </div>
           </div>
+        )}
+
+        {showSmartStudio && aiDatasetId && (
+          <IntelligentDashboardStudio
+            initialDatasetId={aiDatasetId}
+            onClose={() => setShowSmartStudio(false)}
+          />
         )}
 
         {/* Dashboards Grid */}

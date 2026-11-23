@@ -26,6 +26,7 @@ import {
   Upload,
 } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { DescriptivePreviewPanel } from "@/components/descriptive-builder/DescriptivePreviewPanel";
 import { FormulaStudioPanel } from "@/components/descriptive-builder/FormulaStudioPanel";
 import { RelationshipGraphPanel } from "@/components/descriptive-builder/RelationshipGraphPanel";
@@ -71,6 +72,8 @@ export default function DescriptiveBuilderPage() {
   const [savedModels, setSavedModels] = useState<DataModelRecord[]>([]);
   const [activeModelId, setActiveModelId] = useState<string | null>(null);
   const [showModelsModal, setShowModelsModal] = useState(false);
+  const [showSmartKpiStudio, setShowSmartKpiStudio] = useState(false);
+  const [smartKpiPreview, setSmartKpiPreview] = useState<any | null>(null);
 
   // Step 1: Source Selection
   const [dsSearch, setDsSearch] = useState("");
@@ -198,6 +201,17 @@ export default function DescriptiveBuilderPage() {
       setRelAnalysis(null);
     }
   }, [selectedDatasetIds, primaryDatasetId, chosenRelIds, adHocJoins, runRelationshipAnalysis]);
+
+  useEffect(() => {
+    const targetDs = primaryDatasetId || selectedDatasetIds[0];
+    if (!targetDs || !user) {
+      setSmartKpiPreview(null);
+      return;
+    }
+    apiFetch<any>(`/descriptive-builder/smart-kpis/${targetDs}`)
+      .then((res) => setSmartKpiPreview(res))
+      .catch(() => setSmartKpiPreview(null));
+  }, [primaryDatasetId, selectedDatasetIds, user]);
 
   // Auto-populate suggested dimensions & measures when user picks datasets and hasn't explicitly chosen yet
   const allAvailableFields = useMemo(() => {
@@ -435,6 +449,18 @@ export default function DescriptiveBuilderPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {/* 5-Stage Smart KPI Studio Toggle */}
+            <button
+              type="button"
+              onClick={() => setShowSmartKpiStudio((s) => !s)}
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 flex items-center gap-1.5"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              {showSmartKpiStudio
+                ? isFa ? "بستن استودیوی KPI" : "Close Smart Studio"
+                : isFa ? "استودیوی هوشمند KPI (۷ صفحه)" : "Smart KPI Studio"}
+            </button>
+
             {/* Load/Save Data Model Button */}
             <button
               type="button"
@@ -473,6 +499,14 @@ export default function DescriptiveBuilderPage() {
             </div>
           </div>
         </div>
+
+        {/* 5-Stage Intelligent KPI & 7-Page Dashboard Studio */}
+        {showSmartKpiStudio && (
+          <IntelligentDashboardStudio
+            initialDatasetId={primaryDatasetId || selectedDatasetIds[0]}
+            onClose={() => setShowSmartKpiStudio(false)}
+          />
+        )}
 
         {/* Saved Models Modal */}
         {showModelsModal && (
@@ -948,22 +982,83 @@ export default function DescriptiveBuilderPage() {
 
             {/* STEP 4: IDE Formula & Measure Studio */}
             {step === 4 && (
-              <FormulaStudioPanel
-                isFa={isFa}
-                selectedDatasets={selectedDatasets}
-                functions={functions}
-                chosenRelIds={chosenRelIds}
-                adHocJoins={adHocJoins}
-                onRefreshDatasets={refreshDatasetsOnly}
-                onSelectMeasureOrField={(fname, kind) => {
-                  if (kind === "measure" || kind === "field") {
-                    setSelectedMeasures((prev) =>
-                      prev.some((m) => m.field_name === fname) ? prev : [...prev, { field_name: fname, aggregation: "SUM" }]
-                    );
-                  }
-                }}
-                showToast={showToast}
-              />
+              <div className="space-y-4">
+                {smartKpiPreview?.kpis?.length > 0 && (
+                  <div className="bi-card p-4 space-y-2.5 text-xs border border-indigo-500/30">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="font-bold flex items-center gap-1.5 text-indigo-500">
+                        <Sparkles className="w-4 h-4" />
+                        {isFa
+                          ? `شاخص‌های پیشنهادی موتور هوشمند (${smartKpiPreview?.domain?.primary_domain_fa || "تحلیلی"})`
+                          : `Smart Engine Suggested KPIs (${smartKpiPreview?.domain?.primary_domain || "Analytics"})`}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowSmartKpiStudio(true)}
+                        className="text-[11px] font-semibold underline text-indigo-500"
+                      >
+                        {isFa ? "باز کردن استودیوی کامل KPI" : "Open Full KPI Studio"}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                      {smartKpiPreview.kpis.slice(0, 6).map((k: any) => (
+                        <div
+                          key={k.id}
+                          className="p-2.5 rounded-lg border flex items-center justify-between gap-2"
+                          style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}
+                        >
+                          <div className="min-w-0">
+                            <div className="font-bold truncate">{k.name}</div>
+                            <div className="text-[10px] text-emerald-500 font-semibold">{k.formatted_value}</div>
+                            <div dir="ltr" className="text-[10px] font-mono opacity-65 truncate">{k.formula}</div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                const slug = (k.slug || k.id || "kpi").replace(/[^a-zA-Z0-9_]/g, "_");
+                                await apiFetch("/datasets/semantic-metrics", {
+                                  method: "POST",
+                                  body: JSON.stringify({
+                                    dataset_id: primaryDatasetId || selectedDatasetIds[0],
+                                    name: k.name,
+                                    slug,
+                                    formula: k.formula,
+                                    format_type: k.format_type || "number",
+                                  }),
+                                });
+                                await refreshDatasetsOnly();
+                                showToast(isFa ? `شاخص «${k.name}» به مدل معنایی افزوده شد` : `Added ${k.name}`);
+                              } catch (err: any) {
+                                showToast(err.message);
+                              }
+                            }}
+                            className="px-2 py-1 rounded bg-indigo-600 text-white text-[10px] font-semibold shrink-0 hover:bg-indigo-700"
+                          >
+                            + {isFa ? "ثبت در مدل" : "Add"}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <FormulaStudioPanel
+                  isFa={isFa}
+                  selectedDatasets={selectedDatasets}
+                  functions={functions}
+                  chosenRelIds={chosenRelIds}
+                  adHocJoins={adHocJoins}
+                  onRefreshDatasets={refreshDatasetsOnly}
+                  onSelectMeasureOrField={(fname, kind) => {
+                    if (kind === "measure" || kind === "field") {
+                      setSelectedMeasures((prev) =>
+                        prev.some((m) => m.field_name === fname) ? prev : [...prev, { field_name: fname, aggregation: "SUM" }]
+                      );
+                    }
+                  }}
+                  showToast={showToast}
+                />
+              </div>
             )}
 
             {/* STEP 5: 15-Analysis Catalog Selection */}

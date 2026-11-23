@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { BarChart2, GitBranch, Layers, Plus, Sparkles } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
@@ -18,6 +19,7 @@ export default function DatasetsPage() {
   const [metrics, setMetrics] = useState<any[]>([]);
   const [relationships, setRelationships] = useState<any[]>([]);
   const [buildingDash, setBuildingDash] = useState(false);
+  const [showSmartStudio, setShowSmartStudio] = useState(false);
   const [previewColPage, setPreviewColPage] = useState(0);
   const [profSearch, setProfSearch] = useState("");
   const [profPage, setProfPage] = useState(0);
@@ -187,6 +189,14 @@ export default function DatasetsPage() {
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
+                      onClick={() => setShowSmartStudio((s) => !s)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-xs font-semibold bg-indigo-600 hover:bg-indigo-700"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      {locale === "fa" ? "استودیوی هوشمند KPI" : "Smart KPI Studio"}
+                    </button>
+                    <button
+                      type="button"
                       disabled={buildingDash}
                       onClick={handleBuildDashboard}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-xs font-semibold bg-violet-600 hover:bg-violet-700 disabled:opacity-60"
@@ -194,13 +204,21 @@ export default function DatasetsPage() {
                       <Sparkles className="w-3.5 h-3.5" />
                       {buildingDash
                         ? locale === "fa" ? "در حال ساخت داشبورد..." : "Building..."
-                        : locale === "fa" ? "ساخت داشبورد از این مجموعه" : "Build Dashboard"}
+                        : locale === "fa" ? "ساخت فوری داشبورد" : "Build Dashboard"}
                     </button>
                     <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-500 font-semibold">
                       {selected.freshness_status || "fresh"} · v{selected.data_version ?? 1}
                     </span>
                   </div>
                 </div>
+                {showSmartStudio && (
+                  <div className="pt-2">
+                    <IntelligentDashboardStudio
+                      initialDatasetId={selected.id}
+                      onClose={() => setShowSmartStudio(false)}
+                    />
+                  </div>
+                )}
                 {preview ? (() => {
                   const PREVIEW_COL_WINDOW = 40;
                   const allCols = preview.columns || [];

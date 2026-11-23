@@ -478,5 +478,53 @@ export function handleDemoDescriptiveBuilder(
     return { status: 200, body: { id: dashId, title: createdDashboard.title, created_dashboard: createdDashboard } };
   }
 
+  // GET /descriptive-builder/smart-kpis/{datasetId}
+  if (method === "GET" && segments[1] === "smart-kpis" && segments[2]) {
+    const ds = deps.datasets.find((d) => d.id === segments[2]) || deps.datasets[0];
+    if (!ds) return { status: 404, body: { detail: "Dataset not found" } };
+    const table = deps.getRowsForDataset(ds.id);
+    const numFields = (ds.fields || []).filter((f: any) =>
+      ["int", "integer", "float", "decimal", "numeric", "number"].includes(String(f.data_type || "").toLowerCase())
+    );
+    const smartKpis = numFields.slice(0, 6).map((f: any, idx: number) => {
+      const vals = (table.rows || []).map((r) => Number(r[f.field_name])).filter((v) => !Number.isNaN(v));
+      const sum = vals.reduce((a, b) => a + b, 0);
+      const avg = vals.length ? sum / vals.length : 0;
+      const isRatio = /rate|pct|percent|margin|ratio/i.test(f.field_name);
+      const val = isRatio ? avg : sum;
+      return {
+        id: `demo_kpi_${f.field_name}`,
+        slug: `${f.field_name}_${isRatio ? "avg" : "total"}`,
+        name: `${isRatio ? "میانگین" : "مجموع"} ${f.display_name || f.field_name}`,
+        formula: `${isRatio ? "AVG" : "SUM"}("${f.field_name}")`,
+        format_type: /revenue|cost|profit|price|amount|budget/i.test(f.field_name) ? "currency" : isRatio ? "percentage" : "number",
+        value: Math.round(val * 100) / 100,
+        formatted_value: Math.round(val).toLocaleString("en-US"),
+        category: idx === 0 ? "domain" : "aggregate",
+        score: 94 - idx * 4,
+        confidence: 0.92,
+      };
+    });
+    return {
+      status: 200,
+      body: {
+        dataset_id: ds.id,
+        dataset_name: ds.name,
+        domain: { primary_domain: "general_analytics", primary_domain_fa: "تحلیل جامع سازمانی", confidence: 0.85 },
+        kpis: smartKpis,
+        data_quality_kpis: [
+          {
+            id: "dq_completeness",
+            name: "درصد تکمیل داده‌ها",
+            formula: "100.0",
+            value: 99.4,
+            formatted_value: "99.4%",
+          },
+        ],
+        recommended_pages: [],
+      },
+    };
+  }
+
   return { status: 200, body: { status: "ok" } };
 }

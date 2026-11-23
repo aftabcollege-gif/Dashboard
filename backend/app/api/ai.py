@@ -1,10 +1,10 @@
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from typing import Any, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from app.api.deps import enforce_permission, get_client_ip, get_current_user
 from app.core.audit import record_audit
-from app.core.rls_cls import build_data_security_context
+from app.core.rls_cls import build_data_security_context, build_security_projection_and_where
 from app.core.tenant import (
     get_dashboard_for_org,
     get_dataset_for_org,
@@ -16,6 +16,9 @@ from app.core.tenant import (
 from app.database import get_db
 from app.engines.ai_engine import AiAnalyticsEngine
 from app.engines.data_engine import DataProfiler
+from app.engines.formula_engine import validate_and_compile_formula
+from app.engines.kpi_engine import IntelligentKpiEngine, SEMANTIC_CLASS_META, _format_kpi_value, _safe_float
+from app.engines.warehouse import warehouse
 from app.models.identity import User
 
 router = APIRouter(prefix="/ai", tags=["AI Analytics Engine"])
@@ -25,6 +28,40 @@ class GenerateDashboardRequest(BaseModel):
     dataset_id: str
     workspace_id: Optional[str] = None
     title: Optional[str] = None
+    template_mode: str = "executive"
+    detail_level: str = "standard"
+    calendar_mode: str = "jalali"
+    date_range: Optional[dict[str, Any]] = None
+    max_pages: int = 7
+    theme_id: Optional[str] = None
+    selected_kpi_ids: Optional[list[str]] = None
+    custom_kpis: Optional[list[dict[str, Any]]] = None
+    target_values: Optional[dict[str, float]] = None
+    related_dataset_ids: Optional[list[str]] = None
+
+
+class FieldOverrideItem(BaseModel):
+    field_name: str
+    semantic_class: Optional[str] = None
+    aggregation_policy: Optional[str] = None
+    display_name: Optional[str] = None
+    target_value: Optional[float] = None
+
+
+class FieldOverridesRequest(BaseModel):
+    overrides: list[FieldOverrideItem] = Field(default_factory=list)
+
+
+class KpiPreviewRequest(BaseModel):
+    formula: str
+    name: str = "شاخص سفارشی"
+    format_type: str = "number"
+    unit: str = ""
+    target_value: Optional[float] = None
+
+
+class KpiRegisterRequest(BaseModel):
+    kpis: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class NlqRequest(BaseModel):
@@ -56,17 +93,133 @@ class ConversationalAssistantRequest(BaseModel):
     clarifications: dict = {}
 
 
+@router.get("/semantic-classes")
+def list_semantic_classes(user: User = Depends(get_current_user)):
+    return [
+        {
+            "id": k,
+            "name_fa": v["fa"],
+            "policy": v["policy"],
+            "default_aggregation": v["default_agg"],
+            "allowed_aggregations": v["allowed"],
+            "sum_allowed": v["sum_allowed"],
+        }
+        for k, v in SEMANTIC_CLASS_META.items()
+    ]
+
+
 @router.get("/recommend/{dataset_id}")
-def recommend_dashboard(dataset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def recommend_dashboard(
+    dataset_id: str,
+    refresh: bool = Query(False),
+    related_dataset_ids: Optional[str] = Query(None),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     ds = get_dataset_for_org(db, dataset_id, user.organization_id)
     enforce_permission(db, user, "dataset", ds.id, "view")
-    res = AiAnalyticsEngine.recommend_widgets_for_dataset(db, ds, user=user, include_profile=False)
+    rel_list = [x.strip() for x in (related_dataset_ids or "").split(",") if x.strip()]
+    res = AiAnalyticsEngine.recommend_widgets_for_dataset(
+        db,
+        ds,
+        user=user,
+        include_profile=False,
+        related_dataset_ids=rel_list or None,
+        force_refresh=refresh,
+    )
     sec_ctx = build_data_security_context(db, user, ds.id)
     res["profile"] = DataProfiler.profile_table(
         ds.warehouse_table,
         sec_ctx=sec_ctx,
     )
     return res
+
+
+@router.post("/datasets/{dataset_id}/field-overrides")
+def update_field_overrides(
+    dataset_id: str,
+    body: FieldOverridesRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "edit", ip_address=get_client_ip(request))
+    res = IntelligentKpiEngine.save_field_overrides(
+        db, user, ds, [ov.model_dump(exclude_none=True) for ov in body.overrides]
+    )
+    record_audit(
+        db, user.organization_id, "kpi_field_overrides_updated", "dataset",
+        resource_id=ds.id, user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+    )
+    return res
+
+
+@router.post("/datasets/{dataset_id}/kpis/preview")
+def preview_custom_kpi(
+    dataset_id: str,
+    body: KpiPreviewRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "query", "*", "execute", ip_address=get_client_ip(request))
+    enforce_permission(db, user, "dataset", ds.id, "view", ip_address=get_client_ip(request))
+    try:
+        comp = validate_and_compile_formula(
+            db,
+            user,
+            dataset_ids=[ds.id],
+            formula=body.formula,
+            calculation_type="analytical_metric",
+            qualify_with_alias=False,
+            auto_safe_divide=False,
+        )
+        sc = build_data_security_context(db, user, ds.id)
+        sub_sql, sub_p, _ = build_security_projection_and_where(
+            ds.warehouse_table, warehouse.describe_table(ds.warehouse_table), sc
+        )
+        rows = warehouse.execute_query(f'SELECT ({comp["compiled_sql"]}) AS v FROM ({sub_sql}) AS _kv', sub_p, limit=1)["rows"]
+        val = _safe_float(rows[0]["v"]) if rows else None
+        return {
+            "valid": True,
+            "name": body.name,
+            "formula": body.formula,
+            "compiled_sql": comp["compiled_sql"],
+            "value": round(val, 4) if val is not None else None,
+            "formatted_value": _format_kpi_value(val, body.format_type, body.unit),
+            "target_value": body.target_value,
+            "warnings": comp.get("warnings", []),
+            "output_data_type": comp["output_data_type"],
+        }
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/datasets/{dataset_id}/kpis/register")
+def register_kpis_to_semantic_layer(
+    dataset_id: str,
+    body: KpiRegisterRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "edit", ip_address=get_client_ip(request))
+    try:
+        reg = IntelligentKpiEngine.register_kpis_to_semantic_layer(db, user, ds, body.kpis)
+        record_audit(
+            db, user.organization_id, "kpi_registered_semantic_layer", "dataset",
+            resource_id=ds.id, user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        )
+        return {"registered": reg, "count": len(reg)}
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/generate-dashboard")
@@ -85,12 +238,32 @@ def auto_generate_dashboard(
         ws = get_default_workspace_for_org(db, user.organization_id)
         if not ws:
             raise HTTPException(status_code=404, detail="Workspace not found")
-    dash = AiAnalyticsEngine.generate_dashboard_from_dataset(db, user, ws.id, ds, title=body.title)
+    dash, meta = IntelligentKpiEngine.generate_and_persist_dashboard(
+        db,
+        user,
+        ws.id,
+        ds,
+        title=body.title,
+        template_mode=body.template_mode,
+        detail_level=body.detail_level,
+        calendar_mode=body.calendar_mode,
+        date_range=body.date_range,
+        max_pages=max(1, min(int(body.max_pages or 7), 10)),
+        theme_id=body.theme_id,
+        selected_kpi_ids=body.selected_kpi_ids,
+        custom_kpis=body.custom_kpis,
+        target_values=body.target_values,
+        related_dataset_ids=body.related_dataset_ids,
+    )
     record_audit(
         db, user.organization_id, "ai_auto_dashboard", "dashboard", resource_id=dash.id,
         user_id=user.id, username=user.username, ip_address=get_client_ip(request)
     )
-    return {"dashboard_id": dash.id, "title": dash.title}
+    return {
+        "dashboard_id": dash.id,
+        "title": dash.title,
+        **meta,
+    }
 
 
 @router.post("/nlq")
