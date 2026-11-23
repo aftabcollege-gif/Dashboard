@@ -157,19 +157,34 @@ export async function apiFetch<T = any>(
       if (method === "GET" && mProfile) {
         const hit = uploaded.find((d) => d.id === mProfile[1]);
         if (hit) {
-          return {
-            dataset_id: hit.id,
-            row_count: hit.row_count,
-            columns: hit.fields.map((f) => ({
+          const profFields = hit.fields.map((f) => {
+            let nullCount = 0;
+            const distinctSet = new Set<any>();
+            for (const r of hit.rows) {
+              const v = r[f.field_name];
+              if (v === "" || v === null || v === undefined) {
+                nullCount++;
+              } else if (distinctSet.size < 50000) {
+                distinctSet.add(v);
+              }
+            }
+            return {
               field_name: f.field_name,
               column_name: f.field_name,
               display_name: f.display_name,
               data_type: f.data_type,
+              raw_type: f.data_type.toUpperCase(),
               semantic_role: f.semantic_role,
               nullable: f.nullable,
-              null_count: hit.rows.filter((r) => r[f.field_name] === "" || r[f.field_name] === null || r[f.field_name] === undefined).length,
-              distinct_count: new Set(hit.rows.map((r) => r[f.field_name])).size,
-            })),
+              null_count: nullCount,
+              distinct_count: distinctSet.size,
+            };
+          });
+          return {
+            dataset_id: hit.id,
+            row_count: hit.row_count,
+            fields: profFields,
+            columns: profFields,
           } as unknown as T;
         }
       }
@@ -232,7 +247,17 @@ export async function apiFetch<T = any>(
       const uploaded = getDemoUploadedDatasets();
       const customDashes = getDemoCreatedDashboards();
       if (uploaded.length > 0 && !parsedBody.demo_uploaded_datasets) {
-        if (path.startsWith("/ai/")) {
+        const stripRowsForSchemaOnly = (u: DemoUploadedDataset) => ({
+          ...u,
+          is_uploaded_excel: true,
+          rows: u.rows.slice(0, 5),
+        });
+        if (path === "/ai/generate-dashboard") {
+          const target = parsedBody.dataset_id
+            ? uploaded.filter((u) => u.id === parsedBody.dataset_id)
+            : uploaded;
+          parsedBody.demo_uploaded_datasets = target.map(stripRowsForSchemaOnly);
+        } else if (path.startsWith("/ai/")) {
           parsedBody.demo_uploaded_datasets = uploaded;
         } else if (parsedBody.dataset_id) {
           const one = uploaded.find((u) => u.id === parsedBody.dataset_id);

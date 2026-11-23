@@ -240,6 +240,7 @@ export interface DemoUploadedDataset {
 
 const UPLOADED_DATASETS_KEY = "bi_demo_uploaded_datasets_v1";
 const PREVIEW_DEMO_FLAG_KEY = "bi_is_preview_demo";
+const MEMORY_UPLOADED_DATASETS = new Map<string, DemoUploadedDataset>();
 
 export function isDemoPreviewMode(): boolean {
   if (!isBrowserDemo()) return false;
@@ -261,22 +262,41 @@ export function setDemoPreviewMode(active: boolean): void {
 
 export function getDemoUploadedDatasets(): DemoUploadedDataset[] {
   if (!isBrowserDemo()) return [];
+  let persisted: DemoUploadedDataset[] = [];
   try {
     const raw = localStorage.getItem(UPLOADED_DATASETS_KEY);
     const list = raw ? JSON.parse(raw) : [];
-    return Array.isArray(list) ? list : [];
+    persisted = Array.isArray(list) ? list : [];
   } catch {
-    return [];
+    persisted = [];
   }
+  const merged = new Map<string, DemoUploadedDataset>();
+  for (const ds of persisted) {
+    if (ds?.id) merged.set(ds.id, ds);
+  }
+  // In-memory cache preserves full untruncated rows & columns for the active session
+  MEMORY_UPLOADED_DATASETS.forEach((ds, id) => {
+    merged.set(id, ds);
+  });
+  return Array.from(merged.values());
 }
 
 export function saveDemoUploadedDataset(ds: DemoUploadedDataset): void {
   if (!isBrowserDemo() || !ds?.id) return;
+  MEMORY_UPLOADED_DATASETS.set(ds.id, ds);
   try {
     const list = getDemoUploadedDatasets().filter((d) => d.id !== ds.id);
-    // Keep rows trimmed cleanly to fit comfortably within localStorage if extremely huge (> 3000 rows)
-    const trimmed = ds.rows.length > 3000 ? { ...ds, rows: ds.rows.slice(0, 3000) } : ds;
-    localStorage.setItem(UPLOADED_DATASETS_KEY, JSON.stringify([trimmed, ...list]));
+    const nextList = [ds, ...list];
+    try {
+      localStorage.setItem(UPLOADED_DATASETS_KEY, JSON.stringify(nextList));
+    } catch {
+      // Browser localStorage quota (~5MB) exceeded for huge files: persist lightweight snapshot
+      // while keeping 100% of rows & columns in MEMORY_UPLOADED_DATASETS for this session.
+      const snapshotList = nextList.map((item) =>
+        item.rows.length > 200 ? { ...item, rows: item.rows.slice(0, 200) } : item
+      );
+      localStorage.setItem(UPLOADED_DATASETS_KEY, JSON.stringify(snapshotList));
+    }
   } catch {
     // ignore storage quota errors
   }
@@ -284,9 +304,12 @@ export function saveDemoUploadedDataset(ds: DemoUploadedDataset): void {
 
 export function deleteDemoUploadedDataset(dsId: string): void {
   if (!isBrowserDemo()) return;
+  MEMORY_UPLOADED_DATASETS.delete(dsId);
   try {
-    const list = getDemoUploadedDatasets().filter((d) => d.id !== dsId);
-    localStorage.setItem(UPLOADED_DATASETS_KEY, JSON.stringify(list));
+    const raw = localStorage.getItem(UPLOADED_DATASETS_KEY);
+    const list: DemoUploadedDataset[] = raw ? JSON.parse(raw) : [];
+    const next = Array.isArray(list) ? list.filter((d) => d.id !== dsId) : [];
+    localStorage.setItem(UPLOADED_DATASETS_KEY, JSON.stringify(next));
   } catch {
     // ignore
   }

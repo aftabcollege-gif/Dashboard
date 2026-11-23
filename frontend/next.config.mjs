@@ -6,6 +6,9 @@ const isVercelWithoutBackend =
 
 const nextConfig = {
   reactStrictMode: false,
+  experimental: {
+    proxyTimeout: 600_000,
+  },
   ...(isStandalone ? { output: "standalone" } : {}),
   ...(!disableBuildRewrites && !isVercelWithoutBackend
     ? {

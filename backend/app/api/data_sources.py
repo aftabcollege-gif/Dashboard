@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -16,7 +17,8 @@ from app.database import get_db
 from app.engines.connectors import (
     SUPPORTED_DB_TYPES,
     DataConnectorEngine,
-    parse_file_to_preview,
+    preview_file_from_path,
+    stream_import_file_to_warehouse,
 )
 from app.engines.warehouse import sanitize_identifier, warehouse
 from app.models.data import (
@@ -30,7 +32,18 @@ from app.models.identity import User
 
 router = APIRouter(prefix="/data-sources", tags=["Data Sources & File Ingestion"])
 
-ALLOWED_UPLOAD_EXTS = {".xlsx", ".xls", ".csv", ".tsv", ".json", ".xml"}
+ALLOWED_UPLOAD_EXTS = {
+    ".xlsx",
+    ".xls",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".jsonl",
+    ".ndjson",
+    ".log",
+    ".txt",
+    ".xml",
+}
 
 
 class DataSourceCreate(BaseModel):
@@ -47,21 +60,29 @@ class DirectQueryBody(BaseModel):
     limit: int = 200
 
 
-async def _read_upload_bounded(file: UploadFile) -> bytes:
-    chunks: list[bytes] = []
+async def _stream_upload_to_path(file: UploadFile, dest_path: str) -> int:
     total = 0
-    while True:
-        chunk = await file.read(1024 * 1024)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > settings.MAX_UPLOAD_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Uploaded file exceeds maximum allowed size ({settings.MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+    try:
+        with open(dest_path, "wb") as out_f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if settings.MAX_UPLOAD_BYTES > 0 and total > settings.MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file exceeds maximum allowed size ({settings.MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
+                    )
+                out_f.write(chunk)
+    except Exception:
+        if os.path.exists(dest_path):
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+        raise
+    return total
 
 
 def _org_upload_dir(org_id: str) -> str:
@@ -72,6 +93,8 @@ def _org_upload_dir(org_id: str) -> str:
 
 
 def _check_org_storage_quota(org_dir: str, incoming_bytes: int) -> None:
+    if settings.ORG_STORAGE_QUOTA_BYTES <= 0:
+        return
     used = 0
     for root, _, files in os.walk(org_dir):
         for fname in files:
@@ -90,7 +113,7 @@ def _check_org_storage_quota(org_dir: str, incoming_bytes: int) -> None:
 def get_supported_types():
     return {
         "databases": SUPPORTED_DB_TYPES,
-        "files": ["xlsx", "xls", "csv", "tsv", "json", "xml"],
+        "files": ["xlsx", "xls", "csv", "tsv", "json", "jsonl", "ndjson", "log", "txt", "xml"],
     }
 
 
@@ -259,10 +282,13 @@ async def preview_uploaded_file(
     ext = os.path.splitext(fname.lower())[1]
     if ext not in ALLOWED_UPLOAD_EXTS:
         raise HTTPException(status_code=400, detail=f"Unsupported file extension '{ext}'")
-    content = await _read_upload_bounded(file)
+
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
+        tmp_path = tf.name
     try:
-        parsed = parse_file_to_preview(
-            file_bytes=content,
+        await _stream_upload_to_path(file, tmp_path)
+        parsed = preview_file_from_path(
+            file_path=tmp_path,
             filename=fname,
             sheet_name=sheet_name,
             has_header=has_header,
@@ -275,14 +301,23 @@ async def preview_uploaded_file(
             "filename": file.filename,
             "sheets": parsed["sheets"],
             "total_rows": parsed["total_rows"],
+            "row_count_estimated": parsed.get("row_count_estimated", False),
             "duplicate_count": parsed["duplicate_count"],
             "null_counts": parsed["null_counts"],
             "data_quality": parsed["data_quality"],
             "columns": parsed["columns"],
             "preview_rows": parsed["preview_rows"],
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"File parse failed: {exc}")
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 @router.post("/files/import")
@@ -306,33 +341,43 @@ async def import_uploaded_file_dataset(
         raise HTTPException(status_code=400, detail=f"Unsupported file extension '{ext_with_dot}'")
     ext = ext_with_dot.lstrip(".")
 
-    content = await _read_upload_bounded(file)
     org_dir = _org_upload_dir(user.organization_id)
-    _check_org_storage_quota(org_dir, len(content))
-
     safe_stem = re.sub(r"_+", "_", sanitize_identifier(os.path.splitext(fname)[0])).strip("_") or "upload"
     safe_fname = f"{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}_{safe_stem}.{ext}"
     saved_path = os.path.join(org_dir, safe_fname)
 
-    # Parse and validate BEFORE persisting permanently; clean up on any failure
+    await _stream_upload_to_path(file, saved_path)
     try:
-        parsed = parse_file_to_preview(
-            file_bytes=content,
-            filename=fname,
-            sheet_name=sheet_name,
-            has_header=has_header,
-            null_strategy=null_strategy,
-            deduplicate=deduplicate,
-            column_renames=json.loads(column_renames_json or "{}"),
-            type_overrides=json.loads(type_overrides_json or "{}"),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Import parse error: {exc}")
+        _check_org_storage_quota(org_dir, 0)  # saved_path already exists inside org_dir
+    except HTTPException:
+        if os.path.exists(saved_path):
+            try:
+                os.remove(saved_path)
+            except OSError:
+                pass
+        raise
 
-    with open(saved_path, "wb") as f:
-        f.write(content)
+    org_short = re.sub(r"[^a-z0-9]", "", user.organization_id.lower())[:6] or "org"
+    clean_slug = re.sub(r"_+", "_", sanitize_identifier(dataset_name)).strip("_")[:40] or "excel"
+    wh_table = f"wh_file_{org_short}_{clean_slug}_{uuid.uuid4().hex[:8]}"
 
     try:
+        try:
+            imported = stream_import_file_to_warehouse(
+                file_path=saved_path,
+                filename=fname,
+                wh_table=wh_table,
+                warehouse_engine=warehouse,
+                sheet_name=sheet_name,
+                has_header=has_header,
+                null_strategy=null_strategy,
+                deduplicate=deduplicate,
+                column_renames=json.loads(column_renames_json or "{}"),
+                type_overrides=json.loads(type_overrides_json or "{}"),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Import parse error: {exc}")
+
         src = DataSource(
             organization_id=user.organization_id,
             name=f"File: {fname}",
@@ -347,11 +392,6 @@ async def import_uploaded_file_dataset(
         db.add(src)
         db.flush()
 
-        org_short = re.sub(r"[^a-z0-9]", "", user.organization_id.lower())[:6] or "org"
-        clean_slug = re.sub(r"_+", "_", sanitize_identifier(dataset_name)).strip("_")[:40] or "excel"
-        wh_table = f"wh_file_{org_short}_{clean_slug}_{uuid.uuid4().hex[:8]}"
-        load_stats = warehouse.load_dataframe(wh_table, parsed["dataframe"], mode="replace")
-
         ds = Dataset(
             organization_id=user.organization_id,
             data_source_id=src.id,
@@ -360,15 +400,15 @@ async def import_uploaded_file_dataset(
             warehouse_table=wh_table,
             schema_type="flat",
             refresh_policy="manual",
-            row_count=load_stats["total_rows"],
+            row_count=imported["total_rows"],
             last_refreshed_at=datetime.now(timezone.utc),
             freshness_status="fresh",
         )
         db.add(ds)
         db.flush()
 
-        for col_meta in parsed["columns"]:
-            db.add(
+        db.add_all(
+            [
                 DatasetField(
                     dataset_id=ds.id,
                     field_name=col_meta["field_name"],
@@ -376,7 +416,9 @@ async def import_uploaded_file_dataset(
                     data_type=col_meta["data_type"],
                     semantic_role=col_meta["semantic_role"],
                 )
-            )
+                for col_meta in imported["columns"]
+            ]
+        )
 
         db.add(
             DataLineage(
@@ -386,8 +428,9 @@ async def import_uploaded_file_dataset(
                 target_id=ds.id,
                 metadata_json={
                     "filename": fname,
-                    "rows": load_stats["total_rows"],
-                    "data_quality": parsed["data_quality"],
+                    "rows": imported["total_rows"],
+                    "columns_count": len(imported["columns"]),
+                    "data_quality": imported["data_quality"],
                 },
             )
         )
@@ -395,11 +438,20 @@ async def import_uploaded_file_dataset(
             db, user.organization_id, "file_dataset_imported", "dataset",
             resource_id=ds.id, user_id=user.id, username=user.username,
             ip_address=get_client_ip(request),
-            details={"filename": fname, "rows": load_stats["total_rows"], "dq_score": parsed["data_quality"]["dq_score"]}
+            details={
+                "filename": fname,
+                "rows": imported["total_rows"],
+                "columns": len(imported["columns"]),
+                "dq_score": imported["data_quality"]["dq_score"],
+            },
         )
         db.commit()
     except Exception:
         db.rollback()
+        try:
+            warehouse.drop_table(wh_table)
+        except Exception:
+            pass
         if os.path.exists(saved_path):
             try:
                 os.remove(saved_path)
@@ -413,6 +465,7 @@ async def import_uploaded_file_dataset(
         "name": ds.name,
         "warehouse_table": wh_table,
         "row_count": ds.row_count,
-        "data_quality": parsed["data_quality"],
-        "columns": parsed["columns"],
+        "columns_count": len(imported["columns"]),
+        "data_quality": imported["data_quality"],
+        "columns": imported["columns"],
     }

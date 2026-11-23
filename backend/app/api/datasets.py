@@ -87,6 +87,7 @@ def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(
             "refresh_policy": d.refresh_policy,
             "data_version": d.data_version,
             "row_count": d.row_count,
+            "columns_count": len(visible_fields),
             "last_refreshed_at": d.last_refreshed_at,
             "freshness_status": d.freshness_status,
             "is_uploaded_excel": bool(d.warehouse_table and d.warehouse_table.startswith("wh_file_")),
@@ -330,7 +331,9 @@ def delete_dataset(dataset_id: str, user: User = Depends(get_current_user), db: 
         other_ds_on_src = (
             db.query(Dataset).filter(Dataset.data_source_id == ds.data_source_id, Dataset.id != ds.id).first()
         )
-        if src and not other_ds_on_src and src.source_type in ("excel", "csv", "tsv", "json", "xml"):
+        if src and not other_ds_on_src and src.source_type in (
+            "excel", "csv", "tsv", "json", "jsonl", "ndjson", "log", "txt", "xml"
+        ):
             fpath = (src.config_json or {}).get("file_path")
             if fpath and os.path.exists(fpath):
                 try:

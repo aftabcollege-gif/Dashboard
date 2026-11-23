@@ -32,7 +32,7 @@ class AiAnalyticsEngine:
 
     @staticmethod
     def recommend_widgets_for_dataset(
-        db: Session, dataset: Dataset, user: Optional[User] = None
+        db: Session, dataset: Dataset, user: Optional[User] = None, include_profile: bool = True
     ) -> dict[str, Any]:
         sec_ctx = build_data_security_context(db, user, dataset.id) if user is not None else None
         hidden = sec_ctx.hidden_columns if sec_ctx else set()
@@ -50,12 +50,12 @@ class AiAnalyticsEngine:
                 for c in cols
                 if any(k in c["column_type"].lower() for k in ("int", "double", "float", "decimal"))
                 and not c["column_name"].endswith("_id")
-                and c["column_name"] not in ("year", "month", "quarter", "day")
+                and c["column_name"] not in ("year", "month", "quarter", "day", "line_number", "status_code")
             ]
             times = [
                 c["column_name"]
                 for c in cols
-                if any(k in c["column_name"].lower() for k in ("date", "month", "year", "quarter"))
+                if any(k in c["column_type"].lower() or k in c["column_name"].lower() for k in ("date", "time", "month", "year", "quarter"))
             ]
             geos = [
                 c["column_name"]
@@ -72,10 +72,15 @@ class AiAnalyticsEngine:
         else:
             for f in fields:
                 label_map[f.field_name] = f.display_name or f.field_name.replace("_", " ").title()
-            measures = [f.field_name for f in fields if f.semantic_role == "measure"]
+            measures = [f.field_name for f in fields if f.semantic_role == "measure" and f.field_name != "line_number"]
             times = [f.field_name for f in fields if f.semantic_role == "time"]
             geos = [f.field_name for f in fields if f.semantic_role == "geo"]
             dims = [f.field_name for f in fields if f.semantic_role in ("dimension", "geo")]
+
+        pref_log_dims = [c for c in ("level", "status_code", "service", "method", "logger", "host", "path", "region", "category", "department", "product") if c in dims]
+        dims = pref_log_dims + [c for c in dims if c not in pref_log_dims]
+        pref_log_measures = [c for c in ("revenue", "profit", "sales", "amount", "latency_ms", "duration_ms", "response_bytes", "bytes") if c in measures]
+        measures = pref_log_measures + [c for c in measures if c not in pref_log_measures]
 
         def _lbl(col_name: Optional[str]) -> str:
             if not col_name or col_name == "*":
@@ -152,7 +157,7 @@ class AiAnalyticsEngine:
                 if d
             ][:4]
             return {
-                "profile": DataProfiler.profile_table(dataset.warehouse_table, sec_ctx=sec_ctx),
+                "profile": DataProfiler.profile_table(dataset.warehouse_table, sec_ctx=sec_ctx) if include_profile else None,
                 "suggested_widgets": specs,
                 "suggested_filters": suggested_filters,
             }
@@ -250,7 +255,7 @@ class AiAnalyticsEngine:
             for d in (dims + geos)[:3]
         ]
         return {
-            "profile": DataProfiler.profile_table(dataset.warehouse_table, sec_ctx=sec_ctx),
+            "profile": DataProfiler.profile_table(dataset.warehouse_table, sec_ctx=sec_ctx) if include_profile else None,
             "suggested_widgets": specs,
             "suggested_filters": suggested_filters,
         }
@@ -263,7 +268,7 @@ class AiAnalyticsEngine:
         dataset: Dataset,
         title: Optional[str] = None,
     ) -> Dashboard:
-        rec = AiAnalyticsEngine.recommend_widgets_for_dataset(db, dataset, user=user)
+        rec = AiAnalyticsEngine.recommend_widgets_for_dataset(db, dataset, user=user, include_profile=False)
         dash = Dashboard(
             workspace_id=workspace_id,
             title=title or f"AI Executive Insights — {dataset.name}",
@@ -1308,6 +1313,7 @@ class AiAnalyticsEngine:
             (["فروش", "درآمد", "سود", "سفارش", "محصول", "مناطق", "منطقه", "sales", "revenue"], ["sales", "revenue"]),
             (["هزینه", "بودجه", "خرج", "مالی", "expense", "budget", "cost"], ["expense", "cost", "budget"]),
             (["پرسنل", "کارمند", "کارکنان", "حقوق", "منابع انسانی", "نیروی انسانی", "hr", "employee"], ["hr", "workforce"]),
+            (["لاگ", "خطا", "سرور", "درخواست", "log", "error", "request", "access", "nginx"], ["log", "لاگ", "access", "error"]),
         ]
         for kws, targets in syn_groups:
             if any(k in text_low for k in kws):
@@ -1371,14 +1377,14 @@ class AiAnalyticsEngine:
             return col_label_map.get(col, col.replace("_", " ").title())
 
         # Prioritize meaningful dimensions & measures
-        pref_dims = [c for c in ("contractor_name", "region", "project_type", "category", "department", "product", "channel", "city") if c in dim_cols]
+        pref_dims = [c for c in ("contractor_name", "region", "project_type", "category", "department", "product", "channel", "city", "level", "status_code", "service", "method", "logger", "host") if c in dim_cols]
         rest_dims = [c for c in dim_cols if c not in pref_dims and not c.endswith("_code")]
         ordered_dims = pref_dims + rest_dims
         primary_dim = ordered_dims[0] if ordered_dims else None
         secondary_dim = ordered_dims[1] if len(ordered_dims) > 1 else primary_dim
         time_col = next((c["name"] for c in cols_info if c.get("role") == "time"), None)
 
-        pref_nums = [c for c in ("project_count", "revenue", "profit", "actual_amount", "performance_score", "contract_value", "salary") if c in num_cols]
+        pref_nums = [c for c in ("project_count", "revenue", "profit", "actual_amount", "performance_score", "contract_value", "salary", "latency_ms", "duration_ms", "response_bytes", "bytes") if c in num_cols]
         rest_nums = [c for c in num_cols if c not in pref_nums]
         ordered_nums = pref_nums + rest_nums
         primary_num = ordered_nums[0] if ordered_nums else "*"

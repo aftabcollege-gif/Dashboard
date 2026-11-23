@@ -41,6 +41,9 @@ export default function DataSourcesPage() {
   const [nullStrategy, setNullStrategy] = useState("keep");
   const [deduplicate, setDeduplicate] = useState(false);
   const [previewData, setPreviewData] = useState<any>(null);
+  const [previewColPage, setPreviewColPage] = useState(0);
+  const [previewing, setPreviewing] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [colRenames, setColRenames] = useState<Record<string, string>>({});
   const [typeOverrides, setTypeOverrides] = useState<Record<string, string>>({});
   const [dragging, setDragging] = useState(false);
@@ -118,7 +121,8 @@ export default function DataSourcesPage() {
 
   const handlePreviewFile = async (file: File, chosenSheet?: string) => {
     setFileObj(file);
-    if (!datasetName) setDatasetName(file.name.replace(/\.[^.]+$/, ""));
+    setPreviewColPage(0);
+    if (!chosenSheet) setDatasetName(file.name.replace(/\.[^.]+$/, ""));
     const fd = new FormData();
     fd.append("file", file);
     if (chosenSheet) fd.append("sheet_name", chosenSheet);
@@ -128,17 +132,20 @@ export default function DataSourcesPage() {
     fd.append("column_renames_json", JSON.stringify(colRenames));
     fd.append("type_overrides_json", JSON.stringify(typeOverrides));
 
+    setPreviewing(true);
     try {
       const res = await apiFetch("/data-sources/files/preview", { method: "POST", body: fd });
       setPreviewData(res);
       if (res.sheets?.length && !chosenSheet) setSheetName(res.sheets[0]);
     } catch (err: any) {
       showToast(err.message);
+    } finally {
+      setPreviewing(false);
     }
   };
 
   const handleImportDataset = async () => {
-    if (!fileObj || !datasetName) return;
+    if (!fileObj || !datasetName || importing) return;
     const fd = new FormData();
     fd.append("file", fileObj);
     fd.append("dataset_name", datasetName);
@@ -148,17 +155,21 @@ export default function DataSourcesPage() {
     fd.append("deduplicate", String(deduplicate));
     fd.append("column_renames_json", JSON.stringify(colRenames));
     fd.append("type_overrides_json", JSON.stringify(typeOverrides));
+    setImporting(true);
     try {
       const res = await apiFetch("/data-sources/files/import", { method: "POST", body: fd });
       showToast(`Imported ${res.row_count} rows into '${res.name || res.warehouse_table}'!`);
       setLastImported(res);
       setPreviewData(null);
+      setPreviewColPage(0);
       setFileObj(null);
       setColRenames({});
       setTypeOverrides({});
       load();
     } catch (err: any) {
       showToast(err.message);
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -186,14 +197,14 @@ export default function DataSourcesPage() {
             <Database className="w-5 h-5" style={{ color: "var(--bi-primary)" }} /> Data Connectivity & File Ingestion
           </h1>
           <p className="text-xs mt-1" style={{ color: "var(--bi-muted)" }}>
-            Connect to PostgreSQL, SQL Server, MySQL, MariaDB, Oracle, SQLite, MongoDB, REST/GraphQL APIs or drag & drop Excel/CSV/JSON/XML.
+            Connect to PostgreSQL, SQL Server, MySQL, MariaDB, Oracle, SQLite, MongoDB, REST/GraphQL APIs or drag & drop Excel, CSV, TSV, JSON/JSONL, Log (.log/.txt), or XML files (no row/column limits).
           </p>
         </div>
 
         {/* Section 1: Drag & Drop File Ingestion */}
         <div className="bi-card p-5 space-y-4">
           <h2 className="text-sm font-bold flex items-center gap-2">
-            <FileSpreadsheet className="w-4 h-4 text-emerald-500" /> Excel / CSV / JSON / XML File Importer
+            <FileSpreadsheet className="w-4 h-4 text-emerald-500" /> Excel / Log / CSV / JSON File Importer
           </h2>
 
           <div
@@ -213,15 +224,20 @@ export default function DataSourcesPage() {
             <UploadCloud className="w-8 h-8 mx-auto mb-2 opacity-60" />
             <p className="text-xs font-semibold">
               {locale === "fa"
-                ? "فایل اکسل (.xlsx / .xls / .csv / .json) را اینجا بکشید و رها کنید یا انتخاب نمایید"
-                : "Drag & drop .xlsx, .xls, .csv, .tsv, .json, .xml here or select a file"}
+                ? "فایل اکسل (.xlsx / .xls)، فایل لاگ (.log / .txt / .jsonl) یا CSV/JSON/XML را اینجا بکشید و رها کنید"
+                : "Drag & drop .xlsx, .xls, .csv, .tsv, .json, .jsonl, .ndjson, .log, .txt, .xml here or select a file"}
             </p>
             <input
               type="file"
-              accept=".xlsx,.xls,.csv,.tsv,.json,.xml"
+              accept=".xlsx,.xls,.csv,.tsv,.json,.jsonl,.ndjson,.log,.txt,.xml"
               onChange={(e) => e.target.files?.[0] && handlePreviewFile(e.target.files[0])}
               className="mt-3 text-xs"
             />
+            {previewing && (
+              <p className="text-xs mt-2 text-blue-500 font-semibold">
+                {locale === "fa" ? "در حال خواندن و پیش‌نمایش فایل..." : "Reading & generating preview..."}
+              </p>
+            )}
           </div>
 
           {lastImported && (
@@ -300,91 +316,134 @@ export default function DataSourcesPage() {
             </div>
           )}
 
-          {previewData && (
-            <div className="space-y-3 pt-2 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
-              <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-                <input
-                  value={datasetName}
-                  onChange={(e) => setDatasetName(e.target.value)}
-                  placeholder="Dataset Name"
-                  className="px-2.5 py-1.5 rounded border bg-transparent"
-                  style={{ borderColor: "var(--bi-border)" }}
-                />
-                {previewData.sheets?.length > 0 && (
-                  <select
-                    value={sheetName}
-                    onChange={(e) => { setSheetName(e.target.value); fileObj && handlePreviewFile(fileObj, e.target.value); }}
+          {previewData && (() => {
+            const PREVIEW_COL_PAGE_SIZE = 40;
+            const totalCols = previewData.columns?.length || 0;
+            const totalColPages = Math.max(1, Math.ceil(totalCols / PREVIEW_COL_PAGE_SIZE));
+            const safeColPage = Math.min(previewColPage, totalColPages - 1);
+            const startCol = safeColPage * PREVIEW_COL_PAGE_SIZE;
+            const visibleCols = (previewData.columns || []).slice(startCol, startCol + PREVIEW_COL_PAGE_SIZE);
+            return (
+              <div className="space-y-3 pt-2 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
+                  <input
+                    value={datasetName}
+                    onChange={(e) => setDatasetName(e.target.value)}
+                    placeholder="Dataset Name"
                     className="px-2.5 py-1.5 rounded border bg-transparent"
                     style={{ borderColor: "var(--bi-border)" }}
-                  >
-                    {previewData.sheets.map((s: string) => <option key={s} value={s}>Sheet: {s}</option>)}
+                  />
+                  {previewData.sheets?.length > 0 && (
+                    <select
+                      value={sheetName}
+                      onChange={(e) => { setSheetName(e.target.value); fileObj && handlePreviewFile(fileObj, e.target.value); }}
+                      className="px-2.5 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      {previewData.sheets.map((s: string) => <option key={s} value={s}>Sheet: {s}</option>)}
+                    </select>
+                  )}
+                  <select value={nullStrategy} onChange={(e) => setNullStrategy(e.target.value)} className="px-2.5 py-1.5 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
+                    <option value="keep">Nulls: Keep</option>
+                    <option value="drop_rows">Nulls: Drop Rows</option>
+                    <option value="fill_zero">Nulls: Fill Zero/Unknown</option>
+                    <option value="fill_mean">Nulls: Fill Mean</option>
                   </select>
-                )}
-                <select value={nullStrategy} onChange={(e) => setNullStrategy(e.target.value)} className="px-2.5 py-1.5 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
-                  <option value="keep">Nulls: Keep</option>
-                  <option value="drop_rows">Nulls: Drop Rows</option>
-                  <option value="fill_zero">Nulls: Fill Zero/Unknown</option>
-                  <option value="fill_mean">Nulls: Fill Mean</option>
-                </select>
-                <label className="flex items-center gap-1.5 px-2">
-                  <input type="checkbox" checked={hasHeader} onChange={(e) => setHasHeader(e.target.checked)} />
-                  <span>Auto Header</span>
-                </label>
-                <label className="flex items-center gap-1.5 px-2">
-                  <input type="checkbox" checked={deduplicate} onChange={(e) => setDeduplicate(e.target.checked)} />
-                  <span>Dedup ({previewData.duplicate_count})</span>
-                </label>
-                <button onClick={handleImportDataset} className="px-3 py-1.5 rounded text-white font-bold bg-emerald-600">
-                  Import ({previewData.total_rows} rows)
-                </button>
-              </div>
+                  <label className="flex items-center gap-1.5 px-2">
+                    <input type="checkbox" checked={hasHeader} onChange={(e) => setHasHeader(e.target.checked)} />
+                    <span>Auto Header</span>
+                  </label>
+                  <label className="flex items-center gap-1.5 px-2">
+                    <input type="checkbox" checked={deduplicate} onChange={(e) => setDeduplicate(e.target.checked)} />
+                    <span>Dedup ({previewData.duplicate_count})</span>
+                  </label>
+                  <button
+                    type="button"
+                    disabled={importing}
+                    onClick={handleImportDataset}
+                    className="px-3 py-1.5 rounded text-white font-bold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60"
+                  >
+                    {importing
+                      ? locale === "fa" ? "در حال ورود داده‌ها..." : "Importing..."
+                      : `Import (${previewData.row_count_estimated ? "~" : ""}${(previewData.total_rows || 0).toLocaleString()} rows · ${totalCols.toLocaleString()} cols)`}
+                  </button>
+                </div>
 
-              <div className="overflow-auto max-h-56 rounded border" style={{ borderColor: "var(--bi-border)" }}>
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b" style={{ borderColor: "var(--bi-border)" }}>
-                      {previewData.columns.map((c: any) => (
-                        <th key={c.field_name} className="px-2.5 py-2 text-start font-semibold whitespace-nowrap align-top">
-                          <div className="space-y-1">
-                            <input
-                              value={colRenames[c.field_name] ?? c.field_name}
-                              onChange={(e) => setColRenames({ ...colRenames, [c.field_name]: e.target.value })}
-                              className="w-28 px-1.5 py-0.5 rounded border bg-transparent text-[11px] font-semibold"
-                              style={{ borderColor: "var(--bi-border)" }}
-                              title="Rename column"
-                            />
-                            <select
-                              value={typeOverrides[c.field_name] || ""}
-                              onChange={(e) => setTypeOverrides({ ...typeOverrides, [c.field_name]: e.target.value })}
-                              className="block w-28 px-1 py-0.5 rounded border bg-transparent text-[10px] opacity-80"
-                              style={{ borderColor: "var(--bi-border)" }}
-                              title="Cast data type"
-                            >
-                              <option value="">Auto ({c.data_type})</option>
-                              <option value="string">string</option>
-                              <option value="integer">integer</option>
-                              <option value="float">float</option>
-                              <option value="date">date</option>
-                              <option value="boolean">boolean</option>
-                            </select>
-                          </div>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {previewData.preview_rows.slice(0, 15).map((r: any, i: number) => (
-                      <tr key={i} className="border-b" style={{ borderColor: "var(--bi-border)" }}>
-                        {previewData.columns.map((c: any) => (
-                          <td key={c.field_name} className="px-2.5 py-1 whitespace-nowrap">{String(r[c.field_name] ?? "")}</td>
+                {totalCols > PREVIEW_COL_PAGE_SIZE && (
+                  <div className="flex items-center justify-between px-2 py-1 rounded bg-slate-500/10 text-[11px]">
+                    <span>
+                      Showing columns {startCol + 1}–{Math.min(startCol + PREVIEW_COL_PAGE_SIZE, totalCols)} of {totalCols.toLocaleString()}
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={safeColPage <= 0}
+                        onClick={() => setPreviewColPage((p) => Math.max(0, p - 1))}
+                        className="px-2 py-0.5 rounded border disabled:opacity-40"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        Prev Cols
+                      </button>
+                      <button
+                        type="button"
+                        disabled={safeColPage >= totalColPages - 1}
+                        onClick={() => setPreviewColPage((p) => Math.min(totalColPages - 1, p + 1))}
+                        className="px-2 py-0.5 rounded border disabled:opacity-40"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        Next Cols
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="overflow-auto max-h-56 rounded border" style={{ borderColor: "var(--bi-border)" }}>
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b" style={{ borderColor: "var(--bi-border)" }}>
+                        {visibleCols.map((c: any) => (
+                          <th key={c.field_name} className="px-2.5 py-2 text-start font-semibold whitespace-nowrap align-top">
+                            <div className="space-y-1">
+                              <input
+                                value={colRenames[c.field_name] ?? c.field_name}
+                                onChange={(e) => setColRenames({ ...colRenames, [c.field_name]: e.target.value })}
+                                className="w-28 px-1.5 py-0.5 rounded border bg-transparent text-[11px] font-semibold"
+                                style={{ borderColor: "var(--bi-border)" }}
+                                title="Rename column"
+                              />
+                              <select
+                                value={typeOverrides[c.field_name] || ""}
+                                onChange={(e) => setTypeOverrides({ ...typeOverrides, [c.field_name]: e.target.value })}
+                                className="block w-28 px-1 py-0.5 rounded border bg-transparent text-[10px] opacity-80"
+                                style={{ borderColor: "var(--bi-border)" }}
+                                title="Cast data type"
+                              >
+                                <option value="">Auto ({c.data_type})</option>
+                                <option value="string">string</option>
+                                <option value="integer">integer</option>
+                                <option value="float">float</option>
+                                <option value="date">date</option>
+                                <option value="boolean">boolean</option>
+                              </select>
+                            </div>
+                          </th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {previewData.preview_rows.slice(0, 15).map((r: any, i: number) => (
+                        <tr key={i} className="border-b" style={{ borderColor: "var(--bi-border)" }}>
+                          {visibleCols.map((c: any) => (
+                            <td key={c.field_name} className="px-2.5 py-1 whitespace-nowrap">{String(r[c.field_name] ?? "")}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
         </div>
 
         {/* Section 2: Database & API Connections */}

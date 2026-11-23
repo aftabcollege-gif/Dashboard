@@ -1040,22 +1040,47 @@ function buildDemoFullDashboard(ds: any, title: string, layoutPreset: string, th
   const labelMap = new Map<string, string>(colsInfo.map((c: any) => [c.name, c.label]));
   const lbl = (col?: string | null) => (!col || col === "*" ? "رکوردها" : labelMap.get(col) || col.replace(/_/g, " "));
 
-  const prefDims = ["contractor_name", "region", "project_type", "category", "department", "product", "channel", "city"].filter((c) => dimCols.includes(c));
-  const restDims = dimCols.filter((c: string) => !prefDims.includes(c) && !c.endsWith("_code"));
+  const prefDims = [
+    "level",
+    "status_code",
+    "service",
+    "method",
+    "logger",
+    "contractor_name",
+    "region",
+    "project_type",
+    "category",
+    "department",
+    "product",
+    "channel",
+    "city",
+  ].filter((c) => dimCols.includes(c));
+  const restDims = dimCols.filter((c: string) => !prefDims.includes(c) && !c.endsWith("_code") && c !== "line_number");
   const orderedDims = [...prefDims, ...restDims];
   const primaryDim = orderedDims[0] || null;
   const secondaryDim = orderedDims[1] || primaryDim;
   const timeCol = colsInfo.find((c: any) => c.role === "time")?.name || null;
 
-  const prefNums = ["project_count", "revenue", "profit", "actual_amount", "performance_score", "contract_value", "salary"].filter((c) => numCols.includes(c));
-  const restNums = numCols.filter((c: string) => !prefNums.includes(c));
+  const prefNums = [
+    "project_count",
+    "revenue",
+    "profit",
+    "actual_amount",
+    "performance_score",
+    "contract_value",
+    "salary",
+    "latency_ms",
+    "duration_ms",
+    "response_bytes",
+  ].filter((c) => numCols.includes(c));
+  const restNums = numCols.filter((c: string) => !prefNums.includes(c) && c !== "line_number" && c !== "status_code");
   const orderedNums = [...prefNums, ...restNums];
   const primaryNum = orderedNums[0] || "*";
   const secondaryNum = orderedNums[1] || primaryNum;
 
   const aggFor = (col: string) => {
     if (col === "*") return "COUNT";
-    if (["score", "pct", "rate", "ratio", "margin"].some((k) => col.toLowerCase().includes(k))) return "AVG";
+    if (["score", "pct", "rate", "ratio", "margin", "latency", "duration"].some((k) => col.toLowerCase().includes(k))) return "AVG";
     return "SUM";
   };
   const pAgg = aggFor(primaryNum);
@@ -1074,14 +1099,16 @@ function buildDemoFullDashboard(ds: any, title: string, layoutPreset: string, th
       visual_spec: { y_field: "*", aggregation: "COUNT" },
       style: { number_format: "number" },
     });
-    specs.push({
-      title: `${pAgg === "AVG" ? "میانگین" : "مجموع"} ${lbl(primaryNum)}`,
-      chart_type: "kpi",
-      layout: { x: 4, y: 0, w: 4, h: 3 },
-      visual_spec: { y_field: primaryNum, aggregation: pAgg },
-      style: { number_format: isCurrP && pAgg !== "COUNT" ? "currency" : "number" },
-    });
-    if (secondaryNum !== primaryNum) {
+    if (primaryNum !== "*") {
+      specs.push({
+        title: `${pAgg === "AVG" ? "میانگین" : "مجموع"} ${lbl(primaryNum)}`,
+        chart_type: "kpi",
+        layout: { x: 4, y: 0, w: 4, h: 3 },
+        visual_spec: { y_field: primaryNum, aggregation: pAgg },
+        style: { number_format: isCurrP && pAgg !== "COUNT" ? "currency" : "number" },
+      });
+    }
+    if (secondaryNum !== primaryNum && secondaryNum !== "*") {
       specs.push({
         title: `${sAgg === "AVG" ? "میانگین" : "مجموع"} ${lbl(secondaryNum)}`,
         chart_type: "kpi",
@@ -2025,7 +2052,11 @@ export async function handleVercelDemoApi(
     return { status: 200, body: demoData.data_sources || [] };
   }
   if (method === "GET" && path === "/data-sources/supported-types") {
-    return { status: 200, body: demoData.supported_types || { databases: [], files: [] } };
+    const base = demoData.supported_types || { databases: [], files: [] };
+    const mergedFiles = Array.from(
+      new Set([...(base.files || []), "xlsx", "xls", "csv", "tsv", "json", "jsonl", "ndjson", "log", "txt", "xml"])
+    );
+    return { status: 200, body: { ...base, files: mergedFiles } };
   }
   if (method === "POST" && segments[0] === "data-sources" && segments[2] === "test") {
     return { status: 200, body: { ok: true, latency_ms: 4.1, message: "Preview ERP SQLite source reachable (demo snapshot)" } };

@@ -131,51 +131,57 @@ class DataProfiler:
         row_count = int(count_res["rows"][0]["cnt"]) if count_res["rows"] else 0
 
         visible_set = set(visible_cols)
+        visible_meta = [c for c in cols_info if c["column_name"] in visible_set]
         field_stats: list[dict[str, Any]] = []
-        for c in cols_info:
-            cname = c["column_name"]
-            if cname not in visible_set:
-                continue
-            ctype = c["column_type"].lower()
-            is_masked = cname in eff_ctx.masked_columns
-            is_num = (not is_masked) and any(
-                k in ctype for k in ("int", "double", "float", "decimal", "hugeint", "bigint")
-            )
-            if is_num:
-                q = f'''
-                    SELECT
-                        COUNT(DISTINCT "{cname}") AS distinct_cnt,
-                        COUNT(*) - COUNT("{cname}") AS null_cnt,
-                        MIN("{cname}") AS min_val,
-                        MAX("{cname}") AS max_val,
-                        AVG("{cname}") AS avg_val,
-                        MEDIAN("{cname}") AS median_val
-                    FROM ({sub_sql}) AS _prof
-                '''
-            else:
-                q = f'''
-                    SELECT
-                        COUNT(DISTINCT "{cname}") AS distinct_cnt,
-                        COUNT(*) - COUNT("{cname}") AS null_cnt,
-                        CAST(MIN("{cname}") AS VARCHAR) AS min_val,
-                        CAST(MAX("{cname}") AS VARCHAR) AS max_val,
-                        NULL AS avg_val,
-                        NULL AS median_val
-                    FROM ({sub_sql}) AS _prof
-                '''
-            stat = warehouse.execute_query(q, params)["rows"][0]
-            field_stats.append(
-                {
-                    "field_name": cname,
-                    "raw_type": "VARCHAR" if is_masked else c["column_type"],
-                    "distinct_count": int(stat["distinct_cnt"] or 0),
-                    "null_count": int(stat["null_cnt"] or 0),
-                    "min": stat["min_val"],
-                    "max": stat["max_val"],
-                    "avg": round(float(stat["avg_val"]), 4) if stat["avg_val"] is not None else None,
-                    "median": round(float(stat["median_val"]), 4) if stat["median_val"] is not None else None,
-                }
-            )
+        fast_approx = row_count > 200_000
+        batch_size = 25
+
+        for start in range(0, len(visible_meta), batch_size):
+            batch = visible_meta[start : start + batch_size]
+            select_exprs: list[str] = []
+            col_flags: list[tuple[dict[str, str], bool, bool]] = []
+            for idx, c in enumerate(batch):
+                cname = c["column_name"]
+                ctype = c["column_type"].lower()
+                is_masked = cname in eff_ctx.masked_columns
+                is_num = (not is_masked) and any(
+                    k in ctype for k in ("int", "double", "float", "decimal", "hugeint", "bigint")
+                )
+                col_flags.append((c, is_masked, is_num))
+                distinct_fn = f'APPROX_COUNT_DISTINCT("{cname}")' if fast_approx else f'COUNT(DISTINCT "{cname}")'
+                select_exprs.append(f'{distinct_fn} AS "d_{idx}"')
+                select_exprs.append(f'(COUNT(*) - COUNT("{cname}")) AS "n_{idx}"')
+                if is_num:
+                    select_exprs.append(f'MIN("{cname}") AS "mn_{idx}"')
+                    select_exprs.append(f'MAX("{cname}") AS "mx_{idx}"')
+                    select_exprs.append(f'AVG("{cname}") AS "av_{idx}"')
+                    select_exprs.append(
+                        f'NULL AS "md_{idx}"' if fast_approx else f'MEDIAN("{cname}") AS "md_{idx}"'
+                    )
+                else:
+                    select_exprs.append(f'CAST(MIN("{cname}") AS VARCHAR) AS "mn_{idx}"')
+                    select_exprs.append(f'CAST(MAX("{cname}") AS VARCHAR) AS "mx_{idx}"')
+                    select_exprs.append(f'NULL AS "av_{idx}"')
+                    select_exprs.append(f'NULL AS "md_{idx}"')
+
+            q = f'SELECT {", ".join(select_exprs)} FROM ({sub_sql}) AS _prof'
+            stat_rows = warehouse.execute_query(q, params, limit=1)["rows"]
+            stat = stat_rows[0] if stat_rows else {}
+            for idx, (c, is_masked, _is_num) in enumerate(col_flags):
+                av = stat.get(f"av_{idx}")
+                md = stat.get(f"md_{idx}")
+                field_stats.append(
+                    {
+                        "field_name": c["column_name"],
+                        "raw_type": "VARCHAR" if is_masked else c["column_type"],
+                        "distinct_count": int(stat.get(f"d_{idx}") or 0),
+                        "null_count": int(stat.get(f"n_{idx}") or 0),
+                        "min": stat.get(f"mn_{idx}"),
+                        "max": stat.get(f"mx_{idx}"),
+                        "avg": round(float(av), 4) if av is not None else None,
+                        "median": round(float(md), 4) if md is not None else None,
+                    }
+                )
         return {"table_name": table_name, "row_count": row_count, "fields": field_stats}
 
     @staticmethod

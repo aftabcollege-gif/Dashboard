@@ -110,11 +110,16 @@ class AnalyticalWarehouse:
         conn = duckdb.connect(db_path)
         try:
             threads = max(1, min(int(settings.DUCKDB_THREADS), 32))
-            mem = re.sub(r"[^A-Za-z0-9]", "", str(settings.DUCKDB_MEMORY_LIMIT)) or "1GB"
+            mem = re.sub(r"[^A-Za-z0-9]", "", str(settings.DUCKDB_MEMORY_LIMIT)) or "2GB"
 
             # Apply each mandatory hardening directive individually and verify fail-closed
             conn.execute(f"SET threads = {threads}")
             conn.execute(f"SET memory_limit = '{mem}'")
+            if db_path and db_path != ":memory:":
+                spill_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), ".duckdb_tmp")
+                os.makedirs(spill_dir, exist_ok=True)
+                safe_spill = spill_dir.replace("'", "''")
+                conn.execute(f"SET temp_directory = '{safe_spill}'")
             # Defense-in-depth: block read_csv/read_parquet/httpfs/filesystem access inside DuckDB engine
             conn.execute("SET enable_external_access = false")
             # Lock configuration so SQL cannot re-enable external access on the connection
@@ -317,16 +322,50 @@ class AnalyticalWarehouse:
     def describe_table(self, table_name: str) -> list[dict[str, str]]:
         if not SAFE_IDENT_RE.match(table_name):
             raise ValueError(f"Unsafe table name: {table_name}")
-        res = self.execute_query(f'DESCRIBE "{table_name}"', limit=1000)
-        return [
-            {"column_name": r["column_name"], "column_type": r["column_type"]}
-            for r in res["rows"]
-        ]
+        if self._conn is None:
+            with _WriteGuard(self._rw):
+                self._ensure_conn_unlocked()
+        with _ReadGuard(self._rw):
+            cur = self._conn.cursor()
+            try:
+                self._verify_connection_security_unlocked(cur)
+                cur.execute(f'DESCRIBE "{table_name}"')
+                rows = cur.fetchall()
+                return [
+                    {"column_name": str(r[0]), "column_type": str(r[1])}
+                    for r in rows
+                ]
+            finally:
+                cur.close()
 
     def drop_table(self, table_name: str) -> None:
         if not SAFE_IDENT_RE.match(table_name):
             raise ValueError(f"Unsafe table name: {table_name}")
         self.execute_raw(f'DROP TABLE IF EXISTS "{table_name}"')
+
+    @staticmethod
+    def _widen_duckdb_type(cur_type: str, new_type: str) -> str:
+        ct = (cur_type or "").upper()
+        nt = (new_type or "").upper()
+        if ct == nt:
+            return ct
+        if "NULL" in ct:
+            return nt
+        if "NULL" in nt:
+            return ct
+        int_types = ("TINYINT", "SMALLINT", "INTEGER", "INT", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT")
+        float_types = ("FLOAT", "DOUBLE", "REAL", "DECIMAL")
+        is_c_int = any(ct.startswith(p) for p in int_types)
+        is_n_int = any(nt.startswith(p) for p in int_types)
+        is_c_flt = any(ct.startswith(p) for p in float_types)
+        is_n_flt = any(nt.startswith(p) for p in float_types)
+        if is_c_int and is_n_int:
+            return "HUGEINT" if ("HUGEINT" in ct or "HUGEINT" in nt) else "BIGINT"
+        if (is_c_int or is_c_flt) and (is_n_int or is_n_flt):
+            return "DOUBLE"
+        if "TIMESTAMP" in ct and "DATE" in nt or "DATE" in ct and "TIMESTAMP" in nt:
+            return "TIMESTAMP"
+        return "VARCHAR"
 
     def load_dataframe(
         self,
@@ -336,12 +375,13 @@ class AnalyticalWarehouse:
         pk_column: Optional[str] = None,
     ) -> dict[str, int]:
         """
-        Loads a DataFrame safely using atomic staging table swap/merge
+        Loads a DataFrame safely using atomic staging table swap/merge/append
         so half-written or failed loads NEVER corrupt live dashboard data.
+        Supports schema evolution & type widening across streaming chunks.
         """
         tname = sanitize_identifier(table_name)
         stg_name = f"stg_{tname}_{int(time.time() * 1000)}"
-        clean_df = df.copy()
+        clean_df = df.copy(deep=False)
         clean_df.columns = [sanitize_identifier(str(c)) for c in clean_df.columns]
 
         with _WriteGuard(self._rw):
@@ -358,7 +398,33 @@ class AnalyticalWarehouse:
                     inserted = len(clean_df)
                     updated = 0
                 elif mode == "append":
-                    cur.execute(f'INSERT INTO "{tname}" SELECT * FROM "{stg_name}"')
+                    cur.execute(f'DESCRIBE "{tname}"')
+                    tgt_cols = {str(r[0]): str(r[1]) for r in cur.fetchall()}
+                    cur.execute(f'DESCRIBE "{stg_name}"')
+                    stg_cols = [(str(r[0]), str(r[1])) for r in cur.fetchall()]
+                    for cname, stype in stg_cols:
+                        if cname not in tgt_cols:
+                            safe_t = "VARCHAR" if "NULL" in stype.upper() else stype
+                            cur.execute(f'ALTER TABLE "{tname}" ADD COLUMN "{cname}" {safe_t}')
+                            tgt_cols[cname] = safe_t
+                        else:
+                            wider = self._widen_duckdb_type(tgt_cols[cname], stype)
+                            if wider != tgt_cols[cname].upper():
+                                try:
+                                    cur.execute(f'ALTER TABLE "{tname}" ALTER COLUMN "{cname}" TYPE {wider}')
+                                    tgt_cols[cname] = wider
+                                except Exception:
+                                    cur.execute(f'ALTER TABLE "{tname}" ALTER COLUMN "{cname}" TYPE VARCHAR')
+                                    tgt_cols[cname] = "VARCHAR"
+                    col_list = ", ".join(f'"{c}"' for c, _ in stg_cols)
+                    try:
+                        cur.execute(f'INSERT INTO "{tname}" ({col_list}) SELECT {col_list} FROM "{stg_name}"')
+                    except Exception:
+                        # Fallback: promote any incompatible non-matching columns to VARCHAR
+                        for cname, stype in stg_cols:
+                            if tgt_cols.get(cname, "").upper() != stype.upper() and tgt_cols.get(cname, "").upper() != "VARCHAR":
+                                cur.execute(f'ALTER TABLE "{tname}" ALTER COLUMN "{cname}" TYPE VARCHAR')
+                        cur.execute(f'INSERT INTO "{tname}" ({col_list}) SELECT {col_list} FROM "{stg_name}"')
                     cur.execute(f'DROP TABLE IF EXISTS "{stg_name}"')
                     inserted = len(clean_df)
                     updated = 0
@@ -386,6 +452,26 @@ class AnalyticalWarehouse:
             except Exception:
                 try:
                     cur.execute(f'DROP TABLE IF EXISTS "{stg_name}"')
+                except Exception:
+                    pass
+                raise
+            finally:
+                cur.close()
+
+    def deduplicate_table(self, table_name: str) -> int:
+        tname = sanitize_identifier(table_name)
+        tmp_name = f"dedup_{tname}_{int(time.time() * 1000)}"
+        with _WriteGuard(self._rw):
+            cur = self._ensure_conn_unlocked().cursor()
+            try:
+                cur.execute(f'CREATE TABLE "{tmp_name}" AS SELECT DISTINCT * FROM "{tname}"')
+                cur.execute(f'DROP TABLE IF EXISTS "{tname}"')
+                cur.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{tname}"')
+                cur.execute(f'SELECT count(*) FROM "{tname}"')
+                return int(cur.fetchone()[0])
+            except Exception:
+                try:
+                    cur.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
                 except Exception:
                     pass
                 raise

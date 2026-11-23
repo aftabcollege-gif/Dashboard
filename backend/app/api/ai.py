@@ -60,7 +60,7 @@ class ConversationalAssistantRequest(BaseModel):
 def recommend_dashboard(dataset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     ds = get_dataset_for_org(db, dataset_id, user.organization_id)
     enforce_permission(db, user, "dataset", ds.id, "view")
-    res = AiAnalyticsEngine.recommend_widgets_for_dataset(db, ds, user=user)
+    res = AiAnalyticsEngine.recommend_widgets_for_dataset(db, ds, user=user, include_profile=False)
     sec_ctx = build_data_security_context(db, user, ds.id)
     res["profile"] = DataProfiler.profile_table(
         ds.warehouse_table,
