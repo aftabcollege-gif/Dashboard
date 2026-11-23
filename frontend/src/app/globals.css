@@ -64,6 +64,16 @@ html[dir="rtl"] body {
   -webkit-backdrop-filter: blur(var(--bi-blur));
 }
 
+.react-grid-layout {
+  direction: ltr !important;
+}
+
+.react-grid-item {
+  left: 0;
+  top: 0;
+  right: auto;
+}
+
 .react-grid-item.react-grid-placeholder {
   background: rgba(37, 99, 235, 0.14) !important;
   border: 2px dashed var(--bi-primary) !important;

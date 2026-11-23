@@ -175,13 +175,13 @@ function StandardWidgetRenderer({
     const poly = sparkNorm.map((m, idx) => `${(idx * stepX).toFixed(1)},${(28 - m * 22).toFixed(1)}`).join(" ");
 
     return (
-      <div className="h-full flex flex-col justify-between p-0.5 sm:p-1">
-        <div className="flex items-start justify-between gap-2">
-          <div className="text-lg sm:text-2xl lg:text-3xl font-bold tracking-tight truncate" style={{ color: textColor }}>
+      <div className="h-full flex flex-col justify-between gap-1 p-0.5">
+        <div className="flex items-start justify-between gap-2 min-w-0">
+          <div className="text-lg sm:text-xl lg:text-2xl font-bold tracking-tight leading-tight truncate min-w-0" style={{ color: textColor }}>
             {formatBIValue(numericVal, numFmt, decimals, unit, abbreviate)}
           </div>
           {styleConfig.show_sparkline !== false && (
-            <svg viewBox="0 0 120 32" className="w-12 sm:w-24 h-6 sm:h-8 shrink-0 opacity-90">
+            <svg viewBox="0 0 120 32" className="w-12 sm:w-20 h-6 sm:h-7 shrink-0 opacity-90">
               <polyline
                 fill="none"
                 stroke={statusColor}
@@ -555,7 +555,7 @@ function EChartsCanvas(props: {
     };
   }, []);
 
-  return <div ref={containerRef} className="w-full h-full min-h-[160px] cursor-pointer" />;
+  return <div ref={containerRef} className="w-full h-full min-h-[84px] cursor-pointer" />;
 }
 
 function buildEChartsOption(ctx: {
@@ -979,16 +979,27 @@ function buildEChartsOption(ctx: {
     const val = Number(rows[0]?.[yField] ?? 0);
     const maxV = Number(styleConfig.max_value || (val > 100 ? val * 1.5 : 100));
     return {
+      textStyle: { fontFamily },
       color: palette,
       series: [{
         type: "gauge",
+        radius: "92%",
+        center: ["50%", "58%"],
         max: maxV,
-        progress: { show: true, width: 14 },
-        axisLine: { lineStyle: { width: 14 } },
+        progress: { show: true, width: 9 },
+        axisLine: { lineStyle: { width: 9 } },
+        axisTick: { show: false },
+        splitLine: { length: 6, distance: -9, lineStyle: { width: 1.5 } },
+        axisLabel: { distance: 12, fontSize: 9, color: mutedColor, fontFamily },
+        pointer: { length: "52%", width: 4 },
+        title: { offsetCenter: [0, "74%"], fontSize: 10, color: mutedColor, fontFamily },
         detail: {
           valueAnimation: true,
-          fontSize: 20,
+          fontSize: 15,
+          fontWeight: "bold",
+          offsetCenter: [0, "34%"],
           color: textColor,
+          fontFamily,
           formatter: (v: number) => formatBIValue(v, numFmt, decimals, unit, abbreviate),
         },
         data: [{ value: Number(val.toFixed(1)), name: yField }],

@@ -258,6 +258,21 @@ def test_multi_domain_classification_kpis_pages_and_live_execution(client, admin
     assert "grouped_bar" in chart_types
     assert "histogram" in chart_types
 
+    # Verify every page has collision-free 12-col widget grid coordinates
+    for p in pages:
+        p_widgets = [w for w in dash["widgets"] if w["page_id"] == p["id"]]
+        for i, wi in enumerate(p_widgets):
+            li = wi["layout"]
+            assert li["x"] >= 0 and li["y"] >= 0 and li["w"] >= 2 and li["h"] >= 2
+            assert li["x"] + li["w"] <= 12, f"Widget {wi['title']} overflows 12 cols: {li}"
+            for wj in p_widgets[i + 1 :]:
+                lj = wj["layout"]
+                overlap_x = li["x"] < lj["x"] + lj["w"] and lj["x"] < li["x"] + li["w"]
+                overlap_y = li["y"] < lj["y"] + lj["h"] and lj["y"] < li["y"] + li["h"]
+                assert not (overlap_x and overlap_y), (
+                    f"Page {p['title']} layout overlap between {wi['title']} {li} and {wj['title']} {lj}"
+                )
+
     # Execute EVERY generated widget query across ALL pages via execute-batch against DuckDB and confirm zero errors!
     batch_res = client.post(f"/api/v1/dashboards/{dash_id}/execute-batch", headers=admin_headers, json={})
     assert batch_res.status_code == 200, batch_res.text

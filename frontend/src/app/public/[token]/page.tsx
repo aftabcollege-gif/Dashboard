@@ -384,7 +384,7 @@ export default function PublicDashboardPage() {
               ? "col-span-2 md:col-span-3 lg:col-span-3"
               : "col-span-2 md:col-span-3 lg:col-span-4";
           const heightClass =
-            w.chart_type === "kpi"
+            w.chart_type === "kpi" || (w.chart_type === "gauge" && lgSpan <= 4)
               ? "h-36 sm:h-40"
               : effType === "table" || effType === "pivot_table"
               ? "h-[340px] sm:h-80"

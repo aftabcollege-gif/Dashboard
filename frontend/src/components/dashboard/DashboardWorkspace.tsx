@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Responsive, WidthProvider } from "react-grid-layout";
+import { Responsive } from "react-grid-layout";
 import {
   ArrowLeft,
   ArrowUp,
@@ -54,8 +54,6 @@ import {
   WidgetDataResult,
 } from "@/types/bi";
 
-const ResponsiveGridLayout = WidthProvider(Responsive);
-
 export default function DashboardWorkspace({ dashboardId }: { dashboardId: string }) {
   const { locale, t, authStatus, themes, applyThemeTokens, showToast } = useBi();
 
@@ -66,6 +64,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [editMode, setEditMode] = useState(false);
   const [selectedWidgetId, setSelectedWidgetId] = useState<string | null>(null);
   const [isMobile, setIsMobile] = useState(false);
+  const gridContainerRef = useRef<HTMLDivElement>(null);
+  const [gridWidth, setGridWidth] = useState<number>(0);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -393,33 +393,127 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     showToast(`Applied ${stack.map((s) => `${s.field}=${s.value}`).join(" & ")} to all dashboard widgets`);
   };
 
-  // Layout change handler with Undo stack
+  // Layout change handler with Undo stack + RTL mirroring & container-width awareness
   const currentPage = dash?.pages.find((p) => p.id === activePageId);
+  const colsCount = currentPage?.layout_settings?.columns_count || 12;
+  const isRtl = locale === "fa";
+
   const pageWidgets = useMemo(
     () => (dash?.widgets || []).filter((w) => w.page_id === activePageId),
     [dash, activePageId]
   );
 
+  useEffect(() => {
+    if (isMobile) return;
+    const el = gridContainerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const measured = Math.floor(el.getBoundingClientRect().width);
+      if (measured > 0) setGridWidth((prev) => (prev === measured ? prev : measured));
+    };
+    measure();
+    const ro = new ResizeObserver((entries) => {
+      const measured = Math.floor(entries[0]?.contentRect?.width || el.getBoundingClientRect().width);
+      if (measured > 0) setGridWidth((prev) => (prev === measured ? prev : measured));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [Boolean(dash), activePageId, isMobile, showAiDrawer, Boolean(selectedWidgetId)]);
+
+  const effectiveGridWidth =
+    gridWidth > 0
+      ? gridWidth
+      : typeof window !== "undefined"
+      ? Math.max(680, window.innerWidth - 320)
+      : 1120;
+
+  const activeBreakpoint =
+    effectiveGridWidth > 960
+      ? "lg"
+      : effectiveGridWidth > 680
+      ? "md"
+      : effectiveGridWidth > 480
+      ? "sm"
+      : "xs";
+
   const gridLayouts = useMemo(() => {
-    const lg = pageWidgets.map((w) => ({
-      i: w.id,
-      x: w.layout.x,
-      y: w.layout.y,
-      w: w.layout.w,
-      h: w.layout.h,
-      minW: 2,
-      minH: 2,
-    }));
-    return { lg, md: lg, sm: lg.map((item) => ({ ...item, w: Math.min(item.w, 6) })), xs: lg.map((item) => ({ ...item, w: 4, x: 0 })) };
-  }, [pageWidgets]);
+    const sorted = [...pageWidgets].sort(
+      (a, b) => (Number(a.layout?.y || 0) - Number(b.layout?.y || 0)) || (Number(a.layout?.x || 0) - Number(b.layout?.x || 0))
+    );
+
+    const lg = sorted.map((w) => {
+      const rawW = Math.max(2, Math.min(Number(w.layout?.w || 4), colsCount));
+      const rawX = Math.max(0, Math.min(Number(w.layout?.x || 0), Math.max(0, colsCount - rawW)));
+      const rawY = Math.max(0, Number(w.layout?.y || 0));
+      const hasFooter = Boolean(
+        w.config?.advanced?.narrative_fa ||
+          (w.config?.advanced?.analysis_type && w.description)
+      );
+      const minCardH = w.chart_type === "kpi" || w.chart_type === "gauge" ? (hasFooter ? 4 : 3) : 4;
+      const rawH = Math.max(minCardH, Number(w.layout?.h || 4));
+      const displayX = isRtl ? Math.max(0, colsCount - rawW - rawX) : rawX;
+      return {
+        i: w.id,
+        x: displayX,
+        y: rawY,
+        w: rawW,
+        h: rawH,
+        minW: 2,
+        minH: w.chart_type === "kpi" || w.chart_type === "gauge" ? 3 : 4,
+      };
+    });
+
+    // Clean collision-free 6-col packing for narrow desktop / drawer-open split
+    const sm: any[] = [];
+    let smX = 0;
+    let smY = 0;
+    let smRowMaxH = 0;
+    for (const item of lg) {
+      const smW = item.w <= 4 ? 3 : 6;
+      if (smX + smW > 6) {
+        smY += smRowMaxH;
+        smX = 0;
+        smRowMaxH = 0;
+      }
+      const displaySmX = isRtl ? 6 - smW - smX : smX;
+      sm.push({
+        ...item,
+        x: displaySmX,
+        y: smY,
+        w: smW,
+        minW: Math.min(item.minW, smW),
+      });
+      smRowMaxH = Math.max(smRowMaxH, item.h);
+      smX += smW;
+      if (smX >= 6) {
+        smY += smRowMaxH;
+        smX = 0;
+        smRowMaxH = 0;
+      }
+    }
+
+    let xsY = 0;
+    const xs = lg.map((item) => {
+      const out = { ...item, x: 0, y: xsY, w: 4, minW: 2 };
+      xsY += item.h;
+      return out;
+    });
+
+    return { lg, md: lg, sm, xs };
+  }, [pageWidgets, colsCount, isRtl]);
 
   const handleLayoutChange = (currentLayout: any[]) => {
     if (!editMode || !dash) return;
+    // Never overwrite canonical 12/16/24-col coordinates when viewing a narrow sm/xs breakpoint
+    if (activeBreakpoint !== "lg" && activeBreakpoint !== "md") return;
     const prevSnapshot = pageWidgets.map((w) => ({ i: w.id, ...w.layout }));
-    // Only record if coordinates actually shifted
-    const changed = currentLayout.some((item) => {
+    const canonicalLayout = currentLayout.map((item) => {
+      const canonicalX = isRtl ? Math.max(0, colsCount - item.w - item.x) : item.x;
+      return { ...item, canonicalX };
+    });
+    const changed = canonicalLayout.some((item) => {
       const old = prevSnapshot.find((o) => o.i === item.i);
-      return old && (old.x !== item.x || old.y !== item.y || old.w !== item.w || old.h !== item.h);
+      return old && (old.x !== item.canonicalX || old.y !== item.y || old.w !== item.w || old.h !== item.h);
     });
     if (!changed) return;
 
@@ -430,8 +524,10 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       return {
         ...prev,
         widgets: prev.widgets.map((w) => {
-          const updated = currentLayout.find((l) => l.i === w.id);
-          return updated ? { ...w, layout: { x: updated.x, y: updated.y, w: updated.w, h: updated.h } } : w;
+          const updated = canonicalLayout.find((l) => l.i === w.id);
+          return updated
+            ? { ...w, layout: { x: updated.canonicalX, y: updated.y, w: updated.w, h: updated.h } }
+            : w;
         }),
       };
     });
@@ -801,8 +897,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       ])
     );
     const customStyle = w.config.style || {};
+    const isCompactMetric = w.chart_type === "kpi" || effType === "gauge";
     const mobileCardClass = mobileStack
-      ? w.chart_type === "kpi"
+      ? isCompactMetric
         ? "col-span-1 h-36"
         : effType === "bpmn"
         ? "col-span-2 h-[440px]"
@@ -814,6 +911,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     return (
       <div
         key={w.id}
+        dir={isRtl ? "rtl" : "ltr"}
         onClick={() => editMode && setSelectedWidgetId(w.id)}
         className={`bi-card flex flex-col overflow-hidden transition-shadow ${mobileCardClass} ${
           isSelected ? "ring-2 ring-blue-500" : isCrossSource ? "ring-2 ring-emerald-500/70" : ""
@@ -826,14 +924,14 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       >
         {/* Widget Header */}
         <div
-          className={`px-3 sm:px-3.5 py-2 border-b flex flex-wrap items-center justify-between gap-1.5 sm:gap-2 ${
+          className={`px-3 py-1.5 border-b flex flex-wrap items-center justify-between gap-1.5 ${
             editMode && !mobileStack ? "widget-drag-handle cursor-move" : ""
           }`}
           style={{ borderColor: "var(--bi-border)" }}
         >
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="text-xs font-bold leading-snug line-clamp-1 sm:truncate">{w.title}</span>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-xs font-bold leading-snug truncate" title={w.title}>{w.title}</span>
               {hasDrill && canCrossFilter ? (
                 <button
                   type="button"
@@ -1045,7 +1143,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         </div>
 
         {/* Widget Body */}
-        <div className="flex-1 p-2.5 sm:p-3 min-h-0">
+        <div className={`flex-1 min-h-0 ${isCompactMetric ? "px-2.5 py-2" : "p-2.5 sm:p-3"}`}>
           {wd?.error ? (
             <div className="h-full flex items-center justify-center text-xs text-red-500 text-center p-2">
               {wd.error}
@@ -1403,25 +1501,28 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               {sortedMobileWidgets.map((w) => renderWidgetCard(w, true))}
             </div>
           ) : (
-            <ResponsiveGridLayout
-              className="layout"
-              layouts={gridLayouts}
-              breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480 }}
-              cols={{
-                lg: currentPage?.layout_settings?.columns_count || 12,
-                md: currentPage?.layout_settings?.columns_count || 12,
-                sm: 6,
-                xs: 4,
-              }}
-              rowHeight={currentPage?.layout_settings?.row_height || 42}
-              margin={[currentPage?.layout_settings?.gap_px || 16, currentPage?.layout_settings?.gap_px || 16]}
-              isDraggable={editMode}
-              isResizable={editMode}
-              draggableHandle=".widget-drag-handle"
-              onLayoutChange={(layout) => handleLayoutChange(layout)}
-            >
-              {pageWidgets.map((w) => renderWidgetCard(w, false))}
-            </ResponsiveGridLayout>
+            <div ref={gridContainerRef} dir="ltr" className="w-full min-w-0">
+              <Responsive
+                className="layout"
+                width={effectiveGridWidth}
+                layouts={gridLayouts}
+                breakpoints={{ lg: 960, md: 680, sm: 480, xs: 0 }}
+                cols={{
+                  lg: colsCount,
+                  md: colsCount,
+                  sm: 6,
+                  xs: 4,
+                }}
+                rowHeight={currentPage?.layout_settings?.row_height || 42}
+                margin={[currentPage?.layout_settings?.gap_px || 16, currentPage?.layout_settings?.gap_px || 16]}
+                isDraggable={editMode}
+                isResizable={editMode}
+                draggableHandle=".widget-drag-handle"
+                onLayoutChange={(layout) => handleLayoutChange(layout)}
+              >
+                {pageWidgets.map((w) => renderWidgetCard(w, false))}
+              </Responsive>
+            </div>
           )}
         </div>
 

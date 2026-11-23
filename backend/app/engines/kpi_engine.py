@@ -2290,11 +2290,12 @@ class IntelligentKpiEngine:
                 f"{k['name']}: {k.get('formatted_value', '—')} (منبع: {k.get('source', ds.name)}؛ بازه: {k.get('period', 'کل داده')}؛ "
                 f"اطمینان: {int(round(k.get('confidence', 0.9) * 100))}%{comp_txt}).{lims_txt}"
             )
+            kpi_slot = len(p1_widgets)
             w = _make_widget(
                 title=k["name"],
                 chart_type=k_chart,
                 visual_spec=vspec,
-                layout={"x": (idx % 3) * 4, "y": (idx // 3) * 4, "w": 4, "h": 4},
+                layout={"x": (kpi_slot % 3) * 4, "y": (kpi_slot // 3) * 4, "w": 4, "h": 4},
                 style=k_style,
                 narrative_fa=narr,
                 provenance={
@@ -2387,11 +2388,12 @@ class IntelligentKpiEngine:
                 )
                 if w_br:
                     p1_widgets.append(w_br)
-                    if row_x == 6:
-                        row_x = 0
-                        cur_y += 8
-                    else:
-                        cur_y += 8
+                    row_x = 0
+                    cur_y += 8
+
+        if row_x == 6:
+            row_x = 0
+            cur_y += 8
 
         # Always guarantee BPMN diagram on Overview when process schema detected!
         if bpmn_cfg:
@@ -2649,6 +2651,8 @@ class IntelligentKpiEngine:
                         p3_widgets.append(w_fn)
 
             # Multi-source joined dimension chart (if safe join available)
+            if any(w["layout"]["y"] == p3_y for w in p3_widgets):
+                p3_y += 8
             ms_dim = (kpi_bundle.get("multi_source_analysis") or {}).get("recommended_join_dimension")
             if ms_dim:
                 ms_spec = {
@@ -2664,7 +2668,7 @@ class IntelligentKpiEngine:
                         title=f"تحلیل چندمنبعی {pm_disp} به تفکیک {ms_dim['display_name']} ({ms_dim['dataset_name']})",
                         chart_type="horizontal_bar",
                         visual_spec=ms_spec,
-                        layout={"x": 0, "y": p3_y + 8, "w": 12, "h": 8},
+                        layout={"x": 0, "y": p3_y, "w": 12, "h": 8},
                         narrative_fa=f"تحلیل ترکیبی بین «{ds.name}» و «{ms_dim['dataset_name']}» روی «{ms_dim['display_name']}» با حفظ کنترل دسترسی و جلوگیری از تکرار.",
                         provenance={"sources_used": [ds.name, ms_dim["dataset_name"]]},
                         skip_probe=True,
@@ -2746,6 +2750,8 @@ class IntelligentKpiEngine:
                     p4_widgets.append(w_rk)
 
             # Radar multi-metric comparison if >= 2 measures and <= 8 categories
+            if p4_widgets:
+                p4_y += 8
             if secondary_measure and prim_dim["stats"]["distinct_count"] <= 8:
                 rd_spec = {
                     "x_field": prim_dim["field_name"],
@@ -2760,7 +2766,7 @@ class IntelligentKpiEngine:
                         title=f"نمای راداری چندمعیاره ({prim_dim['display_name']})",
                         chart_type="radar",
                         visual_spec=rd_spec,
-                        layout={"x": 0, "y": p4_y + 8, "w": 12, "h": 8},
+                        layout={"x": 0, "y": p4_y, "w": 12, "h": 8},
                         narrative_fa=f"مقایسه هم‌زمان «{pm_disp}» و «{secondary_measure['display_name']}» روی {len(rd_pr['rows'])} گروه اصلی.",
                         skip_probe=True,
                         dedup_key=f"p4_radar_{prim_dim['field_name']}",
@@ -2868,11 +2874,12 @@ class IntelligentKpiEngine:
             p6_widgets: list[dict[str, Any]] = []
             dq_y = 0
             for idx_dq, dqk in enumerate(dq_kpis[:3]):
+                dq_slot = len(p6_widgets)
                 w_dqk = _make_widget(
                     title=dqk["name"],
                     chart_type="gauge" if dqk["id"] == "dq_completeness_pct" else "kpi",
                     visual_spec={"formula": dqk["formula"], "limit": 1},
-                    layout={"x": idx_dq * 4, "y": 0, "w": 4, "h": 4},
+                    layout={"x": dq_slot * 4, "y": 0, "w": 4, "h": 4},
                     style={
                         "number_format": dqk.get("format_type", "number"),
                         "decimals": 1 if dqk.get("format_type") == "percentage" else 0,
@@ -2952,7 +2959,7 @@ class IntelligentKpiEngine:
                     title=f"جدول محوری {pm_disp}: {prim_dim['display_name']} × {sec_dim['display_name']}",
                     chart_type="pivot_table",
                     visual_spec=pv_spec,
-                    layout={"x": 0, "y": 9, "w": 12, "h": 8},
+                    layout={"x": 0, "y": 9 if p7_widgets else 0, "w": 12, "h": 8},
                     narrative_fa=f"جدول تقاطعی دو بعدی برای مقایسه هم‌زمان «{prim_dim['display_name']}» و «{sec_dim['display_name']}».",
                     dedup_key=f"p7_pivot_{prim_dim['field_name']}_{sec_dim['field_name']}",
                 )
