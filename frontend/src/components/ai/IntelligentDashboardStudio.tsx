@@ -104,6 +104,8 @@ export function IntelligentDashboardStudio({
     initialSettings?.related_dataset_ids || []
   );
   const [semanticClasses, setSemanticClasses] = useState<any[]>([]);
+  const [domainOverride, setDomainOverride] = useState<string>("");
+  const [relationships, setRelationships] = useState<any[]>([]);
   const [analysis, setAnalysis] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
   const [savingOverrides, setSavingOverrides] = useState(false);
@@ -167,17 +169,25 @@ export function IntelligentDashboardStudio({
   }, [themes, themeId]);
 
   const loadRecommendation = useCallback(
-    async (dsId: string, forceRefresh = false, relIds: string[] = relatedDatasetIds, calMode: string = calendarMode) => {
+    async (
+      dsId: string,
+      forceRefresh = false,
+      relIds: string[] = relatedDatasetIds,
+      calMode: string = calendarMode,
+      domOv: string = domainOverride
+    ) => {
       if (!dsId) return;
       setLoading(true);
       try {
         const qp = new URLSearchParams();
         if (forceRefresh) qp.set("refresh", "true");
         if (relIds.length > 0) qp.set("related_dataset_ids", relIds.join(","));
+        if (domOv) qp.set("domain_override", domOv);
         qp.set("calendar_mode", calMode);
         const qs = qp.toString();
         const res = await apiFetch<any>(`/ai/recommend/${dsId}${qs ? `?${qs}` : ""}`);
         setAnalysis(res);
+        apiFetch<any[]>("/datasets/relationships").then(setRelationships).catch(() => {});
 
         // Merge standard computable KPIs + discovered business KPIs cleanly
         const stdAll: KpiDefinition[] = res?.kpis?.standard || [];
@@ -268,9 +278,9 @@ export function IntelligentDashboardStudio({
 
   useEffect(() => {
     if (datasetId) {
-      loadRecommendation(datasetId, false, relatedDatasetIds, calendarMode);
+      loadRecommendation(datasetId, false, relatedDatasetIds, calendarMode, domainOverride);
     }
-  }, [datasetId, calendarMode, relatedDatasetIds, loadRecommendation]);
+  }, [datasetId, calendarMode, relatedDatasetIds, domainOverride, loadRecommendation]);
 
   const handleSaveFieldOverrides = async () => {
     if (!datasetId) return;
@@ -570,6 +580,7 @@ export function IntelligentDashboardStudio({
         selected_kpi_ids: confirmedPayloadList.map((c) => c.id),
         target_values: Object.keys(targetValues).length > 0 ? targetValues : undefined,
         related_dataset_ids: relatedDatasetIds.length ? relatedDatasetIds : undefined,
+        domain_override: domainOverride || undefined,
         date_range: dateStart || dateEnd ? { start: dateStart || undefined, end: dateEnd || undefined } : undefined,
       };
 
@@ -727,6 +738,37 @@ export function IntelligentDashboardStudio({
               </button>
             );
           })}
+          {relatedDatasetIds.length > 0 &&
+            relationships
+              .filter(
+                (r) =>
+                  ((r.left_dataset_id === datasetId && relatedDatasetIds.includes(r.right_dataset_id)) ||
+                    (r.right_dataset_id === datasetId && relatedDatasetIds.includes(r.left_dataset_id))) &&
+                  !r.user_confirmed
+              )
+              .map((ur) => (
+                <button
+                  key={ur.id}
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await apiFetch(`/datasets/relationships/${ur.id}/confirm`, {
+                        method: "POST",
+                        body: JSON.stringify({ confirmed: true, note: "Confirmed in AI Studio" }),
+                      });
+                      setRelationships((prev) =>
+                        prev.map((x) => (x.id === ur.id ? { ...x, user_confirmed: true } : x))
+                      );
+                      showToast(isFa ? "اتصال بین‌منبعی تأیید شد" : "Join confirmed");
+                    } catch (e: any) {
+                      showToast(e.message || "خطا");
+                    }
+                  }}
+                  className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/40 text-[10px] font-semibold hover:bg-amber-500/25"
+                >
+                  ⚠ {ur.left_field} = {ur.right_field} · {isFa ? "تأیید اتصال" : "Confirm Join"}
+                </button>
+              ))}
         </div>
       )}
 
@@ -744,7 +786,9 @@ export function IntelligentDashboardStudio({
             <div className="p-2.5 rounded-lg border" style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}>
               <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>حوزه شناسایی‌شده</div>
               <div className="font-bold mt-0.5 text-violet-500 truncate">{domain?.primary_domain_fa}</div>
-              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>اطمینان {Math.round((domain?.confidence || 0) * 100)}%</div>
+              <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>
+                {domain?.domain_family ? `${domain.domain_family} · ` : ""}اطمینان {Math.round((domain?.confidence || 0) * 100)}%
+              </div>
             </div>
             <div className="p-2.5 rounded-lg border" style={{ borderColor: "var(--bi-border)", background: "var(--bi-surface)" }}>
               <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>ابعاد منبع داده</div>
@@ -783,6 +827,40 @@ export function IntelligentDashboardStudio({
             <div className="text-[11px] px-3 py-1.5 rounded-lg bg-violet-500/10 text-violet-600 dark:text-violet-300 flex items-center gap-1.5">
               <Award className="w-3.5 h-3.5 shrink-0" />
               <span><b>شواهد تشخیص حوزه:</b> {domain.evidence_fa}</span>
+            </div>
+          )}
+
+          {domain?.is_ambiguous && domain?.clarification_question && (
+            <div className="p-3 rounded-lg border border-amber-500/40 bg-amber-500/10 text-xs space-y-2">
+              <div className="flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-300">
+                <HelpCircle className="w-4 h-4 shrink-0" />
+                <span>{domain.clarification_question.question_fa}</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {(domain.clarification_question.options || []).map((opt: any) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={async () => {
+                      setDomainOverride(opt.id);
+                      try {
+                        await apiFetch(`/ai/datasets/${datasetId}/domain-override`, {
+                          method: "POST",
+                          body: JSON.stringify({ domain: opt.id }),
+                        });
+                      } catch {
+                        // ignore if read-only viewer overrides locally
+                      }
+                    }}
+                    className={`px-2.5 py-1 rounded-md border text-[11px] font-medium transition ${
+                      domainOverride === opt.id ? "bg-violet-600 text-white border-violet-600" : "hover:bg-amber-500/20"
+                    }`}
+                    style={{ borderColor: domainOverride === opt.id ? undefined : "var(--bi-border)" }}
+                  >
+                    {opt.label_fa}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
 
@@ -939,6 +1017,43 @@ export function IntelligentDashboardStudio({
                           className="px-2 py-0.5 rounded bg-violet-500/10 text-violet-600 dark:text-violet-400 hover:bg-violet-500/20"
                         >
                           + الگوی رشد ماهانه
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const numF = fieldsCls.find((f: any) => f.data_type === "numeric" && f.sum_allowed)?.field_name || "revenue";
+                            setNewKpiFormula(`SAFE_DIVIDE(SUM("${numF}"), COUNT(*))`);
+                            setNewKpiFormat("number");
+                            if (!newKpiName) setNewKpiName("نسبت ایمن");
+                          }}
+                          className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/20"
+                        >
+                          + SAFE_DIVIDE
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const wCol = fieldsCls.find((f: any) => /wait|duration|cycle/.test(f.field_name.toLowerCase()))?.field_name || "wait_hours";
+                            const sCol = fieldsCls.find((f: any) => /sla/.test(f.field_name.toLowerCase()))?.field_name || "sla_hours";
+                            setNewKpiFormula(`SLA_BREACH_RATE("${wCol}", "${sCol}")`);
+                            setNewKpiFormat("percentage");
+                            if (!newKpiName) setNewKpiName("نرخ نقض SLA");
+                          }}
+                          className="px-2 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20"
+                        >
+                          + SLA_BREACH_RATE
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const aCol = fieldsCls.find((f: any) => /action|verdict|status/.test(f.field_name.toLowerCase()))?.field_name || "action";
+                            setNewKpiFormula(`SECURITY_ACTION_RATE("${aCol}", 'Block')`);
+                            setNewKpiFormat("percentage");
+                            if (!newKpiName) setNewKpiName("نرخ مسدودسازی");
+                          }}
+                          className="px-2 py-0.5 rounded bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20"
+                        >
+                          + SECURITY_ACTION_RATE
                         </button>
                       </div>
                     </div>

@@ -28,10 +28,11 @@ PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "0123
 AGGREGATE_FUNCS = {
     "sum", "avg", "count", "count_distinct", "min", "max", "median",
     "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop",
-    "percentile_cont", "quantile_cont", "corr", "skewness", "kurtosis",
+    "percentile_cont", "quantile_cont", "percentile_disc", "quantile_disc", "corr", "skewness", "kurtosis",
     "approx_distinct", "approx_count_distinct", "arg_max", "arg_min",
     "first_value", "last_value", "any_value",
     "percentage", "running_total", "yoy", "mom", "ytd", "mtd", "rank",
+    "sla_breach_rate", "security_action_rate",
 }
 
 NUMERIC_TYPES = {"integer", "int", "bigint", "float", "double", "decimal", "numeric", "number", "real"}
@@ -123,7 +124,7 @@ def _jalali_sql_parts(date_expr_sql: str) -> tuple[str, str, str, str]:
 
 
 def expand_jalali_sql_calls(sql_expr: str) -> str:
-    """Replace JALALI_YEAR(x), JALALI_MONTH(x), JALALI_QUARTER(x), JALALI_DATE(x) with pure DuckDB SQL."""
+    """Replace Jalali and domain formula macros with pure, division-safe DuckDB SQL."""
     try:
         tree = sqlglot.parse_one(f"SELECT {sql_expr} AS _m", read="duckdb")
     except Exception:
@@ -150,6 +151,46 @@ def expand_jalali_sql_calls(sql_expr: str) -> str:
                         f"RIGHT(CONCAT('0', CAST({jd} AS VARCHAR)), 2))"
                     )
                 return sqlglot.parse_one(rep, read="duckdb")
+            if fn == "safe_divide":
+                if len(node.expressions) != 2:
+                    raise ValueError("SAFE_DIVIDE requires exactly 2 arguments (numerator, denominator)")
+                num_s = node.expressions[0].sql(dialect="duckdb")
+                den_s = node.expressions[1].sql(dialect="duckdb")
+                return sqlglot.parse_one(
+                    f"(CAST({num_s} AS DOUBLE) / NULLIF(CAST({den_s} AS DOUBLE), 0))",
+                    read="duckdb",
+                )
+            if fn == "clamp":
+                if len(node.expressions) != 3:
+                    raise ValueError("CLAMP requires exactly 3 arguments (value, min_val, max_val)")
+                x_s = node.expressions[0].sql(dialect="duckdb")
+                lo_s = node.expressions[1].sql(dialect="duckdb")
+                hi_s = node.expressions[2].sql(dialect="duckdb")
+                return sqlglot.parse_one(f"LEAST(GREATEST({x_s}, {lo_s}), {hi_s})", read="duckdb")
+            if fn == "percentile_disc":
+                if len(node.expressions) != 2:
+                    raise ValueError("PERCENTILE_DISC requires exactly 2 arguments (numeric_col, quantile)")
+                c_s = node.expressions[0].sql(dialect="duckdb")
+                q_s = node.expressions[1].sql(dialect="duckdb")
+                return sqlglot.parse_one(f"QUANTILE_DISC({c_s}, {q_s})", read="duckdb")
+            if fn == "sla_breach_rate":
+                if len(node.expressions) != 2:
+                    raise ValueError("SLA_BREACH_RATE requires exactly 2 arguments (duration_col, sla_col)")
+                dur_s = node.expressions[0].sql(dialect="duckdb")
+                sla_s = node.expressions[1].sql(dialect="duckdb")
+                return sqlglot.parse_one(
+                    f"(SUM(CASE WHEN TRY_CAST({dur_s} AS DOUBLE) > TRY_CAST({sla_s} AS DOUBLE) THEN 1.0 ELSE 0.0 END) * 100.0 / NULLIF(COUNT({dur_s}), 0))",
+                    read="duckdb",
+                )
+            if fn == "security_action_rate":
+                if len(node.expressions) != 2:
+                    raise ValueError("SECURITY_ACTION_RATE requires exactly 2 arguments (action_col, target_action)")
+                act_s = node.expressions[0].sql(dialect="duckdb")
+                tgt_s = node.expressions[1].sql(dialect="duckdb")
+                return sqlglot.parse_one(
+                    f"(SUM(CASE WHEN LOWER(CAST({act_s} AS VARCHAR)) = LOWER(CAST({tgt_s} AS VARCHAR)) THEN 1.0 ELSE 0.0 END) * 100.0 / NULLIF(COUNT({act_s}), 0))",
+                    read="duckdb",
+                )
         return node
 
     transformed = tree.transform(_transform)
@@ -562,17 +603,55 @@ SQL_FUNCTION_CATALOG: list[dict[str, Any]] = [
         "common_errors_fa": "نیازمند حداقل دو ماه تقویمی متوالی است.",
         "engine_notes_fa": "مرتب‌سازی بر اساس اندیس تقویمی ماه جاری و ماه قبل (شمسی یا میلادی).",
     },
+    # Math, Statistical, Process & Security Extensions
+    {
+        "id": "SAFE_DIVIDE", "sql_name": "SAFE_DIVIDE", "fa_name": "تقسیم ایمن", "category": "math", "category_fa": "توابع ریاضی",
+        "signature": "SAFE_DIVIDE(صورت, مخرج)", "min_args": 2, "max_args": 2, "arg_types": ["numeric", "numeric"], "return_type": "double",
+        "description_fa": "تقسیم با محافظت خودکار از خطای تقسیم بر صفر (در مخرج صفر NULL برمی‌گرداند).",
+        "simple_example": "SAFE_DIVIDE(profit, revenue)",
+        "combined_example": "ROUND(SAFE_DIVIDE(SUM(profit), SUM(revenue)) * 100.0, 2)",
+        "common_errors_fa": "ارسال ستون غیرعددی.",
+        "engine_notes_fa": "مستقیماً به CAST/NULLIF در DuckDB کامپایل می‌شود.",
+    },
+    {
+        "id": "CLAMP", "sql_name": "CLAMP", "fa_name": "محدودسازی بازه", "category": "math", "category_fa": "توابع ریاضی",
+        "signature": "CLAMP(مقدار, حداقل, حداکثر)", "min_args": 3, "max_args": 3, "arg_types": ["numeric", "numeric", "numeric"], "return_type": "double",
+        "description_fa": "مقدار عددی را درون بازه [حداقل، حداکثر] نگه می‌دارد.",
+        "simple_example": "CLAMP(score, 0, 100)",
+        "combined_example": "AVG(CLAMP(progress_pct, 0, 100))",
+        "common_errors_fa": "قرار دادن مقدار حداقل بزرگ‌تر از حداکثر.",
+        "engine_notes_fa": "به LEAST(GREATEST(x, lo), hi) کامپایل می‌شود.",
+    },
+    {
+        "id": "SLA_BREACH_RATE", "sql_name": "SLA_BREACH_RATE", "fa_name": "نرخ نقض SLA", "category": "process_security", "category_fa": "توابع فرآیندی و امنیتی",
+        "signature": "SLA_BREACH_RATE(ستون_مدت, ستون_سقف_SLA)", "min_args": 2, "max_args": 2, "arg_types": ["numeric", "numeric"], "return_type": "double",
+        "description_fa": "درصد رکوردهایی که مدت انتظار یا انجام آن‌ها از سقف SLA بیشتر شده است را محاسبه می‌کند.",
+        "simple_example": "SLA_BREACH_RATE(wait_hours, sla_hours)",
+        "combined_example": "ROUND(SLA_BREACH_RATE(wait_hours, sla_hours), 2)",
+        "common_errors_fa": "متفاوت بودن واحد زمانی دو ستون (مثلاً دقیقه در برابر ساعت).",
+        "engine_notes_fa": "به SUM(CASE ...)/NULLIF(COUNT(...), 0) با تجمیع امن کامپایل می‌شود.",
+    },
+    {
+        "id": "SECURITY_ACTION_RATE", "sql_name": "SECURITY_ACTION_RATE", "fa_name": "نرخ اقدام امنیتی", "category": "process_security", "category_fa": "توابع فرآیندی و امنیتی",
+        "signature": "SECURITY_ACTION_RATE(ستون_اقدام, اقدام_هدف)", "min_args": 2, "max_args": 2, "arg_types": ["string", "string"], "return_type": "double",
+        "description_fa": "درصد رویدادهای امنیتی دارای اقدام مشخص (مانند Block یا Quarantine یا Failed) را نسبت به کل رویدادهای دارای مقدار محاسبه می‌کند.",
+        "simple_example": "SECURITY_ACTION_RATE(action, 'Block')",
+        "combined_example": "ROUND(SECURITY_ACTION_RATE(action, 'Quarantine'), 2)",
+        "common_errors_fa": "حذف کردن کلیدواژه تک‌کوتیشن دور نام اقدام هدف.",
+        "engine_notes_fa": "Detect، Block، Quarantine و Failed را بدون اختلاط معنایی تفکیک می‌کند.",
+    },
 ]
 
 _FUNC_ARITY_RULES: dict[str, tuple[int, int]] = {
     "sum": (1, 1), "avg": (1, 1), "count": (1, 1), "min": (1, 1), "max": (1, 1),
     "median": (1, 1), "stddev": (1, 1), "stddev_samp": (1, 1), "variance": (1, 1),
-    "percentile_cont": (1, 2), "quantile_cont": (2, 2), "corr": (2, 2),
+    "percentile_cont": (1, 2), "quantile_cont": (2, 2), "percentile_disc": (2, 2), "quantile_disc": (2, 2), "corr": (2, 2),
     "skewness": (1, 1), "kurtosis": (1, 1), "arg_max": (2, 2), "arg_min": (2, 2),
     "last_value": (1, 1), "first_value": (1, 1), "any_value": (1, 1),
     "approx_distinct": (1, 1), "approx_count_distinct": (1, 1),
     "abs": (1, 1), "round": (1, 2), "ceil": (1, 1), "ceiling": (1, 1), "floor": (1, 1),
     "power": (2, 2), "sqrt": (1, 1), "mod": (2, 2), "sign": (1, 1),
+    "safe_divide": (2, 2), "clamp": (3, 3),
     "upper": (1, 1), "lower": (1, 1), "trim": (1, 2), "ltrim": (1, 2), "rtrim": (1, 2),
     "length": (1, 1), "char_length": (1, 1), "substring": (2, 3), "substr": (2, 3),
     "replace": (3, 3), "left": (2, 2), "right": (2, 2), "split_part": (3, 3),
@@ -581,6 +660,7 @@ _FUNC_ARITY_RULES: dict[str, tuple[int, int]] = {
     "coalesce": (1, 20), "nullif": (2, 2), "if": (3, 3), "iif": (3, 3),
     "jalali_year": (1, 1), "jalali_month": (1, 1), "jalali_quarter": (1, 1), "jalali_date": (1, 1),
     "aov": (2, 2), "mom_calendar": (2, 2),
+    "sla_breach_rate": (2, 2), "security_action_rate": (2, 2),
 }
 
 
@@ -1128,6 +1208,8 @@ def _resolve_expr_type(node: Optional[exp.Expression], context: dict[str, Any]) 
             return "string"
         if fn == "date_part":
             return "integer"
+        if fn in ("safe_divide", "clamp", "percentile_disc", "quantile_disc", "sla_breach_rate", "security_action_rate"):
+            return "double"
     return "unknown"
 
 

@@ -463,12 +463,12 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
         perm_map, [k for k in delegable_pairs if k[0] != "organization" or k[1] == "view"]
     )
     roles["security_admin"] = _create_role_with_perms(
-        db, org.id, "Security Administrator", "security_admin", "Manage RBAC, AD, RLS/CLS & Audit logs",
-        perm_map, [k for k in delegable_pairs if k[0] in ("admin", "organization", "dashboard", "widget")]
+        db, org.id, "Security Administrator", "security_admin", "Manage RBAC, AD, RLS/CLS, Security Logs & Audit",
+        perm_map, [k for k in delegable_pairs if k[0] in ("admin", "organization", "dashboard", "widget", "security_log", "process_intel")]
     )
     roles["dashboard_admin"] = _create_role_with_perms(
         db, org.id, "Dashboard Administrator", "dashboard_admin", "Manage dashboards, layouts, themes & permissions",
-        perm_map, [k for k in delegable_pairs if k[0] in ("workspace", "dashboard", "dashboard_page", "widget", "drill_down", "filter", "export", "dataset", "query")]
+        perm_map, [k for k in delegable_pairs if k[0] in ("workspace", "dashboard", "dashboard_page", "widget", "drill_down", "filter", "export", "dataset", "query", "process_intel")]
     )
     roles["dashboard_designer"] = _create_role_with_perms(
         db, org.id, "Dashboard Designer", "dashboard_designer", "Design dashboards, widgets, themes & queries",
@@ -489,6 +489,7 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
             ("dataset", "view"), ("data_source", "view"), ("query", "view"), ("query", "add"),
             ("query", "edit"), ("query", "execute"), ("filter", "view"), ("filter", "edit"),
             ("filter", "add"), ("export", "view"), ("export", "export_pdf"), ("export", "export_excel"), ("export", "export_csv"),
+            ("process_intel", "view"), ("process_intel", "manage_mapping"), ("process_intel", "view_case_details"),
         ],
     )
     roles["data_analyst"] = _create_role_with_perms(
@@ -504,12 +505,15 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
             ("data_source", "view"), ("query", "view"), ("query", "add"), ("query", "execute"),
             ("filter", "view"), ("filter", "edit"), ("export", "view"), ("export", "export_pdf"),
             ("export", "export_excel"), ("export", "export_csv"),
+            ("process_intel", "view"), ("process_intel", "view_case_details"),
+            ("security_log", "view"),
         ],
     )
     roles["data_engineer"] = _create_role_with_perms(
         db, org.id, "Data Engineer", "data_engineer", "Manage Data Sources, Datasets & ETL Pipelines",
         perm_map,
-        [k for k in delegable_pairs if k[0] in ("data_source", "dataset", "query", "workspace", "dashboard")]
+        [k for k in delegable_pairs if k[0] in ("data_source", "dataset", "query", "workspace", "dashboard", "process_intel")]
+        + [("security_log", "view"), ("security_log", "ingest")]
     )
     roles["report_viewer"] = _create_role_with_perms(
         db, org.id, "Report Viewer", "report_viewer", "Read-only viewer with interactive filtering",
@@ -530,6 +534,7 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
             ("drill_down", "drill_down"), ("drill_down", "drill_up"), ("drill_down", "drill_through"),
             ("drill_down", "drill_level_1"), ("drill_down", "drill_level_2"), ("drill_down", "drill_level_3"),
             ("filter", "view"), ("filter", "edit"), ("export", "view"), ("export", "export_pdf"), ("export", "export_excel"),
+            ("process_intel", "view"),
         ],
     )
     roles["custom_scoped"] = _create_role_with_perms(
@@ -1454,6 +1459,8 @@ def seed_database(db: Session) -> None:
                 db.add(Permission(resource_type=rt, action=act, description=desc))
                 added_perm = True
         if added_perm:
+            db.commit()
+            seed_core_catalog(db)
             db.commit()
         # Ensure warehouse tables exist if already seeded earlier and warehouse file was cleaned
         if db.query(EtlPipeline).count() > 0 and not warehouse.table_exists("wh_enterprise_sales"):

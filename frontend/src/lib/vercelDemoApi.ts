@@ -2640,6 +2640,211 @@ export async function handleVercelDemoApi(
     });
   }
 
+  // Process Intelligence (Vercel Preview Demo over real sample rows)
+  if (segments[0] === "process-intelligence") {
+    if (segments[1] === "datasets" && segments[2]) {
+      const dsId = segments[2];
+      const tbl = getTableForDataset(dsId, extraDatasets);
+      const cols = (tbl.columns || []).map((c) => ({ field_name: c, display_name: c, type: "string" }));
+      const inferCol = (pats: string[]) => tbl.columns.find((c) => pats.some((p) => c.toLowerCase().includes(p))) || null;
+      const mapping = {
+        case_id: inferCol(["request_code", "case_id", "request_id", "order_id"]),
+        activity: inferCol(["step_name", "activity", "stage"]),
+        timestamp: inferCol(["event_time", "timestamp", "started_at", "order_date", "date"]),
+        wait_hours: inferCol(["wait_hours", "wait"]),
+        sla_hours: inferCol(["sla_hours", "sla"]),
+        actor: inferCol(["assignee", "actor", "sales_rep"]),
+        department: inferCol(["department", "region"]),
+        status: inferCol(["status"]),
+      };
+      if (segments[3] === "mapping") {
+        return {
+          status: 200,
+          body: {
+            dataset_id: dsId,
+            mapping,
+            confidences: Object.fromEntries(Object.entries(mapping).map(([k, v]) => [k, v ? 0.9 : 0])),
+            reference_sequence: [],
+            user_confirmed: method === "POST",
+            needs_confirmation: method !== "POST",
+            available_columns: cols,
+          },
+        };
+      }
+      if (segments[3] === "analyze") {
+        const rows = applyRlsAndFilters(tbl.rows, username, []);
+        if (!mapping.case_id || !mapping.activity) {
+          return {
+            status: 200,
+            body: { status: "needs_mapping", mapping_info: { mapping, available_columns: cols }, error_fa: "ستون‌های Case ID و Activity در این دیتاست یافت نشد." },
+          };
+        }
+        const byCase = new Map<string, any[]>();
+        for (const r of rows) {
+          const cid = String(r[mapping.case_id] || "").trim();
+          if (!cid) continue;
+          if (!byCase.has(cid)) byCase.set(cid, []);
+          byCase.get(cid)!.push(r);
+        }
+        const byAct = new Map<string, { cnt: number; waits: number[]; breaches: number }>();
+        const varMap = new Map<string, number>();
+        let reworkCases = 0;
+        let slaBreachCases = 0;
+        for (const [, evs] of byCase) {
+          const acts = evs.map((e) => String(e[mapping.activity!] || ""));
+          if (new Set(acts).size < acts.length) reworkCases++;
+          const vk = acts.join(" -> ");
+          varMap.set(vk, (varMap.get(vk) || 0) + 1);
+          let cBreach = false;
+          for (const e of evs) {
+            const act = String(e[mapping.activity!] || "");
+            const cur = byAct.get(act) || { cnt: 0, waits: [], breaches: 0 };
+            cur.cnt++;
+            const w = mapping.wait_hours ? Number(e[mapping.wait_hours] || 0) : 0;
+            const s = mapping.sla_hours ? Number(e[mapping.sla_hours] || 0) : 0;
+            if (mapping.wait_hours) cur.waits.push(w);
+            if (mapping.sla_hours && w > s) { cur.breaches++; cBreach = true; }
+            byAct.set(act, cur);
+          }
+          if (cBreach) slaBreachCases++;
+        }
+        const bottlenecks = Array.from(byAct.entries()).map(([activity, st]) => {
+          const avgW = st.waits.length ? Number((st.waits.reduce((a, b) => a + b, 0) / st.waits.length).toFixed(2)) : null;
+          return {
+            activity,
+            case_count: st.cnt,
+            event_count: st.cnt,
+            avg_wait_hours: avgW,
+            rework_events: 0,
+            rework_rate_pct: 0,
+            sla_breach_pct: Number(((st.breaches * 100) / Math.max(st.cnt, 1)).toFixed(1)),
+            composite_bottleneck_score: Number(Math.min(100, (avgW || 0) * 4 + st.cnt * 1.5).toFixed(1)),
+          };
+        }).sort((a, b) => b.composite_bottleneck_score - a.composite_bottleneck_score);
+        const totalCases = byCase.size || 1;
+        const variants = Array.from(varMap.entries()).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([k, v], i) => ({
+          rank: i + 1,
+          variant_key: k,
+          steps: k.split(" -> "),
+          case_count: v,
+          share_pct: Number(((v * 100) / totalCases).toFixed(1)),
+          avg_cycle_hours: null,
+          rework_rate_pct: 0,
+          sla_breach_pct: 0,
+          skipped_steps: [],
+          is_deviant: i > 0,
+        }));
+        return {
+          status: 200,
+          body: {
+            status: "ok",
+            dataset_id: dsId,
+            mapping_info: { mapping, available_columns: cols },
+            summary: {
+              total_events_analyzed: rows.length,
+              total_cases: byCase.size,
+              unique_activities: byAct.size,
+              unique_variants: varMap.size,
+              avg_cycle_hours: null,
+              median_cycle_hours: null,
+              avg_wait_hours: bottlenecks[0]?.avg_wait_hours ?? null,
+              avg_processing_hours: null,
+              processing_time_note_fa: "[پیش‌نمایش ابری] نیازمند هر دو ستون start_time و end_time.",
+              wait_time_basis_fa: "ستون wait_hours (داده نمونه پیش‌نمایش)",
+              rework_case_count: reworkCases,
+              rework_rate_pct: Number(((reworkCases * 100) / totalCases).toFixed(1)),
+              self_loop_case_count: 0,
+              sla_evaluated_cases: byCase.size,
+              sla_breach_cases: slaBreachCases,
+              sla_breach_rate_pct: Number(((slaBreachCases * 100) / totalCases).toFixed(1)),
+            },
+            data_quality: { warnings_fa: ["پیش‌نمایش ابری بر پایه رکوردهای نمونه؛ برای ذخیره نگاشت و اقدامات اصلاحی به FastAPI متصل شوید."] },
+            bottlenecks,
+            variants,
+            hypotheses: [],
+          },
+        };
+      }
+      if (segments[3] === "cases") {
+        const rows = applyRlsAndFilters(tbl.rows, username, []);
+        const actF = searchParams.get("activity") || "";
+        if (segments[4]) {
+          const cid = decodeURIComponent(segments[4]);
+          const evs = rows.filter((r) => mapping.case_id && String(r[mapping.case_id]) === cid);
+          return {
+            status: 200,
+            body: {
+              case_id: cid,
+              events: evs.map((e, i) => ({
+                seq: i + 1,
+                activity: mapping.activity ? e[mapping.activity] : "",
+                timestamp: mapping.timestamp ? e[mapping.timestamp] : null,
+                actor: mapping.actor ? e[mapping.actor] : null,
+                department: mapping.department ? e[mapping.department] : null,
+                wait_hours: mapping.wait_hours ? e[mapping.wait_hours] : null,
+              })),
+            },
+          };
+        }
+        const matched = rows.filter((r) => !actF || (mapping.activity && String(r[mapping.activity]) === actF)).slice(0, 40);
+        return {
+          status: 200,
+          body: {
+            total: matched.length,
+            cases: matched.map((r, i) => ({
+              case_id: mapping.case_id ? String(r[mapping.case_id]) : `CASE-${i + 1}`,
+              event_count: 1,
+              wait_hours: mapping.wait_hours ? Number(r[mapping.wait_hours] || 0) : null,
+              has_rework: false,
+              sla_breached: Boolean(mapping.sla_hours && mapping.wait_hours && Number(r[mapping.wait_hours]) > Number(r[mapping.sla_hours])),
+            })),
+          },
+        };
+      }
+      if (segments[3] === "actions") {
+        return { status: 200, body: [] };
+      }
+    }
+  }
+
+  // Security Log Intelligence (Honest Preview Demo status)
+  if (segments[0] === "security-intel") {
+    if (segments[1] === "connectors") {
+      return {
+        status: 200,
+        body: {
+          connectors: [
+            { id: "syslog_security_jsonl", name_fa: "جمع‌آورنده بومی لاگ امنیتی (JSONL / Syslog / Key-Value)", status_fa: "پیاده‌سازی‌شده و آزمایش‌شده (نیازمند سرور Backend)", tested: true, requirements_fa: "در محیط کامل FastAPI فعال است." },
+            { id: "defender_edr", name_fa: "Microsoft Defender for Endpoint (EDR)", status_fa: "طرح‌شده — نیازمند زیرساخت و اعتبارنامه", tested: false, requirements_fa: "نیازمند اعتبارنامه Graph API." },
+            { id: "fortinet_fortigate", name_fa: "فایروال Fortinet FortiGate", status_fa: "طرح‌شده — نیازمند زیرساخت و اعتبارنامه", tested: false, requirements_fa: "نیازمند Syslog / API فایروال." },
+          ],
+        },
+      };
+    }
+    if (segments[1] === "overview") {
+      return {
+        status: 200,
+        body: {
+          window_hours: 720,
+          total_events: 0,
+          action_breakdown: { Detect: 0, Block: 0, Quarantine: 0, Clean: 0, Failed: 0, Allow: 0 },
+          interpretation_notes_fa: [
+            "[پیش‌نمایش ابری]: برای دریافت و ذخیره‌سازی واقعی لاگ‌های امنیتی و هشدارهای آماری، BACKEND_INTERNAL_URL را به سرور FastAPI متصل کنید.",
+            "نبود رویداد در پیش‌نمایش به‌معنای سلامت امنیتی نیست.",
+          ],
+        },
+      };
+    }
+    if (segments[1] === "events") return { status: 200, body: { total: 0, can_view_raw: false, events: [] } };
+    if (segments[1] === "unparsed" || segments[1] === "collectors" || segments[1] === "alerts" || segments[1] === "incidents") {
+      return { status: 200, body: [] };
+    }
+  }
+
+  if (segments[0] === "correlation" && segments[1] === "analyze") {
+    return { status: 200, body: { status: "no_security_events", error_fa: "در پیش‌نمایش ابری رویداد امنیتی ذخیره نمی‌شود؛ برای همبستگی زنده به سرور FastAPI متصل شوید." } };
+  }
+
   // Fallback for preview demo mutations (read-only preview note)
   if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
     return {

@@ -383,9 +383,31 @@ export default function DatasetsPage() {
                       </div>
                     ))}
                     {relationships.map((rel) => (
-                      <div key={rel.id} className="p-2 rounded border flex justify-between text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
-                        <span>{rel.left_field} <b>{rel.join_type.toUpperCase()} JOIN</b> {rel.right_field}</span>
-                        <span className="opacity-70">{rel.cardinality}</span>
+                      <div key={rel.id} className="p-2 rounded border flex items-center justify-between gap-2 text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
+                        <div className="min-w-0">
+                          <span>{rel.left_field} <b>{rel.join_type.toUpperCase()} JOIN</b> {rel.right_field}</span>
+                          <span className="ms-2 opacity-70">({rel.cardinality})</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              await apiFetch(`/datasets/relationships/${rel.id}/confirm`, {
+                                method: "POST",
+                                body: JSON.stringify({ confirmed: !rel.user_confirmed, note: "Confirmed via Datasets UI" }),
+                              });
+                              showToast(rel.user_confirmed ? "Confirmation removed" : "Relationship confirmed");
+                              load();
+                            } catch (err: any) {
+                              showToast(err.message || "Error");
+                            }
+                          }}
+                          className={`px-2 py-0.5 rounded text-[10px] font-semibold shrink-0 ${
+                            rel.user_confirmed ? "bg-emerald-600 text-white" : "border text-amber-600 border-amber-500/40"
+                          }`}
+                        >
+                          {rel.user_confirmed ? "✓ Confirmed" : "Confirm Join"}
+                        </button>
                       </div>
                     ))}
                   </div>

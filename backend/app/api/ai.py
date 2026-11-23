@@ -42,6 +42,11 @@ class GenerateDashboardRequest(BaseModel):
     custom_kpis: Optional[list[dict[str, Any]]] = None
     target_values: Optional[dict[str, float]] = None
     related_dataset_ids: Optional[list[str]] = None
+    domain_override: Optional[str] = None
+
+
+class DomainOverrideRequest(BaseModel):
+    domain: Optional[str] = None
 
 
 class FieldOverrideItem(BaseModel):
@@ -122,6 +127,7 @@ def recommend_dashboard(
     refresh: bool = Query(False),
     related_dataset_ids: Optional[str] = Query(None),
     calendar_mode: str = Query("jalali"),
+    domain_override: Optional[str] = Query(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -135,6 +141,7 @@ def recommend_dashboard(
         include_profile=False,
         related_dataset_ids=rel_list or None,
         calendar_mode=calendar_mode,
+        domain_override=domain_override,
         force_refresh=refresh,
     )
     sec_ctx = build_data_security_context(db, user, ds.id)
@@ -143,6 +150,34 @@ def recommend_dashboard(
         sec_ctx=sec_ctx,
     )
     return res
+
+
+@router.post("/datasets/{dataset_id}/domain-override")
+def set_dataset_domain_override(
+    dataset_id: str,
+    body: DomainOverrideRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.engines.kpi_engine import DOMAIN_DEFINITIONS
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "edit", ip_address=get_client_ip(request))
+    prof = dict(ds.profile_json or {})
+    if body.domain:
+        if body.domain not in DOMAIN_DEFINITIONS:
+            raise HTTPException(status_code=400, detail=f"Unknown domain: {body.domain}")
+        prof["domain_override"] = body.domain
+    else:
+        prof.pop("domain_override", None)
+    ds.profile_json = prof
+    db.commit()
+    record_audit(
+        db, user.organization_id, "dataset_domain_override", "dataset",
+        resource_id=ds.id, user_id=user.id, username=user.username,
+        ip_address=get_client_ip(request), details={"domain": body.domain},
+    )
+    return {"dataset_id": ds.id, "domain_override": prof.get("domain_override")}
 
 
 @router.post("/datasets/{dataset_id}/field-overrides")
@@ -312,6 +347,7 @@ def auto_generate_dashboard(
             custom_kpis=body.custom_kpis,
             target_values=body.target_values,
             related_dataset_ids=body.related_dataset_ids,
+            domain_override=body.domain_override,
             dashboard_id=body.dashboard_id,
         )
     except PermissionError as pe:

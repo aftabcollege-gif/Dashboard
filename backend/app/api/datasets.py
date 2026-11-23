@@ -1,15 +1,18 @@
+from datetime import datetime, timezone
 import os
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.api.deps import enforce_permission, get_current_user
+from app.core.audit import record_audit
 from app.core.cache import cache_manager
 from app.core.permissions import permission_resolver
 from app.core.rls_cls import build_data_security_context
 from app.core.tenant import get_dataset_for_org
 from app.database import get_db
 from app.engines.data_engine import DataProfiler
+from app.engines.descriptive_builder import _estimate_join_explosion
 from app.engines.filter_engine import get_cascading_filter_options
 from app.engines.query_engine import execute_dataset_sql
 from app.engines.warehouse import sanitize_identifier, warehouse
@@ -41,6 +44,13 @@ class RelationshipCreate(BaseModel):
     right_field: str
     join_type: str = "left"
     cardinality: str = "many_to_one"
+    user_confirmed: bool = False
+    confirmation_note: str = ""
+
+
+class RelationshipConfirmRequest(BaseModel):
+    confirmed: bool = True
+    note: str = ""
 
 
 class CalculatedFieldCreate(BaseModel):
@@ -155,12 +165,53 @@ def list_relationships(user: User = Depends(get_current_user), db: Session = Dep
     )
     return [
         {
-            "id": r.id, "left_dataset_id": r.left_dataset_id, "left_field": r.left_field,
-            "right_dataset_id": r.right_dataset_id, "right_field": r.right_field,
-            "join_type": r.join_type, "cardinality": r.cardinality
+            "id": r.id,
+            "left_dataset_id": r.left_dataset_id,
+            "left_field": r.left_field,
+            "right_dataset_id": r.right_dataset_id,
+            "right_field": r.right_field,
+            "join_type": r.join_type,
+            "cardinality": r.cardinality,
+            "user_confirmed": bool(getattr(r, "user_confirmed", False)),
+            "confirmation_note": getattr(r, "confirmation_note", "") or "",
+            "confirmed_at": getattr(r, "confirmed_at", None),
+            "metadata_json": getattr(r, "metadata_json", {}) or {},
         }
         for r in rows
     ]
+
+
+@router.post("/relationships/analyze-candidate")
+def analyze_relationship_candidate(
+    body: RelationshipCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    left_ds = get_dataset_for_org(db, body.left_dataset_id, user.organization_id)
+    right_ds = get_dataset_for_org(db, body.right_dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", left_ds.id, "view")
+    enforce_permission(db, user, "dataset", right_ds.id, "view")
+    lf = sanitize_identifier(body.left_field)
+    rf = sanitize_identifier(body.right_field)
+    rep = _estimate_join_explosion(db, user, left_ds, lf, right_ds, rf, body.join_type)
+    l_field_obj = db.query(DatasetField).filter(DatasetField.dataset_id == left_ds.id, DatasetField.field_name == lf).first()
+    r_field_obj = db.query(DatasetField).filter(DatasetField.dataset_id == right_ds.id, DatasetField.field_name == rf).first()
+    pk_fk_analysis = {
+        "left_is_pk": bool(l_field_obj.is_primary_key) if l_field_obj else False,
+        "right_is_pk": bool(r_field_obj.is_primary_key) if r_field_obj else False,
+        "left_type": l_field_obj.data_type if l_field_obj else "unknown",
+        "right_type": r_field_obj.data_type if r_field_obj else "unknown",
+        "safe_for_direct_sum": rep.get("risk") == "safe" and rep.get("inferred_cardinality") in ("one_to_one", "many_to_one"),
+        "requires_pre_aggregation": rep.get("inferred_cardinality") in ("one_to_many", "many_to_many") or rep.get("risk") in ("moderate", "high"),
+    }
+    return {
+        "left_dataset_id": left_ds.id,
+        "left_field": lf,
+        "right_dataset_id": right_ds.id,
+        "right_field": rf,
+        "join_type": body.join_type,
+        "pk_fk_analysis": pk_fk_analysis,
+        "explosion_report": rep,
+        "requires_confirmation": True,
+    }
 
 
 @router.post("/relationships")
@@ -171,17 +222,75 @@ def create_relationship(
     right_ds = get_dataset_for_org(db, body.right_dataset_id, user.organization_id)
     enforce_permission(db, user, "dataset", left_ds.id, "edit")
     enforce_permission(db, user, "dataset", right_ds.id, "view")
+    lf = sanitize_identifier(body.left_field)
+    rf = sanitize_identifier(body.right_field)
+    rep = _estimate_join_explosion(db, user, left_ds, lf, right_ds, rf, body.join_type)
+    inferred_card = rep.get("inferred_cardinality") or body.cardinality
+    now = datetime.now(timezone.utc)
     rel = DatasetRelationship(
         left_dataset_id=left_ds.id,
-        left_field=sanitize_identifier(body.left_field),
+        left_field=lf,
         right_dataset_id=right_ds.id,
-        right_field=sanitize_identifier(body.right_field),
+        right_field=rf,
         join_type=body.join_type,
-        cardinality=body.cardinality,
+        cardinality=inferred_card,
+        user_confirmed=bool(body.user_confirmed),
+        confirmation_note=body.confirmation_note or "",
+        confirmed_by=user.id if body.user_confirmed else None,
+        confirmed_at=now if body.user_confirmed else None,
+        validated_at=now,
+        metadata_json={"explosion_report": rep},
     )
     db.add(rel)
     db.commit()
-    return {"id": rel.id}
+    return {
+        "id": rel.id,
+        "cardinality": rel.cardinality,
+        "user_confirmed": rel.user_confirmed,
+        "explosion_report": rep,
+    }
+
+
+@router.post("/relationships/{rel_id}/confirm")
+def confirm_relationship(
+    rel_id: str,
+    body: RelationshipConfirmRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rel = db.query(DatasetRelationship).filter(DatasetRelationship.id == rel_id).first()
+    if not rel:
+        raise HTTPException(status_code=404, detail="Relationship not found")
+    left_ds = get_dataset_for_org(db, rel.left_dataset_id, user.organization_id)
+    right_ds = get_dataset_for_org(db, rel.right_dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", left_ds.id, "edit")
+    enforce_permission(db, user, "dataset", right_ds.id, "view")
+    rep = _estimate_join_explosion(db, user, left_ds, rel.left_field, right_ds, rel.right_field, rel.join_type)
+    now = datetime.now(timezone.utc)
+    rel.user_confirmed = bool(body.confirmed)
+    rel.confirmation_note = body.note or ""
+    rel.confirmed_by = user.id if body.confirmed else None
+    rel.confirmed_at = now if body.confirmed else None
+    rel.validated_at = now
+    rel.metadata_json = {**(rel.metadata_json or {}), "explosion_report": rep}
+    record_audit(
+        db,
+        user.organization_id,
+        "relationship_confirm" if body.confirmed else "relationship_unconfirm",
+        "dataset_relationship",
+        resource_id=rel.id,
+        user_id=user.id,
+        username=user.username,
+        details={"left": f"{left_ds.name}.{rel.left_field}", "right": f"{right_ds.name}.{rel.right_field}", "risk": rep.get("risk")},
+        commit=False,
+    )
+    db.commit()
+    return {
+        "id": rel.id,
+        "user_confirmed": rel.user_confirmed,
+        "cardinality": rel.cardinality,
+        "explosion_report": rep,
+    }
 
 
 @router.get("/{dataset_id}/profile")

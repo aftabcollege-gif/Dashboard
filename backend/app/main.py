@@ -16,6 +16,7 @@ from sqlalchemy import inspect as sa_inspect, text
 from app.api import (
     ai,
     auth,
+    correlation,
     dashboards,
     data_sources,
     datasets,
@@ -23,7 +24,9 @@ from app.api import (
     etl,
     exports,
     monitoring,
+    process_intelligence,
     queries,
+    security_intelligence,
     themes,
     users_rbac,
 )
@@ -150,7 +153,7 @@ async def security_headers_middleware(request: Request, call_next):
 
     if any(
         path.startswith(f"{settings.API_PREFIX}/{seg}")
-        for seg in ("auth", "rbac", "queries", "data-sources", "monitoring", "descriptive-builder")
+        for seg in ("auth", "rbac", "queries", "data-sources", "monitoring", "descriptive-builder", "process-intelligence", "security-intel", "correlation")
     ):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
         response.headers["Pragma"] = "no-cache"
@@ -203,3 +206,6 @@ app.include_router(etl.router, prefix=settings.API_PREFIX)
 app.include_router(ai.router, prefix=settings.API_PREFIX)
 app.include_router(exports.router, prefix=settings.API_PREFIX)
 app.include_router(monitoring.router, prefix=settings.API_PREFIX)
+app.include_router(process_intelligence.router, prefix=settings.API_PREFIX)
+app.include_router(security_intelligence.router, prefix=settings.API_PREFIX)
+app.include_router(correlation.router, prefix=settings.API_PREFIX)

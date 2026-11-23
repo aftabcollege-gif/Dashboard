@@ -108,6 +108,12 @@ class DatasetRelationship(Base, TimestampMixin):
     join_type: Mapped[str] = mapped_column(String(24), default="left", nullable=False)
     cardinality: Mapped[str] = mapped_column(String(24), default="many_to_one", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    user_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    confirmation_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    confirmed_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     validated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 

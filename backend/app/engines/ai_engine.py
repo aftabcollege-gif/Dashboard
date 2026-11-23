@@ -39,6 +39,7 @@ class AiAnalyticsEngine:
         *,
         related_dataset_ids: Optional[list[str]] = None,
         calendar_mode: str = "jalali",
+        domain_override: Optional[str] = None,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         from app.engines.kpi_engine import IntelligentKpiEngine
@@ -49,6 +50,7 @@ class AiAnalyticsEngine:
             user=user,
             calendar_mode=calendar_mode,
             related_dataset_ids=related_dataset_ids,
+            domain_override=domain_override,
             auto_generate_kpis=True,
             force_refresh=force_refresh,
         )

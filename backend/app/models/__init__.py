@@ -66,6 +66,16 @@ from app.models.performance import (
     DashboardPerformanceLog,
     WidgetPerformanceLog,
 )
+from app.models.intelligence import (
+    ProcessDatasetMapping,
+    ProcessCorrectiveAction,
+    SecurityCollector,
+    SecurityEvent,
+    SecurityUnparsedEvent,
+    SecurityAlertRule,
+    SecurityAlert,
+    SecurityIncident,
+)
 
 __all__ = [
     "Organization",
@@ -126,4 +136,12 @@ __all__ = [
     "QueryExecutionLog",
     "DashboardPerformanceLog",
     "WidgetPerformanceLog",
+    "ProcessDatasetMapping",
+    "ProcessCorrectiveAction",
+    "SecurityCollector",
+    "SecurityEvent",
+    "SecurityUnparsedEvent",
+    "SecurityAlertRule",
+    "SecurityAlert",
+    "SecurityIncident",
 ]

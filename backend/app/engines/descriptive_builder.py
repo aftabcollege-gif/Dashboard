@@ -328,6 +328,8 @@ def analyze_dataset_relationships(
             "join_type": r.join_type.upper(),
             "cardinality": r.cardinality,
             "is_registered": True,
+            "user_confirmed": bool(getattr(r, "user_confirmed", False)),
+            "confirmation_note": getattr(r, "confirmation_note", "") or "",
         })
 
     for idx, aj in enumerate(ad_hoc_joins or []):
@@ -478,6 +480,8 @@ def analyze_dataset_relationships(
                     "right_field": rf,
                     "join_type": jtype,
                     "is_bridge": r_id not in selected_set,
+                    "user_confirmed": bool(step.get("user_confirmed", not step.get("is_registered", True))),
+                    "cardinality": step.get("cardinality", "many_to_one"),
                 })
                 joined_order.add(r_id)
                 rep = _estimate_join_explosion(db, user, accessible_ds[l_id], lf, accessible_ds[r_id], rf, jtype)
@@ -490,6 +494,12 @@ def analyze_dataset_relationships(
 
     has_blocking_issues = bool(disconnected_targets or ambiguous_targets)
     suggested_relationships.sort(key=lambda x: -x["confidence"])
+    unconfirmed_joins = [
+        j for j in resolved_joins if not j.get("user_confirmed")
+    ]
+    high_risk_joins = [
+        ec for ec in explosion_reports if ec.get("risk") in ("moderate", "high")
+    ]
 
     return {
         "primary_dataset_id": prim_id,
@@ -515,6 +525,8 @@ def analyze_dataset_relationships(
         "disconnected_datasets": disconnected_targets,
         "suggested_relationships": suggested_relationships[:12],
         "explosion_checks": explosion_reports,
+        "unconfirmed_joins": unconfirmed_joins,
+        "requires_user_confirmation": bool(unconfirmed_joins or high_risk_joins or suggested_relationships),
         "ready_for_join": not has_blocking_issues,
     }
 

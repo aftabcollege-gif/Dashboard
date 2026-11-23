@@ -29,6 +29,8 @@ RESOURCE_SCOPES = [
     "query",
     "filter",
     "export",
+    "process_intel",
+    "security_log",
     "admin",
 ]
 
@@ -121,6 +123,18 @@ PERMISSION_CATALOG: list[tuple[str, str, str]] = [
     ("export", "export_excel", "Export to Excel"),
     ("export", "export_csv", "Export to CSV"),
     ("export", "export_png", "Export to PNG"),
+    # Process Intelligence
+    ("process_intel", "view", "View process mining variants, metrics, and bottlenecks"),
+    ("process_intel", "manage_mapping", "Confirm and edit event-log column mappings"),
+    ("process_intel", "manage_actions", "Create and evaluate process corrective actions"),
+    ("process_intel", "view_case_details", "Drill down into case traces and activity timeline"),
+    # Security Log Intelligence (raw logs & incident management are independently restricted)
+    ("security_log", "view", "View normalized security log dashboards, alerts, and stats"),
+    ("security_log", "ingest", "Configure collectors and ingest security log batches"),
+    ("security_log", "view_raw", "Access unredacted raw log messages and unparsed lines"),
+    ("security_log", "manage_alerts", "Create, edit, and acknowledge security alert rules"),
+    ("security_log", "manage_incidents", "Create, approve, and manage advisory security incidents"),
+    ("security_log", "export", "Export security analytics reports"),
 ]
 
 

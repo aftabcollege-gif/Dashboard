@@ -17,9 +17,11 @@ import {
   Menu,
   Palette,
   RefreshCw,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Terminal,
+  Workflow,
   X,
 } from "lucide-react";
 import { apiFetch, setStoredToken } from "@/lib/api";
@@ -452,10 +454,32 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     return <LoginScreen />;
   }
 
+  const hasScopeAccess = (resourceType: string, action: string = "view"): boolean => {
+    const ep = user?.effective_permissions;
+    if (!ep) return true;
+    if (ep.is_super_admin) return true;
+    const rolePerms: any[] = ep.role_permissions || [];
+    const resPerms: any[] = ep.resource_permissions || [];
+    const denied =
+      rolePerms.some((p) => p.resource_type === resourceType && p.action === action && p.effect === "deny") ||
+      resPerms.some((p) => p.resource_type === resourceType && p.action === action && p.effect === "deny");
+    if (denied) return false;
+    return (
+      rolePerms.some((p) => p.resource_type === resourceType && p.action === action && p.effect === "allow") ||
+      resPerms.some((p) => p.resource_type === resourceType && p.action === action && p.effect === "allow")
+    );
+  };
+
   const navItems = [
     { href: "/", label: t("home"), icon: Home },
     { href: "/dashboards", label: t("dashboards"), icon: FolderKanban },
     { href: "/descriptive-builder", label: t("descriptiveBuilder"), icon: Sparkles },
+    ...(hasScopeAccess("process_intel", "view")
+      ? [{ href: "/process-intelligence", label: t("processIntelligence"), icon: Workflow }]
+      : []),
+    ...(hasScopeAccess("security_log", "view")
+      ? [{ href: "/security-intel", label: t("securityIntel"), icon: ShieldAlert }]
+      : []),
     { href: "/data-sources", label: t("dataSources"), icon: Database },
     { href: "/datasets", label: t("datasets"), icon: Layers },
     { href: "/query-builder", label: t("queryBuilder"), icon: Terminal },

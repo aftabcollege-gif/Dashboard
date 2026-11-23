@@ -367,12 +367,14 @@ def validate_filter_expression_ast(expr_sql: str, allowed_columns: Optional[set[
 
 SAFE_FORMULA_FUNCS = {
     "sum", "avg", "count", "min", "max", "median", "stddev", "stddev_samp", "stddev_pop",
-    "variance", "var_samp", "var_pop", "percentile_cont", "quantile_cont", "corr",
+    "variance", "var_samp", "var_pop", "percentile_cont", "quantile_cont",
+    "percentile_disc", "quantile_disc", "corr",
     "skewness", "kurtosis", "approx_distinct", "approx_count_distinct",
     "arg_max", "arg_min", "first_value", "last_value", "any_value",
     "rank", "dense_rank", "row_number", "lag", "lead",
     "abs", "round", "ceil", "ceiling", "floor", "power", "pow", "sqrt", "mod", "sign",
     "ln", "log", "log10", "exp", "greatest", "least", "coalesce", "nullif",
+    "safe_divide", "clamp", "sla_breach_rate", "security_action_rate",
     "if", "iif", "case", "cast", "try_cast", "concat", "concat_ws", "upper", "lower",
     "trim", "ltrim", "rtrim", "lpad", "rpad", "pad", "length", "char_length", "substring", "substr",
     "replace", "left", "right", "split_part", "strpos", "instr",

@@ -87,80 +87,144 @@ SEMANTIC_CLASS_META: dict[str, dict[str, Any]] = {
     "Balance": {"fa": "مانده / موجودی لحظه‌ای", "policy": "semi_additive", "default_agg": "LAST_VALUE", "allowed": ["LAST_VALUE", "AVG", "MIN", "MAX", "MEDIAN"], "sum_allowed": False},
 }
 
-# 15 Business Domains (Section 6)
+# Canonical Business, Process, IT Operations, Security, Network & Mixed Domain Definitions
+DOMAIN_FAMILY_MAP: dict[str, str] = {
+    "sales_marketing": "Business",
+    "finance_accounting": "Business",
+    "hr": "Business",
+    "project_contracting": "Business",
+    "contract_management": "Business",
+    "inventory_procurement": "Business",
+    "manufacturing_operations": "Business",
+    "energy_power": "Business",
+    "logistics_transport": "Business",
+    "customer_crm": "Business",
+    "org_management": "Business",
+    "general": "Business",
+    "bpmn_process": "Process/Workflow",
+    "service_support": "Process/Workflow",
+    "it_observability": "IT Operations",
+    "security": "Security",
+    "network": "Network",
+    "mixed": "Mixed",
+}
+
+DOMAIN_FAMILY_FA: dict[str, str] = {
+    "Business": "کسب‌وکار و مالی",
+    "Process/Workflow": "فرآیند و گردش کار",
+    "IT Operations": "عملیات فناوری اطلاعات",
+    "Security": "امنیت و لاگ‌های امنیتی",
+    "Network": "شبکه و ترافیک",
+    "Mixed": "ترکیبی (چنددامنه)",
+}
+
 DOMAIN_DEFINITIONS: dict[str, dict[str, Any]] = {
     "sales_marketing": {
         "fa": "فروش و بازاریابی",
+        "family": "Business",
         "field_keywords": ["revenue", "sales", "order", "discount", "campaign", "lead", "channel", "conversion", "aov", "فروش", "سفارش", "تخفیف", "کمپین", "درآمد"],
         "dataset_keywords": ["sales", "order", "marketing", "retail", "commerce", "فروش", "سفارشات", "بازاریابی"],
     },
     "finance_accounting": {
         "fa": "مالی و حسابداری",
+        "family": "Business",
         "field_keywords": ["budget", "actual", "expense", "cost", "profit", "balance", "cash", "invoice", "ledger", "receivable", "payable", "tax", "هزینه", "بودجه", "سود", "مانده", "تراز", "مالی", "حساب", "فاکتور"],
         "dataset_keywords": ["finance", "accounting", "budget", "ledger", "invoice", "مالی", "حسابداری", "بودجه"],
     },
     "hr": {
         "fa": "منابع انسانی",
+        "family": "Business",
         "field_keywords": ["employee", "staff", "salary", "payroll", "wage", "hire", "attrition", "turnover", "tenure", "absence", "overtime", "department", "headcount", "کارمند", "حقوق", "پرسنل", "استخدام", "ترک کار", "اضافه‌کار"],
         "dataset_keywords": ["hr", "employee", "payroll", "staff", "workforce", "منابع انسانی", "پرسنل", "حقوق"],
     },
     "project_contracting": {
         "fa": "پروژه و پیمانکاری",
+        "family": "Business",
         "field_keywords": ["project", "milestone", "ev", "pv", "ac", "cpi", "spi", "progress_pct", "planned_cost", "actual_cost", "wbs", "contractor", "پروژه", "پیمانکار", "پیشرفت", "زمان‌بندی"],
         "dataset_keywords": ["project", "pmo", "contracting", "construction", "پروژه", "پیمانکاری"],
     },
     "contract_management": {
         "fa": "مدیریت قراردادها",
+        "family": "Business",
         "field_keywords": ["contract", "contract_value", "renewal", "expiry", "clause", "vendor", "amendment", "penalty", "قرارداد", "مبلغ قرارداد", "تمدید", "جریمه"],
         "dataset_keywords": ["contract", "agreement", "procurement", "قرارداد"],
     },
     "bpmn_process": {
         "fa": "مدیریت فرآیند (BPMN)",
-        "field_keywords": ["step_name", "step_id", "wait_hours", "sla_hours", "assignee", "request_code", "case_id", "process", "bottleneck", "گام", "مرحله", "کارتابل", "فرآیند", "فرایند", "انتظار"],
-        "dataset_keywords": ["bpmn", "workflow", "process", "approval", "فرآیند", "فرایند", "گردش کار"],
+        "family": "Process/Workflow",
+        "field_keywords": ["step_name", "step_id", "wait_hours", "sla_hours", "assignee", "request_code", "case_id", "activity", "process", "bottleneck", "rework", "گام", "مرحله", "کارتابل", "فرآیند", "فرایند", "انتظار"],
+        "dataset_keywords": ["bpmn", "workflow", "process", "approval", "event_log", "فرآیند", "فرایند", "گردش کار"],
     },
     "service_support": {
         "fa": "خدمات و پشتیبانی",
+        "family": "Process/Workflow",
         "field_keywords": ["ticket", "incident", "sla", "response_time", "resolution_time", "mttr", "csat", "agent", "priority", "تیکت", "پشتیبانی", "پاسخگویی", "رضایت", "حادثه"],
         "dataset_keywords": ["ticket", "support", "helpdesk", "service", "پشتیبانی", "تیکت"],
     },
     "inventory_procurement": {
         "fa": "انبار و تدارکات",
+        "family": "Business",
         "field_keywords": ["stock", "inventory", "warehouse", "sku", "reorder", "supplier", "po_", "purchase", "lead_time", "receipt", "موجودی", "انبار", "کالا", "تامین‌کننده", "سفارش خرید"],
         "dataset_keywords": ["inventory", "warehouse", "stock", "supply", "procurement", "انبار", "تدارکات"],
     },
     "manufacturing_operations": {
         "fa": "تولید و عملیات",
+        "family": "Business",
         "field_keywords": ["production", "output", "defect", "scrap", "oee", "downtime", "machine", "shift", "line", "yield", "batch", "تولید", "ضایعات", "خرابی", "توقف", "خط تولید", "شیفت"],
         "dataset_keywords": ["manufacturing", "production", "factory", "plant", "operations", "تولید", "کارخانه"],
     },
     "it_observability": {
         "fa": "فناوری اطلاعات و مانیتورینگ",
+        "family": "IT Operations",
         "field_keywords": ["latency", "status_code", "endpoint", "method", "response_bytes", "error_code", "level", "service", "cpu", "memory", "uptime", "http", "ip_address", "لاگ", "خطا"],
         "dataset_keywords": ["log", "nginx", "apache", "access", "service", "telemetry", "apm", "observability", "لاگ", "سرور"],
     },
+    "security": {
+        "fa": "امنیت و لاگ‌های امنیتی",
+        "family": "Security",
+        "field_keywords": [
+            "threat", "malware", "quarantine", "action", "severity", "rule_name", "policy_name",
+            "file_hash", "sha256", "cve", "auth", "failed_login", "src_ip", "dst_ip", "hostname",
+            "username", "blocked", "detect", "incident", "event_type", "تهدید", "امنیت", "قرنطینه", "مسدود",
+        ],
+        "dataset_keywords": ["security", "siem", "edr", "av", "antivirus", "firewall", "syslog", "auth", "امنیت", "امنیتی"],
+    },
+    "network": {
+        "fa": "شبکه و ترافیک",
+        "family": "Network",
+        "field_keywords": [
+            "src_ip", "dst_ip", "src_port", "dst_port", "protocol", "bytes_in", "bytes_out",
+            "packet", "vlan", "jitter", "latency_ms", "dns", "bandwidth", "ttl", "شبکه", "پهنای باند",
+        ],
+        "dataset_keywords": ["network", "netflow", "firewall", "router", "switch", "packet", "dns", "ترافیک", "شبکه"],
+    },
     "energy_power": {
         "fa": "انرژی و برق",
+        "family": "Business",
         "field_keywords": ["kwh", "mwh", "kw", "mw", "feeder", "substation", "outage", "interruption", "saidi", "saifi", "caidi", "generation", "consumption", "load", "peak_load", "transformer", "meter", "برق", "انرژی", "خاموشی", "فیدر", "پست", "مصرف", "تولید برق", "تلفات"],
         "dataset_keywords": ["energy", "power", "grid", "electricity", "utility", "substation", "برق", "انرژی", "توزیع"],
     },
     "logistics_transport": {
         "fa": "حمل‌ونقل و لجستیک",
+        "family": "Business",
         "field_keywords": ["shipment", "delivery", "freight", "vehicle", "fleet", "route", "origin", "destination", "transit", "carrier", "distance", "حمل", "ارسال", "مرسوله", "ناوگان", "مسیر"],
         "dataset_keywords": ["logistics", "transport", "shipping", "fleet", "delivery", "لجستیک", "حمل"],
     },
     "customer_crm": {
         "fa": "مدیریت مشتریان (CRM)",
+        "family": "Business",
         "field_keywords": ["customer", "client", "churn", "retention", "ltv", "segment", "nps", "cohort", "signup", "مشتری", "وفاداری", "ریزش"],
         "dataset_keywords": ["crm", "customer", "client", "مشتریان"],
     },
     "org_management": {
         "fa": "مدیریت سازمانی",
+        "family": "Business",
         "field_keywords": ["department", "division", "branch", "unit", "kpi_score", "performance_score", "directorate", "واحد", "شعبه", "معاونت", "امتیاز عملکرد"],
         "dataset_keywords": ["organization", "branch", "unit", "management", "سازمان", "واحدها"],
     },
     "general": {
         "fa": "عمومی / تحلیلی",
+        "family": "Business",
         "field_keywords": [],
         "dataset_keywords": [],
     },
@@ -246,6 +310,16 @@ def _enrich_kpi_metadata(k: dict[str, Any], idx_priority: int = 10) -> dict[str,
     k.setdefault("comparison_mode", _default_comparison_mode(k))
     k.setdefault("priority", idx_priority)
     k.setdefault("suggested_selected", c_status in ("computable", "computable_with_warning") and k.get("status") == "selected")
+    k.setdefault("domain_scope", "general")
+    k.setdefault("dataset_names", [])
+    k.setdefault("drill_through_method", "widget_drill_details")
+    if "evidence" not in k:
+        k["evidence"] = {
+            "sample_count": k.get("sample_count"),
+            "period": k.get("period"),
+            "matched_fields": list(k.get("base_fields") or []),
+            "dataset_names": list(k.get("dataset_names") or []),
+        }
     if "diagnostics" not in k:
         warns = list(k.get("limitations") or [])
         errs = [k["rejection_reason_fa"]] if k.get("rejection_reason_fa") else []
@@ -1950,6 +2024,9 @@ class IntelligentKpiEngine:
         ds: Dataset,
         classifications: list[dict[str, Any]],
         deep_profile: dict[str, Any],
+        *,
+        domain_override: Optional[str] = None,
+        partner_datasets: Optional[list[Dataset]] = None,
     ) -> dict[str, Any]:
         ds_text = f"{ds.name} {ds.description or ''}".lower()
         scores: list[dict[str, Any]] = []
@@ -1988,26 +2065,101 @@ class IntelligentKpiEngine:
                 scores.append({
                     "domain": dom_id,
                     "domain_fa": dom_def["fa"],
+                    "family": DOMAIN_FAMILY_MAP.get(dom_id, "Business"),
+                    "family_fa": DOMAIN_FAMILY_FA.get(DOMAIN_FAMILY_MAP.get(dom_id, "Business"), "کسب‌وکار"),
                     "score": round(score, 2),
                     "matched_fields": matched_fields,
                     "matched_dataset_keywords": matched_ds_kws,
                 })
 
         scores.sort(key=lambda x: -x["score"])
+
+        # Honor explicit user domain clarification / override
+        if domain_override and domain_override in DOMAIN_DEFINITIONS:
+            ov_def = DOMAIN_DEFINITIONS[domain_override]
+            ov_fam = DOMAIN_FAMILY_MAP.get(domain_override, "Business")
+            matched_cand = next((s for s in scores if s["domain"] == domain_override), None)
+            return {
+                "primary_domain": domain_override,
+                "primary_domain_fa": ov_def["fa"],
+                "domain_family": ov_fam,
+                "domain_family_fa": DOMAIN_FAMILY_FA.get(ov_fam, "کسب‌وکار"),
+                "secondary_domains": [{"domain": s["domain"], "domain_fa": s["domain_fa"], "score": s["score"]} for s in scores[:3] if s["domain"] != domain_override],
+                "confidence": 1.0,
+                "is_ambiguous": False,
+                "user_confirmed_domain": True,
+                "clarification_question": None,
+                "evidence_fa": f"دامنه توسط کاربر به «{ov_def['fa']}» تأیید شد.",
+                "candidates_evaluated": scores[:5],
+                "matched_fields": matched_cand["matched_fields"] if matched_cand else [],
+            }
+
         if not scores or scores[0]["score"] < 2.5:
             return {
                 "primary_domain": "general",
                 "primary_domain_fa": DOMAIN_DEFINITIONS["general"]["fa"],
+                "domain_family": "Business",
+                "domain_family_fa": DOMAIN_FAMILY_FA["Business"],
                 "secondary_domains": [],
                 "confidence": 0.45,
+                "is_ambiguous": True,
+                "user_confirmed_domain": False,
+                "clarification_question": {
+                    "question_fa": "شواهد اسکیما برای تشخیص دقیق دامنه کافی نیست؛ لطفاً حوزه اصلی این مجموعه داده را مشخص کنید:",
+                    "options": [
+                        {"id": "sales_marketing", "label_fa": "کسب‌وکار / فروش و مالی", "family": "Business"},
+                        {"id": "bpmn_process", "label_fa": "فرآیند و گردش کار", "family": "Process/Workflow"},
+                        {"id": "it_observability", "label_fa": "عملیات فناوری اطلاعات", "family": "IT Operations"},
+                        {"id": "security", "label_fa": "امنیت و لاگ‌های امنیتی", "family": "Security"},
+                        {"id": "network", "label_fa": "شبکه و ترافیک", "family": "Network"},
+                        {"id": "general", "label_fa": "عمومی / ترکیبی", "family": "Mixed"},
+                    ],
+                },
                 "evidence_fa": "نشانگرهای کافی برای یک حوزه تخصصی خاص یافت نشد؛ تحلیل بر پایه الگوی عمومی انجام می‌شود.",
                 "candidates_evaluated": scores[:5],
             }
 
         top = scores[0]
-        total_top = sum(s["score"] for s in scores[:3]) or 1.0
         conf = round(min(0.98, 0.45 + (top["score"] / (top["score"] + 4.0)) * 0.53), 2)
         secondaries = [s for s in scores[1:3] if s["score"] >= max(3.0, top["score"] * 0.5)]
+        top_family = DOMAIN_FAMILY_MAP.get(top["domain"], "Business")
+
+        close_rival_families = [
+            s for s in scores[1:4]
+            if s["score"] >= max(3.0, top["score"] * 0.72) and DOMAIN_FAMILY_MAP.get(s["domain"], "Business") != top_family
+        ]
+        is_mixed_signal = bool(close_rival_families)
+        is_ambiguous = conf < 0.65 or is_mixed_signal
+        eff_family = "Mixed" if is_mixed_signal else top_family
+
+        # Check multi-dataset cross-domain mix
+        if partner_datasets and len(partner_datasets) > 0:
+            partner_text = " ".join(f"{p.name} {p.description or ''}".lower() for p in partner_datasets)
+            for p_dom, p_def in DOMAIN_DEFINITIONS.items():
+                if p_dom == "general":
+                    continue
+                if any(kw in partner_text for kw in p_def["dataset_keywords"]) and DOMAIN_FAMILY_MAP.get(p_dom) != top_family:
+                    eff_family = "Mixed"
+                    break
+
+        clarification_q = None
+        if is_ambiguous:
+            opts = [
+                {
+                    "id": s["domain"],
+                    "label_fa": f"{s['domain_fa']} ({s['family_fa']})",
+                    "family": s["family"],
+                    "score": s["score"],
+                }
+                for s in scores[:4]
+            ]
+            clarification_q = {
+                "question_fa": (
+                    "چند دامنه تحلیلی به‌طور هم‌زمان امتیاز بالایی دارند (یا اطمینان تشخیص زیر ۶۵٪ است)؛ کدام دامنه ملاک ساخت داشبورد باشد؟"
+                ),
+                "options": opts,
+            }
+
         ev_parts = []
         if top["matched_fields"]:
             ev_parts.append(f"ستون‌های مرتبط: {', '.join(top['matched_fields'][:6])}")
@@ -2016,8 +2168,13 @@ class IntelligentKpiEngine:
         return {
             "primary_domain": top["domain"],
             "primary_domain_fa": top["domain_fa"],
-            "secondary_domains": [{"domain": s["domain"], "domain_fa": s["domain_fa"], "score": s["score"]} for s in secondaries],
+            "domain_family": eff_family,
+            "domain_family_fa": DOMAIN_FAMILY_FA.get(eff_family, eff_family),
+            "secondary_domains": [{"domain": s["domain"], "domain_fa": s["domain_fa"], "family": s.get("family"), "score": s["score"]} for s in secondaries],
             "confidence": conf,
+            "is_ambiguous": is_ambiguous,
+            "user_confirmed_domain": False,
+            "clarification_question": clarification_q,
             "evidence_fa": " | ".join(ev_parts),
             "candidates_evaluated": scores[:5],
         }
@@ -2597,6 +2754,113 @@ class IntelligentKpiEngine:
                     required_fields=[w_f["field_name"], sla_f["field_name"]],
                 )
 
+        if primary_domain == "security":
+            act_f = _find(lambda c: any(k in c["field_name"].lower() for k in ("action", "result", "outcome", "اقدام")))
+            sev_f = _find(lambda c: any(k in c["field_name"].lower() for k in ("severity", "risk_level", "level", "شدت")))
+            src_f = _find(lambda c: any(k in c["field_name"].lower() for k in ("src_ip", "source_ip", "ip_address")))
+            host_f = _find(lambda c: any(k in c["field_name"].lower() for k in ("hostname", "host", "device")))
+            if act_f:
+                afn = act_f["field_name"]
+                _add_cand(
+                    kpi_id="sec_blocked_quarantined_pct",
+                    name="نرخ رویدادهای مسدود / قرنطینه‌شده (%)",
+                    category="domain",
+                    formula=f'SUM(CASE WHEN LOWER(CAST("{afn}" AS VARCHAR)) IN (\'block\', \'blocked\', \'quarantine\', \'quarantined\', \'deny\', \'drop\') THEN 1.0 ELSE 0.0 END) * 100.0 / NULLIF(COUNT("{afn}"), 0)',
+                    format_type="percentage",
+                    unit="%",
+                    direction="higher_is_better",
+                    importance=0.95,
+                    domain_fit=0.98,
+                    confidence=0.92,
+                    required_fields=[afn],
+                    limitations=["Detect، Block، Quarantine و Failed به‌صورت مجزا سنجیده می‌شوند؛ نبود رویداد دلیل سلامت نیست."],
+                )
+                _add_cand(
+                    kpi_id="sec_failed_action_pct",
+                    name="نرخ رویدادهای ناموفق / Failed (%)",
+                    category="domain",
+                    formula=f'SUM(CASE WHEN LOWER(CAST("{afn}" AS VARCHAR)) IN (\'failed\', \'fail\', \'error\') THEN 1.0 ELSE 0.0 END) * 100.0 / NULLIF(COUNT("{afn}"), 0)',
+                    format_type="percentage",
+                    unit="%",
+                    direction="lower_is_better",
+                    importance=0.91,
+                    domain_fit=0.95,
+                    confidence=0.90,
+                    required_fields=[afn],
+                )
+            if sev_f:
+                sfn_c = sev_f["field_name"]
+                _add_cand(
+                    kpi_id="sec_high_critical_pct",
+                    name="سهم رویدادهای بحرانی و بالا (%)",
+                    category="domain",
+                    formula=f'SUM(CASE WHEN LOWER(CAST("{sfn_c}" AS VARCHAR)) IN (\'critical\', \'high\', \'alert\', \'emerg\') THEN 1.0 ELSE 0.0 END) * 100.0 / NULLIF(COUNT("{sfn_c}"), 0)',
+                    format_type="percentage",
+                    unit="%",
+                    direction="lower_is_better",
+                    importance=0.96,
+                    domain_fit=0.98,
+                    confidence=0.93,
+                    required_fields=[sfn_c],
+                )
+            if src_f:
+                _add_cand(
+                    kpi_id="sec_unique_src_ip",
+                    name="تعداد IP مبدأ یکتا",
+                    category="domain",
+                    formula=f'COUNT(DISTINCT "{src_f["field_name"]}")',
+                    format_type="count",
+                    unit="IP",
+                    importance=0.88,
+                    domain_fit=0.92,
+                    confidence=0.95,
+                    required_fields=[src_f["field_name"]],
+                )
+            if host_f:
+                _add_cand(
+                    kpi_id="sec_unique_hosts",
+                    name="تعداد میزبان / دستگاه یکتا",
+                    category="domain",
+                    formula=f'COUNT(DISTINCT "{host_f["field_name"]}")',
+                    format_type="count",
+                    unit="میزبان",
+                    importance=0.86,
+                    domain_fit=0.92,
+                    confidence=0.95,
+                    required_fields=[host_f["field_name"]],
+                )
+
+        if primary_domain == "network":
+            bytes_f = _find(lambda c: any(k in c["field_name"].lower() for k in ("bytes", "traffic", "response_bytes")))
+            lat_f = _find(lambda c: any(k in c["field_name"].lower() for k in ("latency", "rtt", "jitter")))
+            if bytes_f and bytes_f["data_type"] == "numeric":
+                _add_cand(
+                    kpi_id="net_total_bytes",
+                    name="مجموع حجم ترافیک انتقالی",
+                    category="domain",
+                    formula=f'SUM("{bytes_f["field_name"]}")',
+                    format_type="number",
+                    unit="بایت",
+                    importance=0.92,
+                    domain_fit=0.95,
+                    confidence=0.94,
+                    required_fields=[bytes_f["field_name"]],
+                )
+            if lat_f and lat_f["data_type"] == "numeric":
+                _add_cand(
+                    kpi_id="net_avg_latency",
+                    name="میانگین تأخیر شبکه",
+                    category="domain",
+                    formula=f'AVG("{lat_f["field_name"]}")',
+                    format_type="duration",
+                    unit="ms",
+                    direction="lower_is_better",
+                    importance=0.94,
+                    domain_fit=0.96,
+                    confidence=0.93,
+                    required_fields=[lat_f["field_name"]],
+                )
+
         if primary_domain == "manufacturing_operations":
             def_f = _find(lambda c: any(k in c["field_name"].lower() for k in ("defect", "scrap", "reject", "ضایعات", "خراب")))
             out_f = _find(lambda c: any(k in c["field_name"].lower() for k in ("output", "produced", "total_units", "تولید"))) or qty_f
@@ -3141,6 +3405,9 @@ class IntelligentKpiEngine:
                 kpi["score"] = round(min(100.0, max(0.0, raw_score)), 1)
             kpi.setdefault("period", default_period)
             kpi.setdefault("source", " + ".join(kpi.get("source_datasets") or [ds.name]))
+            kpi["domain_scope"] = f"{domain_info.get('domain_family', 'Business')} / {domain_info.get('primary_domain_fa', 'عمومی')}"
+            kpi["dataset_names"] = list(kpi.get("source_datasets") or [ds.name])
+            kpi["sample_count"] = row_count
             kpi["computed_at"] = computed_at
             if kpi.get("target_value") is None and kpi.get("field") in eff_targets:
                 kpi["target_value"] = eff_targets[kpi["field"]]
@@ -3152,6 +3419,9 @@ class IntelligentKpiEngine:
 
         for sk in std_needs_data + rejected_kpis:
             sk["computed_at"] = computed_at
+            sk.setdefault("domain_scope", f"{domain_info.get('domain_family', 'Business')} / {domain_info.get('primary_domain_fa', 'عمومی')}")
+            sk.setdefault("dataset_names", list(sk.get("source_datasets") or [ds.name]))
+            sk.setdefault("sample_count", row_count)
             _enrich_kpi_metadata(sk, idx_priority=int(sk.get("priority") or 99))
 
         # Adaptive dynamic selection — NO arbitrary "first 3 fields" rule!
@@ -3231,11 +3501,24 @@ class IntelligentKpiEngine:
         custom_kpis: Optional[list[dict[str, Any]]] = None,
         target_values: Optional[dict[str, float]] = None,
         related_dataset_ids: Optional[list[str]] = None,
+        domain_override: Optional[str] = None,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         deep_profile = IntelligentKpiEngine.deep_profile_dataset(db, ds, user=user, force_refresh=force_refresh)
         classifications = IntelligentKpiEngine.classify_fields(db, ds, deep_profile)
-        domain_info = IntelligentKpiEngine.detect_business_domain(ds, classifications, deep_profile)
+        partner_objs = (
+            db.query(Dataset)
+            .filter(Dataset.organization_id == ds.organization_id, Dataset.id.in_(related_dataset_ids))
+            .all()
+            if related_dataset_ids
+            else []
+        )
+        eff_override = domain_override or (ds.profile_json or {}).get("domain_override")
+        domain_info = IntelligentKpiEngine.detect_business_domain(
+            ds, classifications, deep_profile,
+            domain_override=eff_override,
+            partner_datasets=partner_objs,
+        )
         kpi_bundle = IntelligentKpiEngine.generate_and_score_kpis(
             db, ds, user, deep_profile, classifications, domain_info,
             related_dataset_ids=related_dataset_ids,
@@ -4484,6 +4767,7 @@ class IntelligentKpiEngine:
         custom_kpis: Optional[list[dict[str, Any]]] = None,
         target_values: Optional[dict[str, float]] = None,
         related_dataset_ids: Optional[list[str]] = None,
+        domain_override: Optional[str] = None,
         dashboard_id: Optional[str] = None,
     ) -> tuple[Dashboard, dict[str, Any]]:
         plan = IntelligentKpiEngine.build_intelligent_dashboard_plan(
@@ -4499,6 +4783,7 @@ class IntelligentKpiEngine:
             custom_kpis=custom_kpis,
             target_values=target_values,
             related_dataset_ids=related_dataset_ids,
+            domain_override=domain_override,
         )
 
         # Resolve theme cleanly within org
