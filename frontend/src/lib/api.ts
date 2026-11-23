@@ -33,9 +33,11 @@ export function getCsrfCookie(): string | null {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  detail?: any;
+  constructor(status: number, message: string, detail?: any) {
     super(message);
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -237,6 +239,7 @@ export async function apiFetch<T = any>(
     method === "POST" &&
     typeof effectiveBody === "string" &&
     (path.startsWith("/ai/") ||
+      path.startsWith("/descriptive-builder/") ||
       path.startsWith("/queries/") ||
       path.includes("/execute-batch") ||
       path.includes("/filter-options") ||
@@ -302,13 +305,19 @@ export async function apiFetch<T = any>(
 
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
+    let detail: any = undefined;
     try {
       const errJson = await res.json();
-      msg = errJson.detail || errJson.message || msg;
+      detail = errJson.detail;
+      if (detail && typeof detail === "object") {
+        msg = detail.message || JSON.stringify(detail);
+      } else {
+        msg = detail || errJson.message || msg;
+      }
     } catch {
       // ignore parse err
     }
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, detail);
   }
 
   const contentType = res.headers.get("content-type") || "";
@@ -317,7 +326,41 @@ export async function apiFetch<T = any>(
     if (inDemo && method === "GET" && path === "/datasets" && Array.isArray(jsonRes)) {
       return mergeDemoDatasetList(jsonRes) as unknown as T;
     }
-    if (inDemo && method === "POST" && path === "/ai/generate-dashboard" && jsonRes?.created_dashboard) {
+    if (inDemo && method === "GET" && path === "/descriptive-builder/datasets" && Array.isArray(jsonRes?.datasets)) {
+      const existingIds = new Set(jsonRes.datasets.map((d: any) => d.id));
+      const uploadedExtras = getDemoUploadedDatasets()
+        .filter((u) => !existingIds.has(u.id))
+        .map((u) => ({
+          id: u.id,
+          name: u.name,
+          description: `Uploaded dataset (${u.row_count} rows)`,
+          schema_type: "fact",
+          row_count: u.row_count,
+          freshness_status: "fresh",
+          last_refreshed_at: new Date().toISOString(),
+          has_security_restrictions: false,
+          fields: (u.fields || []).map((f: any) => ({
+            ...f,
+            is_primary_key: false,
+            is_calculated: false,
+            calculation_type: "physical",
+            expression: null,
+            format_type: "number",
+            unit: "",
+            description: "",
+            version: 1,
+            access_scope: "dataset",
+          })),
+          metrics: [],
+        }));
+      return { ...jsonRes, datasets: [...uploadedExtras, ...jsonRes.datasets] } as unknown as T;
+    }
+    if (
+      inDemo &&
+      method === "POST" &&
+      (path === "/ai/generate-dashboard" || path === "/descriptive-builder/save") &&
+      jsonRes?.created_dashboard
+    ) {
       saveDemoCreatedDashboard(jsonRes.created_dashboard);
     }
     return jsonRes;

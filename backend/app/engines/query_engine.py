@@ -15,11 +15,12 @@ from app.core.rls_cls import (
     build_security_cte_sql,
     build_security_projection_and_where,
 )
-from app.core.sql_guard import extract_ast_column_references, validate_readonly_sql_ast
+from app.core.sql_guard import extract_ast_column_references, validate_formula_ast, validate_readonly_sql_ast
 from app.engines.data_engine import FormulaCompiler
 from app.engines.filter_engine import compile_filters_to_sql
+from app.engines.formula_engine import expand_jalali_sql_calls
 from app.engines.warehouse import warehouse
-from app.models.data import Dataset
+from app.models.data import Dataset, DatasetField, SemanticMetric
 from app.models.identity import User
 from app.models.performance import QueryExecutionLog
 
@@ -136,6 +137,12 @@ def build_visual_query_sql(
     table_expr = f"({base_sub_sql}) AS {alias_base}"
     subquery_params: list[Any] = list(base_sub_params)
     avail_cols = set(visible_base_cols)
+    ds_alias_map: dict[str, str] = {dataset.id: alias_base}
+    ds_visible_map: dict[str, set[str]] = {dataset.id: set(visible_base_cols)}
+    ds_hidden_map: dict[str, set[str]] = {dataset.id: set(primary_sc.hidden_columns)}
+    ds_objects: list[Dataset] = [dataset]
+
+    base_proj_parts: list[str] = [f'{alias_base}."{c}" AS "{c}"' for c in visible_base_cols]
 
     merged_hidden: set[str] = set(primary_sc.hidden_columns)
     merged_masks: dict[str, str] = dict(primary_sc.masked_columns)
@@ -175,6 +182,8 @@ def build_visual_query_sql(
             )
 
             jtype = str(j.get("join_type", "LEFT")).upper()
+            if jtype == "FULL OUTER":
+                jtype = "FULL"
             if jtype not in ("INNER", "LEFT", "RIGHT", "FULL"):
                 jtype = "LEFT"
             lf = str(j.get("left_field", ""))
@@ -182,7 +191,14 @@ def build_visual_query_sql(
             if not (IDENT_RE.match(lf) and IDENT_RE.match(rf)):
                 raise ValueError("Invalid join column identifier")
 
-            if lf in primary_sc.hidden_columns or lf not in visible_base_cols:
+            left_ds_id = j.get("left_dataset_id") or dataset.id
+            left_alias = ds_alias_map.get(left_ds_id)
+            if not left_alias:
+                raise ValueError(f"Join source dataset '{left_ds_id}' is not part of the active join chain")
+            left_visible = ds_visible_map.get(left_ds_id, visible_base_cols)
+            left_hidden = ds_hidden_map.get(left_ds_id, primary_sc.hidden_columns)
+
+            if lf in left_hidden or lf not in left_visible:
                 raise PermissionError(f"Access denied to hidden or unavailable join column '{lf}'")
             if rf in join_sc.hidden_columns or rf not in j_visible_cols:
                 raise PermissionError(f"Access denied to hidden or unavailable join column '{rf}'")
@@ -190,10 +206,22 @@ def build_visual_query_sql(
             alias_j = f"t{idx}"
             join_clauses += (
                 f' {jtype} JOIN ({j_sub_sql}) AS {alias_j} '
-                f'ON {alias_base}."{lf}" = {alias_j}."{rf}"'
+                f'ON {left_alias}."{lf}" = {alias_j}."{rf}"'
             )
             subquery_params.extend(j_sub_params)
-            avail_cols.update(j_visible_cols)
+            for jc in j_visible_cols:
+                if jc not in avail_cols:
+                    base_proj_parts.append(f'{alias_j}."{jc}" AS "{jc}"')
+                    avail_cols.add(jc)
+                else:
+                    disambig = f"{alias_j}__{jc}"
+                    base_proj_parts.append(f'{alias_j}."{jc}" AS "{disambig}"')
+                    avail_cols.add(disambig)
+
+            ds_alias_map[target_ds.id] = alias_j
+            ds_visible_map[target_ds.id] = set(j_visible_cols)
+            ds_hidden_map[target_ds.id] = set(join_sc.hidden_columns)
+            ds_objects.append(target_ds)
             merged_hidden.update(join_sc.hidden_columns)
             merged_masks.update(join_sc.masked_columns)
             sec_hashes.append(join_sc.context_hash)
@@ -204,6 +232,83 @@ def build_visual_query_sql(
                     "context_hash": join_sc.context_hash,
                 }
             )
+
+    # Project active row-level Calculated Columns into _base_raw after verifying strict AST + CLS safety
+    calc_col_defs: list[dict[str, Any]] = []
+    seen_calc_names: set[str] = set(avail_cols)
+    for d_obj in ds_objects:
+        db_calc_fields = (
+            db.query(DatasetField)
+            .filter(DatasetField.dataset_id == d_obj.id, DatasetField.is_calculated == True)
+            .all()
+        )
+        for cf in db_calc_fields:
+            if getattr(cf, "calculation_type", "calculated_column") == "calculated_measure":
+                continue
+            if cf.field_name in seen_calc_names or not cf.expression or not IDENT_RE.match(cf.field_name):
+                continue
+            calc_col_defs.append({"field_name": cf.field_name, "expression": cf.expression, "explicit": False})
+
+    for inline_cc in (visual_spec.get("calculated_columns") or []):
+        cname = str(inline_cc.get("field_name") or "").strip()
+        cexpr = str(inline_cc.get("expression") or "").strip()
+        if cname and cexpr and IDENT_RE.match(cname) and cname not in seen_calc_names:
+            calc_col_defs.append({"field_name": cname, "expression": cexpr, "explicit": True})
+
+    # Topologically project active row-level Calculated Columns into _base_raw (supports chained calc columns)
+    remaining_cc = list(calc_col_defs)
+    for _pass in range(len(remaining_cc) + 1):
+        if not remaining_cc:
+            break
+        progressed = False
+        next_remaining: list[dict[str, Any]] = []
+        for cc in remaining_cc:
+            try:
+                comp_cc = expand_jalali_sql_calls(cc["expression"])
+                validate_formula_ast(comp_cc, allowed_columns=avail_cols)
+                _assert_expr_no_hidden_cols(comp_cc, merged_hidden, avail_cols)
+                base_proj_parts.append(f'({comp_cc}) AS "{cc["field_name"]}"')
+                avail_cols.add(cc["field_name"])
+                seen_calc_names.add(cc["field_name"])
+                progressed = True
+            except PermissionError:
+                if cc["explicit"]:
+                    raise
+            except Exception as exc:
+                next_remaining.append({**cc, "_last_err": exc})
+        remaining_cc = next_remaining
+        if not progressed:
+            for cc in remaining_cc:
+                if cc["explicit"] and cc.get("_last_err"):
+                    raise cc["_last_err"]
+            break
+
+    x_field = override_dimension or visual_spec.get("x_field") or visual_spec.get("dimension")
+
+    # Optional custom dimension formula (e.g. JALALI_DATE(order_date) or DATE_TRUNC('month', order_date))
+    x_formula = visual_spec.get("x_formula")
+    if x_formula and x_field and IDENT_RE.match(x_field) and x_field not in avail_cols:
+        comp_xf = expand_jalali_sql_calls(str(x_formula))
+        validate_formula_ast(comp_xf, allowed_columns=avail_cols)
+        _assert_expr_no_hidden_cols(comp_xf, merged_hidden, avail_cols)
+        base_proj_parts.append(f'({comp_xf}) AS "{x_field}"')
+        avail_cols.add(x_field)
+
+    # Load saved calculated measures & semantic metrics for involved datasets so widgets can reference them by name/slug
+    saved_measure_exprs: dict[str, str] = {}
+    for d_obj in ds_objects:
+        for cf in db.query(DatasetField).filter(
+            DatasetField.dataset_id == d_obj.id,
+            DatasetField.is_calculated == True,
+        ).all():
+            if getattr(cf, "calculation_type", "calculated_column") == "calculated_measure" and cf.expression:
+                saved_measure_exprs[cf.field_name.lower()] = cf.expression
+        for sm in db.query(SemanticMetric).filter(
+            SemanticMetric.organization_id == dataset.organization_id,
+            SemanticMetric.dataset_id == d_obj.id,
+        ).all():
+            if sm.formula:
+                saved_measure_exprs[sm.slug.lower()] = sm.formula
 
     if security_bundle_out is not None:
         security_bundle_out["merged_sec_ctx"] = DataSecurityContext(
@@ -233,11 +338,13 @@ def build_visual_query_sql(
     params = list(subquery_params) + list(compiled_filters["params"])
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
+    proj_sql = ", ".join(base_proj_parts) if base_proj_parts else "*"
+    base_ctes = f"_base_raw AS (SELECT {proj_sql} FROM {table_expr}{join_clauses}), _base AS (SELECT * FROM _base_raw {where_sql})"
+
     if raw_mode:
-        sql = f"WITH _base AS (SELECT * FROM {table_expr}{join_clauses} {where_sql}) SELECT * FROM _base LIMIT 1000"
+        sql = f"WITH {base_ctes} SELECT * FROM _base LIMIT 1000"
         return sql, params, "raw"
 
-    x_field = override_dimension or visual_spec.get("x_field") or visual_spec.get("dimension")
     series_field = visual_spec.get("series_field") or visual_spec.get("legend_field")
     y_field = visual_spec.get("y_field") or visual_spec.get("measure")
     agg = str(visual_spec.get("aggregation", "SUM")).upper()
@@ -266,7 +373,7 @@ def build_visual_query_sql(
         order_col = visual_spec.get("order_by")
         order_dir = "DESC" if str(visual_spec.get("order_dir", "ASC")).upper() == "DESC" else "ASC"
         order_sql = f' ORDER BY "{order_col}" {order_dir}' if order_col and IDENT_RE.match(order_col) else ""
-        sql = f"WITH _base AS (SELECT * FROM {table_expr}{join_clauses} {where_sql}) SELECT {sel_sql} FROM _base{order_sql} LIMIT {lim}"
+        sql = f"WITH {base_ctes} SELECT {sel_sql} FROM _base{order_sql} LIMIT {lim}"
         return sql, params, "visual_select"
 
     group_fields: list[str] = []
@@ -281,13 +388,25 @@ def build_visual_query_sql(
 
     if measures:
         for idx, m in enumerate(measures):
-            m_expr = m.get("formula") or f"{m.get('aggregation', 'SUM')}({m.get('field', '*')})"
+            m_field = str(m.get("field") or "").strip()
+            m_expr = m.get("formula") or (
+                saved_measure_exprs.get(m_field.lower())
+                if m_field and m_field.lower() in saved_measure_exprs
+                else f"{m.get('aggregation', 'SUM')}({m_field or '*'})"
+            )
             m_alias = str(m.get("alias") or f"value_{idx+1}")
             if not IDENT_RE.match(m_alias):
                 m_alias = f"value_{idx+1}"
             compiled_expr = FormulaCompiler.compile_measure(m_expr, time_col=time_col, order_col=x_field)
             _assert_expr_no_hidden_cols(compiled_expr, merged_hidden, avail_cols)
             select_parts.append(f'{compiled_expr} AS "{m_alias}"')
+    elif visual_spec.get("formula"):
+        compiled_expr = FormulaCompiler.compile_measure(str(visual_spec["formula"]), time_col=time_col, order_col=x_field)
+        _assert_expr_no_hidden_cols(compiled_expr, merged_hidden, avail_cols)
+        alias_name = visual_spec.get("y_alias") or "value"
+        if not IDENT_RE.match(alias_name):
+            alias_name = "value"
+        select_parts.append(f'{compiled_expr} AS "{alias_name}"')
     elif y_field:
         if agg in ("RAW", "NONE"):
             if IDENT_RE.match(y_field):
@@ -295,7 +414,10 @@ def build_visual_query_sql(
                     raise PermissionError(f"Access denied to hidden column '{y_field}'")
                 select_parts.append(f'"{y_field}"')
         else:
-            formula = f"{agg}({y_field})" if "(" not in y_field else y_field
+            if y_field.lower() in saved_measure_exprs and y_field not in avail_cols:
+                formula = saved_measure_exprs[y_field.lower()]
+            else:
+                formula = f"{agg}({y_field})" if "(" not in y_field else y_field
             compiled_expr = FormulaCompiler.compile_measure(formula, time_col=time_col, order_col=x_field)
             _assert_expr_no_hidden_cols(compiled_expr, merged_hidden, avail_cols)
             alias_name = visual_spec.get("y_alias") or "value"
@@ -338,7 +460,7 @@ def build_visual_query_sql(
 
     sel_sql = ", ".join(select_parts)
     sql = (
-        f"WITH _base AS (SELECT * FROM {table_expr}{join_clauses} {where_sql}) "
+        f"WITH {base_ctes} "
         f"SELECT {sel_sql} FROM _base {group_sql} {order_sql} LIMIT {lim}"
     )
     return sql, params, "visual_agg"

@@ -1,6 +1,7 @@
 import rawDemoData from "@/lib/vercelDemoData.json";
 import { parseSpreadsheetBuffer } from "@/lib/excelParser";
 import { DEFAULT_PROCUREMENT_BPMN_GRAPH, inferBpmnFieldMapping } from "@/lib/bpmnParser";
+import { handleDemoDescriptiveBuilder } from "@/lib/vercelDemoDescriptiveBuilder";
 
 const demoData = rawDemoData as any;
 
@@ -2223,6 +2224,17 @@ export async function handleVercelDemoApi(
   }
   if (method === "POST" && path === "/ai/assistant") {
     return { status: 200, body: handleAssistantDemo(body, username) };
+  }
+
+  // Descriptive Dashboard Builder
+  if (segments[0] === "descriptive-builder") {
+    return handleDemoDescriptiveBuilder(method, segments, body, {
+      datasets: getEffectiveDatasets(extraDatasets),
+      themes: demoData.themes || [],
+      getRowsForDataset: (dsId: string) => getTableForDataset(dsId, extraDatasets),
+      executeVisual: (dsId: string, spec: any) =>
+        executeVisualSpec(dsId, spec, username, [], null, String(spec?.aggregation || "").toUpperCase() === "RAW", extraDatasets),
+    });
   }
 
   // Fallback for preview demo mutations (read-only preview note)

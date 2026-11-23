@@ -365,27 +365,153 @@ def validate_filter_expression_ast(expr_sql: str, allowed_columns: Optional[set[
     return cleaned
 
 
-SAFE_FORMULA_FUNCS = {"SUM", "AVG", "COUNT", "MIN", "MAX", "MEDIAN", "COALESCE", "ABS", "ROUND", "NULLIF"}
+SAFE_FORMULA_FUNCS = {
+    "sum", "avg", "count", "min", "max", "median", "stddev", "stddev_samp", "stddev_pop",
+    "variance", "var_samp", "var_pop", "rank", "dense_rank", "row_number", "lag", "lead",
+    "abs", "round", "ceil", "ceiling", "floor", "power", "pow", "sqrt", "mod", "sign",
+    "ln", "log", "log10", "exp", "greatest", "least", "coalesce", "nullif",
+    "if", "iif", "case", "cast", "try_cast", "concat", "concat_ws", "upper", "lower",
+    "trim", "ltrim", "rtrim", "lpad", "rpad", "pad", "length", "char_length", "substring", "substr",
+    "replace", "left", "right", "split_part", "strpos", "instr",
+    "current_date", "current_timestamp", "date_trunc", "timestamp_trunc",
+    "date_part", "extract", "date_diff", "datediff", "date_add", "date_sub",
+    "strftime", "time_to_str", "strptime", "try_strptime", "to_date", "to_timestamp",
+    "year", "quarter", "month", "week", "day", "dayofweek", "dayofyear", "epoch",
+    "timezone", "at_time_zone",
+    "jalali_year", "jalali_month", "jalali_quarter", "jalali_date",
+}
+
+ALLOWED_FORMULA_NON_FUNC_NODES = (
+    exp.Alias,
+    exp.Column,
+    exp.Identifier,
+    exp.Literal,
+    exp.Boolean,
+    exp.Null,
+    exp.Star,
+    exp.Paren,
+    exp.Var,
+    exp.DataType,
+    exp.DataType.Type,
+    exp.Interval,
+    exp.Kwarg,
+    exp.Distinct,
+    exp.Window,
+    exp.WindowSpec,
+    exp.Partition,
+    exp.Order,
+    exp.Ordered,
+    exp.Add,
+    exp.Sub,
+    exp.Mul,
+    exp.Div,
+    exp.IntDiv,
+    exp.Mod,
+    exp.Pow,
+    exp.Neg,
+    exp.EQ,
+    exp.NEQ,
+    exp.GT,
+    exp.GTE,
+    exp.LT,
+    exp.LTE,
+    exp.And,
+    exp.Or,
+    exp.Not,
+    exp.Is,
+    exp.In,
+    exp.Between,
+    exp.Like,
+    exp.ILike,
+    exp.DPipe,
+    exp.Case,
+    exp.If,
+    exp.Cast,
+    exp.TryCast,
+    exp.AtTimeZone,
+)
 
 
-def validate_formula_ast(compiled_sql_expr: str) -> None:
-    """Validate compiled aggregate formula contains no subqueries, tables, or unsafe functions."""
+def validate_formula_ast(
+    compiled_sql_expr: str,
+    allowed_columns: Optional[set[str]] = None,
+    allowed_qualified_columns: Optional[set[tuple[str, str]]] = None,
+    max_length: int = 16000,
+) -> list[tuple[Optional[str], str]]:
+    """
+    Strictly validate a formula expression using sqlglot AST allowlisting.
+    - Rejects multi-statement inputs, subqueries, FROM/JOIN/WHERE/Command clauses.
+    - Enforces explicit AST node allowlist AND explicit function allowlist.
+    - Enforces column allowlists when provided and returns referenced (table, column) pairs.
+    """
+    cleaned = (compiled_sql_expr or "").strip()
+    if not cleaned or len(cleaned) > max_length:
+        raise ValueError(f"Formula expression is empty or exceeds maximum length ({max_length} characters)")
+
+    # Reject raw SQL comment tokens or statement separators outside literals
+    stripped_literals = re.sub(r"'(?:''|[^'])*'", "''", cleaned)
+    if ";" in stripped_literals or "--" in stripped_literals or "/*" in stripped_literals:
+        raise ValueError("SQL comments and multi-statement separators are forbidden in formulas")
+
     try:
-        tree = sqlglot.parse_one(f"SELECT {compiled_sql_expr} AS _m", read="duckdb")
+        parsed = sqlglot.parse(f"SELECT {cleaned} AS _m", read="duckdb")
     except Exception as exc:
         raise ValueError(f"Invalid formula expression: {exc}") from exc
 
+    statements = [s for s in parsed if s is not None]
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        raise ValueError("Formula must parse as a single scalar/aggregate expression")
+
+    tree = statements[0]
+    for clause in ("from_", "joins", "where", "group", "having", "order", "limit", "with_", "into"):
+        if tree.args.get(clause):
+            raise ValueError(f"Clauses such as '{clause}' are not permitted inside a formula")
+    if len(tree.expressions) != 1:
+        raise ValueError("Formula must represent a single expression")
+
+    referenced_cols: list[tuple[Optional[str], str]] = []
     for node in tree.walk():
-        if isinstance(node, (exp.Subquery, exp.Table, exp.Command)):
-            raise ValueError("Subqueries and arbitrary tables are not permitted in custom formulas")
+        if node is tree:
+            continue
+        if isinstance(node, (exp.Subquery, exp.Table, exp.Command, exp.Select, exp.With, exp.Union, exp.Lambda)):
+            raise ValueError("Subqueries, table references, and commands are not permitted in formulas")
+
         if isinstance(node, exp.Func):
-            fname = _node_func_name(node)
+            if isinstance(node, exp.Anonymous):
+                fname = (node.name or "").strip().lower()
+            elif isinstance(node, exp.Mod):
+                fname = "mod"
+            elif isinstance(node, exp.Pow):
+                fname = "power"
+            else:
+                fname = _node_func_name(node)
+
             if (
-                fname in FORBIDDEN_EXACT_FUNCTIONS
+                not fname
+                or fname in FORBIDDEN_EXACT_FUNCTIONS
                 or any(fname.startswith(p) for p in FORBIDDEN_FUNC_PREFIXES)
                 or any(fname.endswith(s) for s in FORBIDDEN_FUNC_SUFFIXES)
+                or fname not in SAFE_FORMULA_FUNCS
             ):
-                raise ValueError(f"Forbidden function in formula: {fname}")
+                raise ValueError(f"Function '{fname or type(node).__name__}' is not in the allowed formula allowlist")
+        elif not isinstance(node, ALLOWED_FORMULA_NON_FUNC_NODES):
+            raise ValueError(f"Unsupported syntax node '{type(node).__name__}' in formula")
+
+        if isinstance(node, exp.Column):
+            cname = (node.name or "").strip()
+            tname = (node.table or "").strip() or None
+            if cname:
+                referenced_cols.append((tname, cname))
+                if allowed_qualified_columns is not None and tname is not None:
+                    if (tname, cname) not in allowed_qualified_columns and (tname.lower(), cname.lower()) not in {
+                        (a.lower(), b.lower()) for a, b in allowed_qualified_columns
+                    }:
+                        raise ValueError(f"Unknown or inaccessible field '{tname}.{cname}'")
+                elif allowed_columns is not None:
+                    if cname not in allowed_columns and cname.lower() not in {c.lower() for c in allowed_columns}:
+                        raise ValueError(f"Unknown or inaccessible field '{cname}'")
+
+    return referenced_cols
 
 
 def safe_eval_dataframe_formula(df, formula: str):

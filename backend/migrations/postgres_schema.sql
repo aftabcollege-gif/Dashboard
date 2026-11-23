@@ -527,6 +527,12 @@ CREATE TABLE IF NOT EXISTS dataset_fields (
     expression      TEXT,
     format_json     JSONB NOT NULL DEFAULT '{}'::jsonb,
     stats_json      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    description     TEXT NOT NULL DEFAULT '',
+    calculation_type VARCHAR(32) NOT NULL DEFAULT 'physical',
+    dependent_fields_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    access_scope    VARCHAR(32) NOT NULL DEFAULT 'dataset',
+    version         INTEGER NOT NULL DEFAULT 1,
+    created_by      VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (dataset_id, field_name)
@@ -540,6 +546,9 @@ CREATE TABLE IF NOT EXISTS dataset_relationships (
     right_field     VARCHAR(140) NOT NULL,
     join_type       VARCHAR(24) NOT NULL DEFAULT 'left', -- inner|left|right|full
     cardinality     VARCHAR(24) NOT NULL DEFAULT 'many_to_one',
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata_json   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    validated_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -554,6 +563,14 @@ CREATE TABLE IF NOT EXISTS semantic_metrics (
     formula         TEXT NOT NULL,
     format_type     VARCHAR(32) NOT NULL DEFAULT 'number',
     unit            VARCHAR(32) NOT NULL DEFAULT '',
+    metric_kind     VARCHAR(32) NOT NULL DEFAULT 'analytical_metric',
+    output_data_type VARCHAR(48) NOT NULL DEFAULT 'double',
+    dependent_datasets_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dependent_fields_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dependent_metrics_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    access_scope    VARCHAR(32) NOT NULL DEFAULT 'organization',
+    version         INTEGER NOT NULL DEFAULT 1,
+    created_by      VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (organization_id, slug)
@@ -588,8 +605,11 @@ CREATE TABLE IF NOT EXISTS data_models (
     id              VARCHAR(64) PRIMARY KEY,
     organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     name            VARCHAR(180) NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
     model_type      VARCHAR(32) NOT NULL DEFAULT 'star_schema', -- star_schema|snowflake_schema
     definition_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    version         INTEGER NOT NULL DEFAULT 1,
+    created_by      VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

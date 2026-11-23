@@ -18,6 +18,7 @@ import {
   Palette,
   RefreshCw,
   ShieldCheck,
+  Sparkles,
   Terminal,
   X,
 } from "lucide-react";
@@ -454,6 +455,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const navItems = [
     { href: "/", label: t("home"), icon: Home },
     { href: "/dashboards", label: t("dashboards"), icon: FolderKanban },
+    { href: "/descriptive-builder", label: t("descriptiveBuilder"), icon: Sparkles },
     { href: "/data-sources", label: t("dataSources"), icon: Database },
     { href: "/datasets", label: t("datasets"), icon: Layers },
     { href: "/query-builder", label: t("queryBuilder"), icon: Terminal },

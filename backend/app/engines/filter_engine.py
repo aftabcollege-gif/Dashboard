@@ -3,9 +3,23 @@ from datetime import date, timedelta
 from typing import Any, Optional
 from app.core.rls_cls import DataSecurityContext, build_security_projection_and_where
 from app.core.sql_guard import validate_filter_expression_ast
+from app.engines.formula_engine import gregorian_to_jalali, jalali_to_gregorian, parse_jalali_or_gregorian_date
 from app.engines.warehouse import warehouse
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _maybe_convert_jalali_bound(val: Any, calendar_hint: Optional[str] = None) -> Any:
+    if not isinstance(val, str):
+        return val
+    txt = val.strip()
+    if not txt:
+        return val
+    if calendar_hint == "jalali" or re.match(r"^(13|14|۱۳|۱۴)\d{2}[-/]", txt):
+        parsed = parse_jalali_or_gregorian_date(txt)
+        if parsed is not None:
+            return parsed.isoformat()
+    return val
 
 
 def compile_filters_to_sql(
@@ -79,6 +93,7 @@ def compile_filters_to_sql(
             where_clauses.append(f"{col_sql} <= ?")
             params.append(val)
         elif op in ("between", "numeric_range", "date_range"):
+            cal_hint = str(f.get("calendar") or "").lower() or None
             if isinstance(val, dict):
                 low, high = val.get("min") or val.get("start"), val.get("max") or val.get("end")
             elif isinstance(val, (list, tuple)) and len(val) >= 2:
@@ -87,10 +102,10 @@ def compile_filters_to_sql(
                 continue
             if low is not None and low != "":
                 where_clauses.append(f"{col_sql} >= ?")
-                params.append(low)
+                params.append(_maybe_convert_jalali_bound(low, cal_hint))
             if high is not None and high != "":
                 where_clauses.append(f"{col_sql} <= ?")
-                params.append(high)
+                params.append(_maybe_convert_jalali_bound(high, cal_hint))
         elif op == "relative_date":
             today = date.today()
             mode = str(val).lower()
@@ -107,6 +122,14 @@ def compile_filters_to_sql(
                 start_d = date(today.year, 1, 1)
             elif mode == "mtd":
                 start_d = date(today.year, today.month, 1)
+            elif mode == "jalali_ytd":
+                jy, _, _ = gregorian_to_jalali(today.year, today.month, today.day)
+                gy, gm, gd = jalali_to_gregorian(jy, 1, 1)
+                start_d = date(gy, gm, gd)
+            elif mode == "jalali_mtd":
+                jy, jm, _ = gregorian_to_jalali(today.year, today.month, today.day)
+                gy, gm, gd = jalali_to_gregorian(jy, jm, 1)
+                start_d = date(gy, gm, gd)
             if start_d is not None:
                 where_clauses.append(f"CAST({col_sql} AS DATE) >= ?")
                 params.append(start_d.isoformat())

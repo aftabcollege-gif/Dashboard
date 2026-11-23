@@ -87,7 +87,8 @@ class FormulaCompiler:
                 f'THEN "{arg}" ELSE 0 END)'
             )
 
-        # Arithmetic combination of SUM/AVG/COUNT calls or direct column arithmetic e.g. SUM(revenue) - SUM(cost)
+        # General compound formulas (aggregate / arithmetic / math / string / date / Jalali / conditional):
+        # Validate strict sqlglot AST allowlist + expand Jalali helpers safely for DuckDB
         compiled = re.sub(
             r"COUNT_DISTINCT\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
             r'COUNT(DISTINCT "\1")',
@@ -95,11 +96,13 @@ class FormulaCompiler:
             flags=re.IGNORECASE,
         )
         compiled = re.sub(
-            r"\b(SUM|AVG|COUNT|MIN|MAX|MEDIAN)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+            r"\b(SUM|AVG|COUNT|MIN|MAX|MEDIAN|STDDEV|VARIANCE)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
             lambda m: f'{m.group(1).upper()}("{m.group(2)}")',
             compiled,
             flags=re.IGNORECASE,
         )
+        from app.engines.formula_engine import expand_jalali_sql_calls
+        compiled = expand_jalali_sql_calls(compiled)
         validate_formula_ast(compiled)
         return compiled
 

@@ -13,6 +13,7 @@ import {
   Download,
   Edit3,
   Eye,
+  FileText,
   Filter,
   History,
   Layers,
@@ -1061,6 +1062,29 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             />
           )}
         </div>
+
+        {/* Descriptive Narrative & Source Provenance Footer */}
+        {(w.config?.advanced?.narrative_fa || (w.config?.advanced?.analysis_type && w.description)) && (
+          <div
+            className="px-3 py-1.5 border-t text-[10px] leading-relaxed flex flex-wrap items-start justify-between gap-1.5"
+            style={{
+              borderColor: "var(--bi-border)",
+              background: "color-mix(in srgb, var(--bi-surface) 75%, transparent)",
+            }}
+          >
+            <div className="flex items-start gap-1.5 flex-1 min-w-0">
+              <FileText className="w-3 h-3 text-emerald-500 shrink-0 mt-0.5" />
+              <span className="line-clamp-2" title={w.config?.advanced?.narrative_fa || w.description}>
+                {w.config?.advanced?.narrative_fa || w.description}
+              </span>
+            </div>
+            {Array.isArray(w.config?.advanced?.sources_used) && w.config.advanced.sources_used.length > 0 && (
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500 font-semibold shrink-0">
+                {w.config.advanced.sources_used.join(" + ")}
+              </span>
+            )}
+          </div>
+        )}
       </div>
     );
   };

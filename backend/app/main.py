@@ -19,6 +19,7 @@ from app.api import (
     dashboards,
     data_sources,
     datasets,
+    descriptive_builder,
     etl,
     exports,
     monitoring,
@@ -149,7 +150,7 @@ async def security_headers_middleware(request: Request, call_next):
 
     if any(
         path.startswith(f"{settings.API_PREFIX}/{seg}")
-        for seg in ("auth", "rbac", "queries", "data-sources", "monitoring")
+        for seg in ("auth", "rbac", "queries", "data-sources", "monitoring", "descriptive-builder")
     ):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
         response.headers["Pragma"] = "no-cache"
@@ -196,6 +197,7 @@ app.include_router(data_sources.router, prefix=settings.API_PREFIX)
 app.include_router(datasets.router, prefix=settings.API_PREFIX)
 app.include_router(queries.router, prefix=settings.API_PREFIX)
 app.include_router(dashboards.router, prefix=settings.API_PREFIX)
+app.include_router(descriptive_builder.router, prefix=settings.API_PREFIX)
 app.include_router(themes.router, prefix=settings.API_PREFIX)
 app.include_router(etl.router, prefix=settings.API_PREFIX)
 app.include_router(ai.router, prefix=settings.API_PREFIX)
