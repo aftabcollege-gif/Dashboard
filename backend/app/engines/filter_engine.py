@@ -1,7 +1,7 @@
 import re
 from datetime import date, timedelta
 from typing import Any, Optional
-from app.core.rls_cls import DataSecurityContext, build_security_projection_and_where
+from app.core.rls_cls import DataSecurityContext, build_security_projection_and_where, is_safe_column_ident
 from app.core.sql_guard import validate_filter_expression_ast
 from app.engines.formula_engine import gregorian_to_jalali, jalali_to_gregorian, parse_jalali_or_gregorian_date
 from app.engines.warehouse import warehouse
@@ -38,7 +38,7 @@ def compile_filters_to_sql(
         if f.get("is_active") is False:
             continue
         field = str(f.get("field_name") or f.get("field") or "").strip()
-        if not field or not IDENT_RE.match(field):
+        if not field or not is_safe_column_ident(field):
             continue
         if available_columns is not None and field not in available_columns:
             continue
@@ -168,7 +168,7 @@ def get_cascading_filter_options(
     limit: int = 200,
     sec_ctx: Optional[DataSecurityContext] = None,
 ) -> list[Any]:
-    if not IDENT_RE.match(warehouse_table) or not IDENT_RE.match(field_name):
+    if not IDENT_RE.match(warehouse_table) or not is_safe_column_ident(field_name):
         raise ValueError("Invalid table or field identifier")
 
     bounded_limit = max(1, min(int(limit), 1000))

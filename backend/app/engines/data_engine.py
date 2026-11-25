@@ -1,11 +1,17 @@
 import re
 from typing import Any, Optional
 import pandas as pd
-from app.core.rls_cls import DataSecurityContext, build_security_projection_and_where
+from app.core.rls_cls import DataSecurityContext, build_security_projection_and_where, is_safe_column_ident
 from app.core.sql_guard import safe_eval_dataframe_formula, validate_formula_ast
 from app.engines.warehouse import sanitize_identifier, warehouse
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_order_col(col: Optional[str], fallback: str) -> str:
+    if col and is_safe_column_ident(str(col)):
+        return str(col).strip()
+    return sanitize_identifier(fallback)
 
 
 class FormulaCompiler:
@@ -28,8 +34,13 @@ class FormulaCompiler:
         normalized = re.sub(r"\bCOUNT\s+DISTINCT\s*\(", "COUNT_DISTINCT(", raw, flags=re.IGNORECASE)
 
         def _extract_arg(fn: str) -> Optional[str]:
-            m = re.match(rf"^{fn}\(\s*([A-Za-z_][A-Za-z0-9_]*|\*)\s*\)$", normalized, re.IGNORECASE)
-            return m.group(1) if m else None
+            m = re.match(rf'^{fn}\(\s*(?:"([^"]+)"|([^)]+?))\s*\)$', normalized, re.IGNORECASE)
+            if not m:
+                return None
+            cand = (m.group(1) if m.group(1) is not None else m.group(2)).strip()
+            if cand == "*" or is_safe_column_ident(cand):
+                return cand
+            return None
 
         if arg := _extract_arg("SUM"):
             return f'COALESCE(SUM("{arg}"), 0)'
@@ -60,8 +71,8 @@ class FormulaCompiler:
         if arg := _extract_arg("P95"):
             return f'QUANTILE_CONT("{arg}", 0.95)'
         if arg := _extract_arg("LAST_VALUE"):
-            if time_col and IDENT_RE.match(str(time_col)):
-                return f'ARG_MAX("{arg}", "{sanitize_identifier(str(time_col))}")'
+            if time_col and is_safe_column_ident(str(time_col)):
+                return f'ARG_MAX("{arg}", "{str(time_col).strip()}")'
             return f'ANY_VALUE("{arg}")'
 
         if arg := _extract_arg("RANK"):
@@ -72,25 +83,25 @@ class FormulaCompiler:
             return f'(COALESCE(SUM("{arg}"), 0) * 100.0) / NULLIF(SUM(SUM("{arg}")) OVER (), 0)'
 
         if arg := _extract_arg("RUNNING_TOTAL"):
-            ord_field = sanitize_identifier(order_col or time_col or arg)
+            ord_field = _safe_order_col(order_col or time_col, arg)
             return f'SUM(COALESCE(SUM("{arg}"), 0)) OVER (ORDER BY "{ord_field}" ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)'
 
         if arg := _extract_arg("YOY"):
-            ord_field = sanitize_identifier(order_col or time_col or "year")
+            ord_field = _safe_order_col(order_col or time_col, "year")
             return (
                 f'((SUM("{arg}") - LAG(SUM("{arg}"), 1) OVER (ORDER BY "{ord_field}")) * 100.0) '
                 f'/ NULLIF(ABS(LAG(SUM("{arg}"), 1) OVER (ORDER BY "{ord_field}")), 0)'
             )
 
         if arg := _extract_arg("MOM"):
-            ord_field = sanitize_identifier(order_col or time_col or "month_key")
+            ord_field = _safe_order_col(order_col or time_col, "month_key")
             return (
                 f'((SUM("{arg}") - LAG(SUM("{arg}"), 1) OVER (ORDER BY "{ord_field}")) * 100.0) '
                 f'/ NULLIF(ABS(LAG(SUM("{arg}"), 1) OVER (ORDER BY "{ord_field}")), 0)'
             )
 
         if arg := _extract_arg("YTD"):
-            tcol = sanitize_identifier(time_col or order_col or "order_date")
+            tcol = _safe_order_col(time_col or order_col, "order_date")
             return (
                 f'SUM(CASE WHEN EXTRACT(YEAR FROM CAST("{tcol}" AS DATE)) = '
                 f'(SELECT MAX(EXTRACT(YEAR FROM CAST("{tcol}" AS DATE))) FROM _base) '
@@ -98,7 +109,7 @@ class FormulaCompiler:
             )
 
         if arg := _extract_arg("MTD"):
-            tcol = sanitize_identifier(time_col or order_col or "order_date")
+            tcol = _safe_order_col(time_col or order_col, "order_date")
             return (
                 f'SUM(CASE WHEN DATE_TRUNC(\'month\', CAST("{tcol}" AS DATE)) = '
                 f'(SELECT MAX(DATE_TRUNC(\'month\', CAST("{tcol}" AS DATE))) FROM _base) '

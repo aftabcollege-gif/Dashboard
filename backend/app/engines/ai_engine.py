@@ -371,44 +371,166 @@ class AiAnalyticsEngine:
         return s
 
     @staticmethod
-    def _infer_bpmn_config_from_cols(cols_info: list[dict[str, str]]) -> Optional[dict[str, Any]]:
-        """Detects BPMN process columns (step, wait time, SLA, assignee, status) from dataset columns."""
+    def _norm_col_text(val: Any) -> str:
+        s = str(val or "").strip().lower()
+        for a, b in (
+            ("ي", "ی"),
+            ("ى", "ی"),
+            ("ك", "ک"),
+            ("آ", "ا"),
+            ("أ", "ا"),
+            ("إ", "ا"),
+            ("\u200c", " "),
+            ("\u200f", ""),
+            ("_", " "),
+            ("-", " "),
+        ):
+            s = s.replace(a, b)
+        return re.sub(r"\s+", " ", s).strip()
+
+    @staticmethod
+    def _infer_bpmn_config_from_cols(cols_info: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        """Detects BPMN process columns (process, step, wait time, SLA, assignee, status, timestamps) from dataset columns."""
         if not cols_info:
             return None
 
-        def _pick(hints: tuple[str, ...]) -> Optional[str]:
-            for h in hints:
-                for c in cols_info:
-                    hay = f"{c.get('name', '')} {c.get('label', '')}".lower()
-                    if h in hay:
-                        return c["name"]
+        norm_cols: list[dict[str, str]] = []
+        for c in cols_info:
+            cname = c.get("name") or c.get("field_name") or c.get("column_name") or ""
+            if not cname:
+                continue
+            clabel = c.get("label") or c.get("display_name") or cname
+            norm_cols.append({
+                "name": str(cname),
+                "n_name": AiAnalyticsEngine._norm_col_text(cname),
+                "n_label": AiAnalyticsEngine._norm_col_text(clabel),
+            })
+
+        if not norm_cols:
             return None
 
-        step_col = _pick(("step_name", "step", "stage", "activity", "task", "گام", "مرحله", "فعالیت"))
-        wait_col = _pick(("wait_hours", "wait_time", "wait", "duration", "delay", "انتظار", "تاخیر", "توقف", "مدت"))
-        assignee_col = _pick(("assignee_name", "assignee", "owner", "person", "user", "کارتابل", "مسئول", "شخص", "کاربر"))
-        sla_col = _pick(("sla_hours", "sla", "target_hours", "سقف", "مجاز"))
-        status_col = _pick(("status", "state", "وضعیت"))
-        req_col = _pick(("request_code", "request_id", "case_id", "ticket", "کد درخواست", "درخواست", "شماره"))
-        dept_col = _pick(("department", "unit", "واحد", "بخش"))
-        role_col = _pick(("assignee_role", "role", "سمت"))
+        def _pick(
+            hints: tuple[str, ...],
+            *,
+            exclude_names: set[str] | None = None,
+            exclude_tokens: tuple[str, ...] = (),
+        ) -> Optional[str]:
+            ex = exclude_names or set()
+            norm_hints = [AiAnalyticsEngine._norm_col_text(h) for h in hints]
+            norm_ex_toks = [AiAnalyticsEngine._norm_col_text(t) for t in exclude_tokens if t]
 
-        # Must at least look like a process dataset (step + wait or step + assignee)
-        if not step_col or (not wait_col and not assignee_col):
+            def _blocked(item: dict[str, str], hint: str) -> bool:
+                if item["name"] in ex:
+                    return True
+                hay = f"{item['n_name']} {item['n_label']}"
+                for t in norm_ex_toks:
+                    if t in hay and t not in hint:
+                        return True
+                return False
+
+            # Pass 1: exact match on normalized name or label
+            for h in norm_hints:
+                for item in norm_cols:
+                    if _blocked(item, h):
+                        continue
+                    if item["n_name"] == h or item["n_label"] == h:
+                        return item["name"]
+
+            # Pass 2: phrase substring match
+            for h in norm_hints:
+                for item in norm_cols:
+                    if _blocked(item, h):
+                        continue
+                    if h in item["n_name"] or h in item["n_label"]:
+                        return item["name"]
+            return None
+
+        # 1) Process name column (must NOT match step/stage/activity/code/time columns like "مرحله فرایند" or "گام فرایند")
+        process_col = _pick(
+            (
+                "process_name", "workflow_name", "process_title", "process_type",
+                "نام فرایندهای سازمان", "نام فرایند سازمان", "فرایندهای سازمان",
+                "نام فرایند", "عنوان فرایند", "نوع فرایند", "فرایند",
+                "process", "workflow",
+            ),
+            exclude_tokens=("step", "stage", "activity", "task", "node", "گام", "مرحله", "فعالیت", "کد", "شناسه", "id", "code", "مدت", "زمان", "تاریخ", "wait", "sla", "time"),
+        )
+
+        # 2) Step / activity column (must exclude process_col if found)
+        used = {process_col} if process_col else set()
+        step_col = _pick(
+            (
+                "step_name", "activity_name", "stage_name", "task_name",
+                "گامهای هر فرایند", "گام های هر فرایند", "نام گام", "نام مرحله", "گام فرایند", "مرحله فرایند",
+                "گام", "مرحله", "فعالیت", "step", "stage", "activity", "task",
+            ),
+            exclude_names=used,
+            exclude_tokens=("کد", "شناسه", "id", "code", "مدت", "زمان", "تاریخ", "wait", "sla", "تعداد"),
+        )
+        if not step_col:
+            step_col = _pick(("step_name", "step", "stage", "activity", "task", "گام", "مرحله", "فعالیت"), exclude_names=used)
+        if step_col:
+            used.add(step_col)
+
+        # 3) Wait / duration / delay column
+        wait_col = _pick(
+            (
+                "wait_hours", "wait_time", "waiting_hours", "duration_hours", "cycle_hours", "delay_hours",
+                "مدت انتظار", "زمان انتظار", "میزان انتظار", "تاخیر", "توقف", "مدت زمان", "مدت",
+                "wait", "duration", "delay", "latency",
+            ),
+            exclude_names=used,
+        )
+
+        # 4) Assignee / cartable owner / person column (NEVER steal process_col or step_col!)
+        assignee_col = _pick(
+            (
+                "assignee_name", "assignee", "actor_name", "actor", "handler", "operator", "agent",
+                "employee_name", "employee", "staff", "owner_name", "owner", "person", "username", "user_name", "user",
+                "نام کارشناس", "صاحب کارتابل", "در کارتابل", "کارتابل", "نام مجری", "مجری",
+                "اقدام کننده", "کاربر اقدام کننده", "تحویل گیرنده", "مسئول کارتابل", "نام مسئول", "مسئول",
+                "نام و نام خانوادگی", "نام خانوادگی", "نام کامل", "نام همکار", "نام کارمند", "نام شخص", "نام فرد", "نام کاربر",
+                "کارشناس", "متصدی", "عامل", "کاربر", "شخص", "پشتیبان", "درخواست دهنده",
+            ),
+            exclude_names=used,
+            exclude_tokens=("فرایند", "فرآیند", "گام", "مرحله", "واحد", "بخش", "دپارتمان", "شرکت", "سمت", "نقش", "نقش کارتابل"),
+        )
+
+        sla_col = _pick(("sla_hours", "sla", "target_hours", "max_hours", "سقف مجاز", "سقف", "مهلت", "مجاز", "هدف"), exclude_names=used)
+        status_col = _pick(("status", "state", "وضعیت درخواست", "وضعیت گام", "وضعیت"), exclude_names=used)
+        req_col = _pick(
+            (
+                "request_code", "request_id", "case_id", "instance_id", "process_instance_id", "ticket_id", "ticket_code",
+                "کد درخواست", "شماره درخواست", "شناسه درخواست", "شماره پرونده", "کد پرونده", "شناسه پرونده", "کد رهگیری",
+                "درخواست", "پرونده", "case", "request", "ticket",
+            ),
+            exclude_names=used,
+        )
+        req_title_col = _pick(("request_title", "case_title", "title", "subject", "description", "عنوان درخواست", "موضوع درخواست", "عنوان", "موضوع", "شرح"), exclude_names=used)
+        entered_at_col = _pick(("entered_at", "event_time", "start_time", "created_at", "timestamp", "date", "تاریخ ورود", "زمان ورود", "تاریخ ثبت", "تاریخ", "زمان"), exclude_names=used)
+        dept_col = _pick(("department", "unit", "org_unit", "واحد سازمانی", "واحد", "بخش", "دپارتمان", "اداره", "معاونت"), exclude_names=used)
+        role_col = _pick(("assignee_role", "actor_role", "role", "position", "سمت", "نقش", "پست"), exclude_names=used)
+        step_id_col = _pick(("step_id", "node_id", "task_id", "کد گام", "کد مرحله", "شناسه گام"), exclude_names=used)
+
+        # Must look like a process dataset (step + any of process / wait / assignee / req)
+        if not step_col or (not process_col and not wait_col and not assignee_col and not req_col):
             return None
 
         return {
+            "process_field": process_col,
             "step_field": step_col,
-            "step_id_field": _pick(("step_id", "node_id")),
+            "step_id_field": step_id_col,
             "wait_field": wait_col,
             "sla_field": sla_col,
             "assignee_field": assignee_col,
             "assignee_role_field": role_col,
             "request_id_field": req_col,
+            "request_title_field": req_title_col,
+            "entered_at_field": entered_at_col,
             "status_field": status_col,
             "department_field": dept_col,
             "heatmap_enabled": True,
-            "heatmap_metric": "avg_wait",
+            "heatmap_metric": "avg_wait" if wait_col else "pending_count",
         }
 
     @staticmethod
@@ -959,18 +1081,39 @@ class AiAnalyticsEngine:
         viz_cfg = {"show_legend": True, "show_tooltip": True, "data_labels": False}
 
         sec_ctx = build_data_security_context(db, user, chosen_ds.id)
-        sql, params, _ = build_visual_query_sql(
-            db, chosen_ds, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
-            raw_mode=(eff_chart == "bpmn"),
-            user=user,
-        )
-        raw_preview = warehouse.execute_query(sql, params)
-        vis_cols, vis_rows = apply_cls_and_masking(raw_preview["columns"], raw_preview["rows"], sec_ctx)
-        preview_data = {
-            "columns": vis_cols,
-            "rows": vis_rows,
-            "row_count": len(vis_rows),
-        }
+        if eff_chart == "bpmn":
+            from app.engines.bpmn_analytics import execute_bpmn_widget_sql
+
+            bpmn_res = execute_bpmn_widget_sql(
+                db,
+                chosen_ds,
+                visual_spec,
+                viz_cfg,
+                [],
+                sec_ctx.rls_where_clauses,
+                sec_ctx.rls_params,
+                user=user,
+            )
+            sql = bpmn_res.get("generated_sql", "")
+            preview_data = {
+                "columns": bpmn_res["columns"],
+                "rows": bpmn_res["rows"],
+                "row_count": bpmn_res["row_count"],
+                "bpmn_analytics": bpmn_res.get("bpmn_analytics"),
+            }
+        else:
+            sql, params, _ = build_visual_query_sql(
+                db, chosen_ds, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
+                raw_mode=False,
+                user=user,
+            )
+            raw_preview = warehouse.execute_query(sql, params)
+            vis_cols, vis_rows = apply_cls_and_masking(raw_preview["columns"], raw_preview["rows"], sec_ctx)
+            preview_data = {
+                "columns": vis_cols,
+                "rows": vis_rows,
+                "row_count": len(vis_rows),
+            }
 
         created_widget = None
         if create_widget and dashboard_id:

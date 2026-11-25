@@ -14,6 +14,7 @@ from app.core.rls_cls import (
     build_public_data_security_context,
     build_security_cte_sql,
     build_security_projection_and_where,
+    is_safe_column_ident,
 )
 from app.core.sql_guard import extract_ast_column_references, validate_formula_ast, validate_readonly_sql_ast
 from app.engines.data_engine import FormulaCompiler
@@ -188,7 +189,7 @@ def build_visual_query_sql(
                 jtype = "LEFT"
             lf = str(j.get("left_field", ""))
             rf = str(j.get("right_field", ""))
-            if not (IDENT_RE.match(lf) and IDENT_RE.match(rf)):
+            if not (is_safe_column_ident(lf) and is_safe_column_ident(rf)):
                 raise ValueError("Invalid join column identifier")
 
             left_ds_id = j.get("left_dataset_id") or dataset.id
@@ -341,6 +342,12 @@ def build_visual_query_sql(
     proj_sql = ", ".join(base_proj_parts) if base_proj_parts else "*"
     base_ctes = f"_base_raw AS (SELECT {proj_sql} FROM {table_expr}{join_clauses}), _base AS (SELECT * FROM _base_raw {where_sql})"
 
+    if security_bundle_out is not None:
+        security_bundle_out["base_ctes"] = base_ctes
+        security_bundle_out["base_params"] = list(params)
+        security_bundle_out["avail_cols"] = sorted(avail_cols)
+        security_bundle_out["cols_meta"] = base_cols_meta
+
     if raw_mode:
         sql = f"WITH {base_ctes} SELECT * FROM _base LIMIT 1000"
         return sql, params, "raw"
@@ -367,12 +374,12 @@ def build_visual_query_sql(
             raise PermissionError(f"Access denied to hidden column '{candidate}'")
 
     if explicit_cols and not x_field and not y_field and not measures:
-        safe_cols = [f'"{c}"' for c in explicit_cols if IDENT_RE.match(c) and c in avail_cols]
+        safe_cols = [f'"{c}"' for c in explicit_cols if is_safe_column_ident(c) and c in avail_cols]
         sel_sql = ", ".join(safe_cols) if safe_cols else "*"
         lim = max(1, min(int(visual_spec.get("limit", 1000)), settings.MAX_QUERY_ROWS))
         order_col = visual_spec.get("order_by")
         order_dir = "DESC" if str(visual_spec.get("order_dir", "ASC")).upper() == "DESC" else "ASC"
-        order_sql = f' ORDER BY "{order_col}" {order_dir}' if order_col and IDENT_RE.match(order_col) else ""
+        order_sql = f' ORDER BY "{order_col}" {order_dir}' if order_col and is_safe_column_ident(order_col) else ""
         sql = f"WITH {base_ctes} SELECT {sel_sql} FROM _base{order_sql} LIMIT {lim}"
         return sql, params, "visual_select"
 
@@ -415,7 +422,7 @@ def build_visual_query_sql(
         allowed_aggs = {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNT_DISTINCT"}
         if l_agg not in allowed_aggs or r_agg not in allowed_aggs:
             raise ValueError("Unsupported aggregation in multi_source_agg")
-        if not (IDENT_RE.match(l_key) and IDENT_RE.match(r_key) and IDENT_RE.match(l_field) and IDENT_RE.match(r_field)):
+        if not (is_safe_column_ident(l_key) and is_safe_column_ident(r_key) and is_safe_column_ident(l_field) and is_safe_column_ident(r_field)):
             raise ValueError("Invalid column identifier in multi_source_agg")
         if l_key in merged_hidden or l_key not in avail_cols:
             raise PermissionError(f"Access denied to column '{l_key}'")
@@ -432,7 +439,7 @@ def build_visual_query_sql(
         l_agg_sql = f'COUNT(DISTINCT "{l_field}")' if l_agg == "COUNT_DISTINCT" else f'COALESCE({l_agg}("{l_field}"), 0)'
         r_agg_sql = f'COUNT(DISTINCT "{r_field}")' if r_agg == "COUNT_DISTINCT" else f'COALESCE({r_agg}("{r_field}"), 0)'
 
-        x_valid = bool(x_field and IDENT_RE.match(x_field) and x_field in avail_cols)
+        x_valid = bool(x_field and is_safe_column_ident(x_field) and x_field in avail_cols)
         if x_valid and x_field == l_key:
             ms_left_sql = (
                 f'SELECT "{l_key}" AS _jk, {l_agg_sql} AS _l_val, COUNT(*) AS _l_cnt '
@@ -500,7 +507,7 @@ def build_visual_query_sql(
             g_agg = str(pre_grain.get("grain_agg", "SUM")).upper()
         if g_agg not in {"SUM", "AVG", "MIN", "MAX"}:
             g_agg = "SUM"
-        if not IDENT_RE.match(amt_col) or not IDENT_RE.match(ord_col):
+        if not is_safe_column_ident(amt_col) or not is_safe_column_ident(ord_col):
             raise ValueError("Invalid column name in AOV / pre_agg_grain")
         if amt_col in merged_hidden or amt_col not in avail_cols:
             raise PermissionError(f"Access denied to column '{amt_col}'")
@@ -508,9 +515,9 @@ def build_visual_query_sql(
             raise PermissionError(f"Access denied to column '{ord_col}'")
 
         grp_cols_raw: list[str] = []
-        if x_field and IDENT_RE.match(x_field) and x_field != ord_col:
+        if x_field and is_safe_column_ident(x_field) and x_field != ord_col:
             grp_cols_raw.append(x_field)
-        if series_field and IDENT_RE.match(series_field) and series_field not in (x_field, ord_col):
+        if series_field and is_safe_column_ident(series_field) and series_field not in (x_field, ord_col):
             grp_cols_raw.append(series_field)
 
         grp_select = ", ".join(f'"{c}"' for c in grp_cols_raw)
@@ -615,21 +622,25 @@ def build_visual_query_sql(
     group_fields: list[str] = []
     select_parts: list[str] = []
 
-    if x_field and IDENT_RE.match(x_field):
+    if x_field and is_safe_column_ident(x_field) and x_field in avail_cols:
         select_parts.append(f'"{x_field}"')
         group_fields.append(f'"{x_field}"')
-    if series_field and IDENT_RE.match(series_field) and series_field != x_field:
+    if series_field and is_safe_column_ident(series_field) and series_field in avail_cols and series_field != x_field:
         select_parts.append(f'"{series_field}"')
         group_fields.append(f'"{series_field}"')
 
     if measures:
         for idx, m in enumerate(measures):
             m_field = str(m.get("field") or "").strip()
-            m_expr = m.get("formula") or (
-                saved_measure_exprs.get(m_field.lower())
-                if m_field and m_field.lower() in saved_measure_exprs
-                else f"{m.get('aggregation', 'SUM')}({m_field or '*'})"
-            )
+            m_agg = str(m.get("aggregation", "SUM")).upper()
+            if m.get("formula"):
+                m_expr = m["formula"]
+            elif m_field and m_field.lower() in saved_measure_exprs:
+                m_expr = saved_measure_exprs[m_field.lower()]
+            elif m_field and m_field != "*":
+                m_expr = f'{m_agg}("{m_field}")'
+            else:
+                m_expr = f"{m_agg}(*)"
             m_alias = str(m.get("alias") or f"value_{idx+1}")
             if not IDENT_RE.match(m_alias):
                 m_alias = f"value_{idx+1}"
@@ -645,15 +656,17 @@ def build_visual_query_sql(
         select_parts.append(f'{compiled_expr} AS "{alias_name}"')
     elif y_field:
         if agg in ("RAW", "NONE"):
-            if IDENT_RE.match(y_field):
+            if is_safe_column_ident(y_field):
                 if y_field in merged_hidden and y_field not in avail_cols:
                     raise PermissionError(f"Access denied to hidden column '{y_field}'")
                 select_parts.append(f'"{y_field}"')
         else:
             if y_field.lower() in saved_measure_exprs and y_field not in avail_cols:
                 formula = saved_measure_exprs[y_field.lower()]
+            elif "(" not in y_field:
+                formula = f"{agg}(*)" if y_field == "*" else f'{agg}("{y_field}")'
             else:
-                formula = f"{agg}({y_field})" if "(" not in y_field else y_field
+                formula = y_field
             compiled_expr = FormulaCompiler.compile_measure(formula, time_col=time_col, order_col=x_field)
             _assert_expr_no_hidden_cols(compiled_expr, merged_hidden, avail_cols)
             alias_name = visual_spec.get("y_alias") or "value"
@@ -664,15 +677,15 @@ def build_visual_query_sql(
         select_parts.append('COUNT(*) AS "value"')
 
     if sec_field := visual_spec.get("secondary_y_field"):
-        if IDENT_RE.match(sec_field):
+        if is_safe_column_ident(sec_field):
             sec_agg = str(visual_spec.get("secondary_aggregation", "AVG")).upper()
-            sec_expr = FormulaCompiler.compile_measure(f"{sec_agg}({sec_field})", time_col=time_col, order_col=x_field)
+            sec_expr = FormulaCompiler.compile_measure(f'{sec_agg}("{sec_field}")', time_col=time_col, order_col=x_field)
             _assert_expr_no_hidden_cols(sec_expr, merged_hidden, avail_cols)
             select_parts.append(f'{sec_expr} AS "secondary_value"')
 
     if size_field := visual_spec.get("size_field"):
-        if IDENT_RE.match(size_field):
-            size_expr = FormulaCompiler.compile_measure(f"SUM({size_field})", time_col=time_col, order_col=x_field)
+        if is_safe_column_ident(size_field):
+            size_expr = FormulaCompiler.compile_measure(f'SUM("{size_field}")', time_col=time_col, order_col=x_field)
             _assert_expr_no_hidden_cols(size_expr, merged_hidden, avail_cols)
             select_parts.append(f'{size_expr} AS "size_value"')
 
@@ -687,7 +700,7 @@ def build_visual_query_sql(
     elif visual_spec.get("sort_by"):
         sb = str(visual_spec["sort_by"])
         sdir = "DESC" if str(visual_spec.get("sort_dir", "DESC")).upper() == "DESC" else "ASC"
-        if sb in ("value", "secondary_value") or IDENT_RE.match(sb):
+        if sb in ("value", "secondary_value") or (is_safe_column_ident(sb) and sb in avail_cols):
             order_sql = f'ORDER BY "{sb}" {sdir}'
     elif x_field and any(k in x_field.lower() for k in ("year", "quarter", "month", "day", "date")):
         order_sql = f'ORDER BY "{x_field}" ASC'

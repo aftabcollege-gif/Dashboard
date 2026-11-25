@@ -27,6 +27,8 @@ export default function PublicDashboardPage() {
   const [widgetResults, setWidgetResults] = useState<Record<string, any>>({});
   const [crossFilters, setCrossFilters] = useState<CrossFilterItem[]>([]);
   const [drillStates, setDrillStates] = useState<Record<string, { field: string; value: any }[]>>({});
+  const [bpmnProcessMap, setBpmnProcessMap] = useState<Record<string, string>>({});
+  const [bpmnFieldOverridesMap, setBpmnFieldOverridesMap] = useState<Record<string, Record<string, string | null>>>({});
   const [widgetChartOverrides, setWidgetChartOverrides] = useState<Record<string, string>>({});
   const [clickModes, setClickModes] = useState<Record<string, "drill" | "cross_filter">>({});
   const [loadingBatch, setLoadingBatch] = useState(false);
@@ -77,9 +79,24 @@ export default function PublicDashboardPage() {
   };
 
   const executePublicBatch = useCallback(
-    async (nextCross: CrossFilterItem[], nextDrill: Record<string, { field: string; value: any }[]>) => {
+    async (
+      nextCross: CrossFilterItem[],
+      nextDrill: Record<string, { field: string; value: any }[]>,
+      nextProcMap?: Record<string, string>,
+      nextOverridesMap?: Record<string, Record<string, string | null>>
+    ) => {
       setLoadingBatch(true);
       try {
+        const effProcMap = nextProcMap ?? bpmnProcessMap;
+        const rawOvMap = nextOverridesMap ?? bpmnFieldOverridesMap;
+        const cleanOvMap: Record<string, Record<string, string>> = {};
+        for (const [wid, ov] of Object.entries(rawOvMap)) {
+          const clean: Record<string, string> = {};
+          for (const [k, v] of Object.entries(ov || {})) {
+            if (v) clean[k] = v;
+          }
+          if (Object.keys(clean).length > 0) cleanOvMap[wid] = clean;
+        }
         const res = await apiFetch<{ widgets: Record<string, any> }>(`/dashboards/public/${token}/execute-batch`, {
           method: "POST",
           body: JSON.stringify({
@@ -87,6 +104,8 @@ export default function PublicDashboardPage() {
             cross_filters: nextCross,
             drill_states: nextDrill,
             use_cache: false,
+            bpmn_process_map: effProcMap,
+            bpmn_field_overrides_map: cleanOvMap,
           }),
         });
         if (res?.widgets) {
@@ -98,7 +117,7 @@ export default function PublicDashboardPage() {
         setLoadingBatch(false);
       }
     },
-    [token]
+    [token, bpmnProcessMap, bpmnFieldOverridesMap]
   );
 
   const getWidgetClickMode = (w: any): "drill" | "cross_filter" => {
@@ -175,9 +194,11 @@ export default function PublicDashboardPage() {
   const resetAll = async () => {
     setCrossFilters([]);
     setDrillStates({});
+    setBpmnProcessMap({});
+    setBpmnFieldOverridesMap({});
     setWidgetChartOverrides({});
     setClickModes({});
-    await executePublicBatch([], {});
+    await executePublicBatch([], {}, {}, {});
   };
 
   if (err) return <div className="p-8 text-center text-red-500 text-sm">{err}</div>;
@@ -522,6 +543,20 @@ export default function PublicDashboardPage() {
                   vizConfig={w.config?.visualization || {}}
                   visualSpec={w.query?.visual_spec}
                   onPointClick={(field, val) => handlePointClick(w, field, val)}
+                  widgetId={w.id}
+                  publicShareToken={token}
+                  crossFilters={crossFilters}
+                  bpmnAnalytics={wd.bpmn_analytics}
+                  onProcessSelect={(proc) => {
+                    const nextProcMap = { ...bpmnProcessMap, [w.id]: proc };
+                    setBpmnProcessMap(nextProcMap);
+                    executePublicBatch(crossFilters, drillStates, nextProcMap, bpmnFieldOverridesMap);
+                  }}
+                  onFieldMappingOverride={(ov) => {
+                    const nextOvMap = { ...bpmnFieldOverridesMap, [w.id]: ov };
+                    setBpmnFieldOverridesMap(nextOvMap);
+                    executePublicBatch(crossFilters, drillStates, bpmnProcessMap, nextOvMap);
+                  }}
                 />
               </div>
             </div>

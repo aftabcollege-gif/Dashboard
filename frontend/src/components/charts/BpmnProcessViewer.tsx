@@ -1,27 +1,35 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
   Clock,
+  Database,
   Filter,
   Flame,
+  GitBranch,
   Inbox,
+  Loader2,
   Maximize2,
   Search,
+  SlidersHorizontal,
   UserCheck,
   Users,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { apiFetch } from "@/lib/api";
 import {
+  BpmnAssigneeSummary,
+  BpmnCartableItem,
   BpmnNode,
   BpmnStepMetrics,
   BpmnWidgetConfig,
   computeBpmnAnalytics,
 } from "@/lib/bpmnParser";
 import { useBi } from "@/lib/context";
+import type { BpmnAnalyticsPayload } from "@/types/bi";
 
 interface Props {
   columns: string[];
@@ -30,6 +38,33 @@ interface Props {
   vizConfig?: Record<string, any>;
   visualSpec?: Record<string, any>;
   onPointClick?: (field: string, value: any) => void;
+  widgetId?: string;
+  publicShareToken?: string;
+  activeFilters?: any[];
+  crossFilters?: any[];
+  bpmnAnalytics?: BpmnAnalyticsPayload;
+  onProcessSelect?: (processName: string) => void;
+  onFieldMappingOverride?: (overrides: Record<string, string | null>) => void;
+}
+
+interface ServerDrillPayload {
+  step_name: string;
+  process_name: string | null;
+  available_columns: string[];
+  step_summary: Record<string, any>;
+  assignees: {
+    assigneeName: string;
+    assigneeRole: string;
+    pendingCount: number;
+    totalCount: number;
+    avgWaitHours: number;
+    maxWaitHours: number;
+    overdueCount: number;
+  }[];
+  items: BpmnCartableItem[];
+  total_items: number;
+  limit: number;
+  offset: number;
 }
 
 function getHeatPalette(ratio: number, isDark: boolean): {
@@ -81,7 +116,9 @@ function formatWaitDuration(hours: number, isFa: boolean): string {
     const days = Math.floor(h / 24);
     const rem = Math.round((h % 24) * 10) / 10;
     if (isFa) {
-      return rem > 0 ? `${h.toLocaleString("fa-IR")} ساعت (${days} روز و ${rem} س)` : `${h.toLocaleString("fa-IR")} ساعت (${days} روز)`;
+      return rem > 0
+        ? `${h.toLocaleString("fa-IR")} ساعت (${days} روز و ${rem} س)`
+        : `${h.toLocaleString("fa-IR")} ساعت (${days} روز)`;
     }
     return `${h.toFixed(1)}h (${days}d ${rem}h)`;
   }
@@ -94,7 +131,6 @@ function getEdgePath(src: BpmnNode, dst: BpmnNode): { path: string; midX: number
   const tx = dst.x;
   const ty = dst.y + dst.height / 2;
 
-  // Backward loop edge (e.g. revision -> review)
   if (tx < src.x + 10) {
     const sBotX = src.x + src.width / 2;
     const sBotY = src.y + src.height;
@@ -108,7 +144,6 @@ function getEdgePath(src: BpmnNode, dst: BpmnNode): { path: string; midX: number
     };
   }
 
-  // Branch down (gateway -> lower branch)
   if (Math.abs(ty - sy) > 70 && Math.abs(tx - sx) < 90) {
     const sBotX = src.x + src.width / 2;
     const sBotY = src.y + src.height;
@@ -137,18 +172,32 @@ export default function BpmnProcessViewer({
   vizConfig = {},
   visualSpec = {},
   onPointClick,
+  widgetId,
+  publicShareToken,
+  activeFilters = [],
+  crossFilters = [],
+  bpmnAnalytics,
+  onProcessSelect,
+  onFieldMappingOverride,
 }: Props) {
   const { locale, activeThemeMode, activeThemeTokens } = useBi();
   const isFa = locale === "fa";
   const isDark = activeThemeMode === "dark";
 
-  const bpmnConfig: BpmnWidgetConfig = useMemo(
-    () => ({
+  const [localFieldOverrides, setLocalFieldOverrides] = useState<Record<string, string | null>>({});
+  const [showMapper, setShowMapper] = useState<boolean>(false);
+
+  const bpmnConfig: BpmnWidgetConfig = useMemo(() => {
+    const base = {
       ...(visualSpec?.bpmn_config || {}),
+      ...(vizConfig?.bpmn_config || {}),
       ...(styleConfig?.bpmn_config || {}),
-    }),
-    [visualSpec, styleConfig]
-  );
+    };
+    for (const [k, v] of Object.entries(localFieldOverrides)) {
+      if (v) (base as any)[k] = v;
+    }
+    return base;
+  }, [visualSpec, vizConfig, styleConfig, localFieldOverrides]);
 
   const [heatmapEnabled, setHeatmapEnabled] = useState<boolean>(
     bpmnConfig.heatmap_enabled ?? vizConfig.heatmap_enabled ?? true
@@ -162,16 +211,84 @@ export default function BpmnProcessViewer({
   const [selectedAssignee, setSelectedAssignee] = useState<string | null>(null);
   const [showAllStatusesInDrill, setShowAllStatusesInDrill] = useState<boolean>(false);
   const [drillSearch, setDrillSearch] = useState<string>("");
+  const [drillOffset, setDrillOffset] = useState<number>(0);
+
+  const [serverDrill, setServerDrill] = useState<ServerDrillPayload | null>(null);
+  const [drillLoading, setDrillLoading] = useState<boolean>(false);
 
   const analytics = useMemo(
-    () => computeBpmnAnalytics(rows || [], columns || [], bpmnConfig, heatmapMetric),
-    [rows, columns, bpmnConfig, heatmapMetric]
+    () => computeBpmnAnalytics(rows || [], columns || [], bpmnConfig, heatmapMetric, bpmnAnalytics),
+    [rows, columns, bpmnConfig, heatmapMetric, bpmnAnalytics]
   );
 
   const { graph, stepMap, minMetricValue, maxMetricValue, totalPendingRequests, overallAvgWaitHours, bottleneckStep, mapping } =
     analytics;
 
-  // Compute SVG Bounding Box
+  const availableCols = useMemo(
+    () => (bpmnAnalytics?.available_columns?.length ? bpmnAnalytics.available_columns : columns || []),
+    [bpmnAnalytics?.available_columns, columns]
+  );
+
+  // Fetch live SQL cartable drill-down when widgetId is available
+  useEffect(() => {
+    if (!selectedStepKey || !widgetId) {
+      setServerDrill(null);
+      return;
+    }
+    const stepMeta = stepMap[selectedStepKey];
+    const targetStepName = stepMeta?.stepKey || selectedStepKey;
+    const cleanOverrides: Record<string, string> = {};
+    for (const [k, v] of Object.entries(localFieldOverrides)) {
+      if (v) cleanOverrides[k] = v;
+    }
+    let cancelled = false;
+    setDrillLoading(true);
+    const endpoint = publicShareToken
+      ? `/api/v1/dashboards/public/${publicShareToken}/widgets/${widgetId}/bpmn-drill`
+      : `/api/v1/dashboards/widgets/${widgetId}/bpmn-drill`;
+
+    apiFetch<ServerDrillPayload>(endpoint, {
+      method: "POST",
+      body: JSON.stringify({
+        step_name: targetStepName,
+        process_name: bpmnAnalytics?.active_process || null,
+        assignee_name: selectedAssignee,
+        pending_only: !showAllStatusesInDrill && (stepMeta?.pendingCount ?? 0) > 0,
+        search: drillSearch.trim() || null,
+        limit: 80,
+        offset: drillOffset,
+        active_filters: activeFilters,
+        cross_filters: crossFilters,
+        field_overrides: Object.keys(cleanOverrides).length > 0 ? cleanOverrides : null,
+      }),
+    })
+      .then((res) => {
+        if (!cancelled) setServerDrill(res);
+      })
+      .catch(() => {
+        if (!cancelled) setServerDrill(null);
+      })
+      .finally(() => {
+        if (!cancelled) setDrillLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    selectedStepKey,
+    widgetId,
+    publicShareToken,
+    bpmnAnalytics?.active_process,
+    selectedAssignee,
+    showAllStatusesInDrill,
+    drillSearch,
+    drillOffset,
+    activeFilters,
+    crossFilters,
+    localFieldOverrides,
+  ]);
+
   const bounds = useMemo(() => {
     if (graph.nodes.length === 0) return { minX: 0, minY: 0, width: 900, height: 340 };
     let minX = Infinity;
@@ -195,9 +312,13 @@ export default function BpmnProcessViewer({
   const activeStepMetrics: BpmnStepMetrics | null = selectedStepKey ? stepMap[selectedStepKey] || null : null;
   const hoveredStepMetrics: BpmnStepMetrics | null = hoveredStepId ? stepMap[hoveredStepId] || null : null;
 
-  if (!rows || rows.length === 0) {
+  const hasAnyData = (rows && rows.length > 0) || (bpmnAnalytics?.step_summary && bpmnAnalytics.step_summary.length > 0);
+  if (!hasAnyData) {
     return (
-      <div className="h-full flex flex-col items-center justify-center text-xs p-4 text-center" style={{ color: activeThemeTokens.muted_text }}>
+      <div
+        className="h-full flex flex-col items-center justify-center text-xs p-4 text-center"
+        style={{ color: activeThemeTokens.muted_text }}
+      >
         <Inbox className="w-7 h-7 mb-2 opacity-50" />
         <p className="font-semibold">
           {isFa ? "هیچ ردیف فرآیندی با فیلترهای فعلی یافت نشد." : "No process events matched the active filters."}
@@ -206,15 +327,80 @@ export default function BpmnProcessViewer({
     );
   }
 
+  const renderFieldMapperPanel = () => {
+    if (!showMapper) return null;
+    const fields: { key: keyof BpmnWidgetConfig; labelFa: string; labelEn: string }[] = [
+      { key: "process_field", labelFa: "ستون نام فرآیند", labelEn: "Process Name Col" },
+      { key: "step_field", labelFa: "ستون گام / مرحله", labelEn: "Step / Activity Col" },
+      { key: "assignee_field", labelFa: "ستون فرد / کارتابل", labelEn: "Assignee / Cartable Col" },
+      { key: "wait_field", labelFa: "ستون زمان انتظار", labelEn: "Wait Hours Col" },
+      { key: "status_field", labelFa: "ستون وضعیت", labelEn: "Status Col" },
+    ];
+    return (
+      <div
+        className="p-2.5 rounded-lg border grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2 shrink-0"
+        style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}
+      >
+        {fields.map((f) => {
+          const val = (localFieldOverrides[f.key] ?? (mapping as any)[f.key] ?? "") as string;
+          return (
+            <label key={f.key} className="block space-y-1 text-[10px]">
+              <span className="font-semibold block" style={{ color: activeThemeTokens.muted_text }}>
+                {isFa ? f.labelFa : f.labelEn}
+              </span>
+              <select
+                value={val}
+                onChange={(e) => {
+                  const nextVal = e.target.value || null;
+                  const next = { ...localFieldOverrides, [f.key]: nextVal };
+                  setLocalFieldOverrides(next);
+                  if (onFieldMappingOverride) onFieldMappingOverride(next);
+                }}
+                className="w-full px-2 py-1 rounded border text-[11px]"
+                style={{
+                  background: activeThemeTokens.card_bg,
+                  color: activeThemeTokens.text,
+                  borderColor: activeThemeTokens.border,
+                }}
+              >
+                <option value="">{isFa ? "— خودکار / ندارد —" : "— Auto / None —"}</option>
+                {availableCols.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            </label>
+          );
+        })}
+      </div>
+    );
+  };
+
   // ---------------- DRILL-DOWN VIEW FOR SELECTED BPMN STEP ----------------
   if (activeStepMetrics) {
+    const serverAssignees: BpmnAssigneeSummary[] =
+      serverDrill?.assignees?.map((sa) => ({
+        assigneeName: sa.assigneeName,
+        assigneeRole: sa.assigneeRole || "",
+        pendingCount: sa.pendingCount,
+        totalCount: sa.totalCount,
+        avgWaitHours: sa.avgWaitHours,
+        maxWaitHours: sa.maxWaitHours,
+        overdueCount: sa.overdueCount,
+        items: [],
+      })) || [];
+
+    const effectiveAssignees =
+      serverAssignees.length > 0 ? serverAssignees : activeStepMetrics.assignees;
+
     const baseList = showAllStatusesInDrill
       ? activeStepMetrics.items
       : activeStepMetrics.pendingItems.length > 0
       ? activeStepMetrics.pendingItems
       : activeStepMetrics.items;
     const qLow = drillSearch.trim().toLowerCase();
-    const filteredList = baseList.filter((it) => {
+    const localFilteredList = baseList.filter((it) => {
       if (selectedAssignee && it.assigneeName !== selectedAssignee) return false;
       if (!qLow) return true;
       return (
@@ -224,6 +410,19 @@ export default function BpmnProcessViewer({
         it.department.toLowerCase().includes(qLow)
       );
     });
+
+    const displayedItems = serverDrill ? serverDrill.items : localFilteredList;
+    const totalDisplayedCount = serverDrill ? serverDrill.total_items : localFilteredList.length;
+
+    const effSummary = {
+      pendingCount: serverDrill?.step_summary?.pending_count ?? activeStepMetrics.pendingCount,
+      completedCount: serverDrill?.step_summary?.completed_count ?? activeStepMetrics.completedCount,
+      totalCount: serverDrill?.step_summary?.total_count ?? activeStepMetrics.totalCount,
+      avgWaitHours: serverDrill?.step_summary?.avg_wait_hours ?? activeStepMetrics.avgWaitHours,
+      maxWaitHours: serverDrill?.step_summary?.max_wait_hours ?? activeStepMetrics.maxWaitHours,
+      slaHours: serverDrill?.step_summary?.sla_hours ?? activeStepMetrics.slaHours,
+      overdueCount: serverDrill?.step_summary?.overdue_count ?? activeStepMetrics.overdueCount,
+    };
 
     return (
       <div dir={isFa ? "rtl" : "ltr"} className="h-full flex flex-col gap-2.5 overflow-hidden text-xs">
@@ -242,6 +441,8 @@ export default function BpmnProcessViewer({
                 setSelectedStepKey(null);
                 setSelectedAssignee(null);
                 setDrillSearch("");
+                setDrillOffset(0);
+                setServerDrill(null);
               }}
               className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-bold text-white"
               style={{ backgroundColor: activeThemeTokens.primary }}
@@ -260,10 +461,22 @@ export default function BpmnProcessViewer({
                   {isFa ? "گلوگاه فرآیند" : "Bottleneck"}
                 </span>
               )}
+              {drillLoading && <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />}
             </div>
           </div>
 
           <div className="flex items-center gap-1.5">
+            {availableCols.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowMapper((s) => !s)}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-semibold hover:bg-blue-500/10"
+                style={{ borderColor: activeThemeTokens.border }}
+              >
+                <SlidersHorizontal className="w-3 h-3" />
+                {isFa ? "تنظیم ستون کارتابل" : "Columns"}
+              </button>
+            )}
             {onPointClick && (
               <button
                 type="button"
@@ -279,20 +492,25 @@ export default function BpmnProcessViewer({
           </div>
         </div>
 
+        {renderFieldMapperPanel()}
+
         {/* Summary KPI Strip for Selected Step */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 shrink-0">
           <div className="p-2 rounded-lg border" style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}>
             <div className="text-[10px]" style={{ color: activeThemeTokens.muted_text }}>
               {isFa ? "درخواست مانده در کارتابل" : "Pending in Cartable"}
             </div>
-            <div className="text-sm font-bold mt-0.5">{activeStepMetrics.pendingCount}</div>
+            <div className="text-sm font-bold mt-0.5">
+              {effSummary.pendingCount.toLocaleString(isFa ? "fa-IR" : "en-US")}{" "}
+              <span className="text-[10px] opacity-65">({isFa ? `کل: ${effSummary.totalCount.toLocaleString("fa-IR")}` : `Total: ${effSummary.totalCount}`})</span>
+            </div>
           </div>
           <div className="p-2 rounded-lg border" style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}>
             <div className="text-[10px]" style={{ color: activeThemeTokens.muted_text }}>
               {isFa ? "میانگین زمان انتظار" : "Avg Wait Time"}
             </div>
             <div className="text-sm font-bold mt-0.5 text-amber-500">
-              {activeStepMetrics.avgWaitHours} {isFa ? "ساعت" : "hrs"}
+              {effSummary.avgWaitHours} {isFa ? "ساعت" : "hrs"}
             </div>
           </div>
           <div className="p-2 rounded-lg border" style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}>
@@ -300,7 +518,7 @@ export default function BpmnProcessViewer({
               {isFa ? "بیشترین زمان انتظار" : "Max Wait Time"}
             </div>
             <div className="text-sm font-bold mt-0.5 text-red-500">
-              {activeStepMetrics.maxWaitHours} {isFa ? "ساعت" : "hrs"}
+              {effSummary.maxWaitHours} {isFa ? "ساعت" : "hrs"}
             </div>
           </div>
           <div className="p-2 rounded-lg border" style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}>
@@ -308,7 +526,8 @@ export default function BpmnProcessViewer({
               {isFa ? "عبور از سقف SLA" : "SLA Overdue"}
             </div>
             <div className="text-sm font-bold mt-0.5">
-              {activeStepMetrics.overdueCount} <span className="text-[10px] opacity-65">(SLA: {activeStepMetrics.slaHours}h)</span>
+              {effSummary.overdueCount.toLocaleString(isFa ? "fa-IR" : "en-US")}{" "}
+              <span className="text-[10px] opacity-65">(SLA: {effSummary.slaHours}h)</span>
             </div>
           </div>
         </div>
@@ -323,12 +542,17 @@ export default function BpmnProcessViewer({
             <div className="flex items-center justify-between mb-2 shrink-0">
               <div className="font-bold flex items-center gap-1.5 text-[11px]">
                 <Users className="w-3.5 h-3.5 text-blue-500" />
-                {isFa ? "افرادی که درخواست در کارتابل آن‌ها مانده" : "Cartable Assignees"}
+                {isFa
+                  ? `افراد دارای درخواست در کارتابل (${effectiveAssignees.length})`
+                  : `Cartable Assignees (${effectiveAssignees.length})`}
               </div>
               {selectedAssignee && (
                 <button
                   type="button"
-                  onClick={() => setSelectedAssignee(null)}
+                  onClick={() => {
+                    setSelectedAssignee(null);
+                    setDrillOffset(0);
+                  }}
                   className="text-[10px] font-semibold underline"
                   style={{ color: activeThemeTokens.primary }}
                 >
@@ -337,13 +561,16 @@ export default function BpmnProcessViewer({
               )}
             </div>
             <div className="flex-1 overflow-y-auto space-y-1.5 pe-0.5">
-              {activeStepMetrics.assignees.map((asgn) => {
+              {effectiveAssignees.map((asgn) => {
                 const isActive = selectedAssignee === asgn.assigneeName;
                 return (
                   <button
                     key={asgn.assigneeName}
                     type="button"
-                    onClick={() => setSelectedAssignee(isActive ? null : asgn.assigneeName)}
+                    onClick={() => {
+                      setSelectedAssignee(isActive ? null : asgn.assigneeName);
+                      setDrillOffset(0);
+                    }}
                     className={`w-full text-start p-2 rounded-lg border transition flex items-center justify-between gap-2 ${
                       isActive ? "ring-2 ring-blue-500/60" : "hover:bg-blue-500/5"
                     }`}
@@ -365,10 +592,10 @@ export default function BpmnProcessViewer({
                     </div>
                     <div className="text-end shrink-0">
                       <div className="font-bold text-[11px]">
-                        {asgn.pendingCount > 0 ? asgn.pendingCount : asgn.totalCount}{" "}
+                        {(asgn.pendingCount > 0 ? asgn.pendingCount : asgn.totalCount).toLocaleString(isFa ? "fa-IR" : "en-US")}{" "}
                         {isFa ? "درخواست" : "req"}
                       </div>
-                      <div className={`text-[10px] font-semibold ${asgn.avgWaitHours > activeStepMetrics.slaHours ? "text-red-500" : "text-amber-500"}`}>
+                      <div className={`text-[10px] font-semibold ${asgn.avgWaitHours > effSummary.slaHours ? "text-red-500" : "text-amber-500"}`}>
                         {isFa ? `میانگین ${asgn.avgWaitHours} س` : `Avg ${asgn.avgWaitHours}h`}
                       </div>
                     </div>
@@ -389,23 +616,29 @@ export default function BpmnProcessViewer({
                 {isFa ? "جزئیات درخواست‌ها و زمان انتظار در کارتابل" : "Pending Requests & Cartable Wait Time"}
               </div>
               <div className="flex items-center gap-1.5">
-                {activeStepMetrics.completedCount > 0 && (
+                {effSummary.completedCount > 0 && (
                   <button
                     type="button"
-                    onClick={() => setShowAllStatusesInDrill((s) => !s)}
+                    onClick={() => {
+                      setShowAllStatusesInDrill((s) => !s);
+                      setDrillOffset(0);
+                    }}
                     className="px-2 py-0.5 rounded border text-[10px] font-semibold"
                     style={{ borderColor: activeThemeTokens.border }}
                   >
                     {showAllStatusesInDrill
                       ? isFa ? "فقط مانده در کارتابل" : "Pending Only"
-                      : isFa ? `نمایش کل (${activeStepMetrics.totalCount})` : `Show All (${activeStepMetrics.totalCount})`}
+                      : isFa ? `نمایش کل (${effSummary.totalCount.toLocaleString("fa-IR")})` : `Show All (${effSummary.totalCount})`}
                   </button>
                 )}
                 <div className="relative">
                   <Search className="w-3 h-3 absolute top-1.5 start-2 opacity-50" />
                   <input
                     value={drillSearch}
-                    onChange={(e) => setDrillSearch(e.target.value)}
+                    onChange={(e) => {
+                      setDrillSearch(e.target.value);
+                      setDrillOffset(0);
+                    }}
                     placeholder={isFa ? "جستجو..." : "Search..."}
                     className="ps-6 pe-2 py-0.5 rounded border text-[10px] bg-transparent w-28"
                     style={{ borderColor: activeThemeTokens.border }}
@@ -425,7 +658,7 @@ export default function BpmnProcessViewer({
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredList.map((it, i) => {
+                  {displayedItems.map((it, i) => {
                     const slaPct = it.slaHours > 0 ? Math.min(200, Math.round((it.waitHours / it.slaHours) * 100)) : 0;
                     return (
                       <tr key={`${it.requestId}-${i}`} className="border-b last:border-0" style={{ borderColor: activeThemeTokens.border }}>
@@ -475,9 +708,46 @@ export default function BpmnProcessViewer({
                       </tr>
                     );
                   })}
+                  {displayedItems.length === 0 && !drillLoading && (
+                    <tr>
+                      <td colSpan={4} className="py-6 text-center text-[11px]" style={{ color: activeThemeTokens.muted_text }}>
+                        {isFa ? "موردی یافت نشد." : "No matching requests."}
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>
+
+            {serverDrill && totalDisplayedCount > serverDrill.limit && (
+              <div className="flex items-center justify-between pt-2 border-t text-[10px]" style={{ borderColor: activeThemeTokens.border }}>
+                <span>
+                  {isFa
+                    ? `نمایش ${drillOffset + 1} تا ${Math.min(drillOffset + serverDrill.limit, totalDisplayedCount)} از ${totalDisplayedCount.toLocaleString("fa-IR")}`
+                    : `${drillOffset + 1}-${Math.min(drillOffset + serverDrill.limit, totalDisplayedCount)} of ${totalDisplayedCount}`}
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    disabled={drillOffset === 0}
+                    onClick={() => setDrillOffset((o) => Math.max(0, o - serverDrill.limit))}
+                    className="px-2 py-0.5 rounded border disabled:opacity-40"
+                    style={{ borderColor: activeThemeTokens.border }}
+                  >
+                    {isFa ? "قبلی" : "Prev"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={drillOffset + serverDrill.limit >= totalDisplayedCount}
+                    onClick={() => setDrillOffset((o) => o + serverDrill.limit)}
+                    className="px-2 py-0.5 rounded border disabled:opacity-40"
+                    style={{ borderColor: activeThemeTokens.border }}
+                  >
+                    {isFa ? "بعدی" : "Next"}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -485,17 +755,92 @@ export default function BpmnProcessViewer({
   }
 
   // ---------------- MAIN BPMN DIAGRAM + HEATMAP VIEW ----------------
+  const processes = bpmnAnalytics?.processes || [];
+  const activeProcess = bpmnAnalytics?.active_process || null;
+
   return (
     <div dir={isFa ? "rtl" : "ltr"} className="h-full flex flex-col gap-2 overflow-hidden text-xs">
+      {/* Multi-Process Switcher Bar when organization dataset has multiple processes */}
+      {processes.length > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-1.5 px-2.5 py-1.5 rounded-lg border shrink-0 overflow-x-auto"
+          style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}
+        >
+          <span className="text-[10px] font-bold flex items-center gap-1 shrink-0" style={{ color: activeThemeTokens.muted_text }}>
+            <GitBranch className="w-3.5 h-3.5 text-blue-500" />
+            {isFa ? `فرآیندهای سازمان (${processes.length}):` : `Processes (${processes.length}):`}
+          </span>
+          {onProcessSelect && (
+            <button
+              type="button"
+              onClick={() => onProcessSelect("__ALL__")}
+              className={`px-2 py-0.5 rounded-md text-[10px] font-semibold border transition shrink-0 ${
+                !activeProcess ? "text-white" : "hover:bg-blue-500/10"
+              }`}
+              style={!activeProcess ? { backgroundColor: activeThemeTokens.primary, borderColor: activeThemeTokens.primary } : { borderColor: activeThemeTokens.border }}
+            >
+              {isFa ? "همه فرآیندها" : "All Processes"}
+            </button>
+          )}
+          {processes.slice(0, 12).map((pr) => {
+            const isSel = activeProcess === pr.process_name;
+            return (
+              <button
+                key={pr.process_name}
+                type="button"
+                onClick={() => onProcessSelect && onProcessSelect(pr.process_name)}
+                className={`px-2 py-0.5 rounded-md text-[10px] font-semibold border transition shrink-0 ${
+                  isSel ? "text-white" : "hover:bg-blue-500/10"
+                }`}
+                style={isSel ? { backgroundColor: activeThemeTokens.primary, borderColor: activeThemeTokens.primary } : { borderColor: activeThemeTokens.border }}
+                title={`${pr.process_name} (${pr.total_count} رکورد، ${pr.step_count} گام)`}
+              >
+                {pr.process_name} <span className="opacity-75">({pr.total_count.toLocaleString(isFa ? "fa-IR" : "en-US")})</span>
+              </button>
+            );
+          })}
+          {processes.length > 12 && onProcessSelect && (
+            <select
+              value={activeProcess || "__ALL__"}
+              onChange={(e) => onProcessSelect(e.target.value)}
+              className="px-2 py-0.5 rounded border text-[10px]"
+              style={{
+                background: activeThemeTokens.card_bg,
+                color: activeThemeTokens.text,
+                borderColor: activeThemeTokens.border,
+              }}
+            >
+              <option value="__ALL__">{isFa ? "همه فرآیندها..." : "All Processes..."}</option>
+              {processes.map((pr) => (
+                <option key={pr.process_name} value={pr.process_name}>
+                  {pr.process_name} ({pr.total_count})
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      )}
+
       {/* Top Interactive Controls & Summary Strip */}
       <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
         <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+          {bpmnAnalytics && bpmnAnalytics.total_source_rows > 0 && (
+            <span
+              className="px-2 py-1 rounded-md border font-semibold flex items-center gap-1 text-emerald-600 dark:text-emerald-400 border-emerald-500/30 bg-emerald-500/10"
+              title={isFa ? "تحلیل ۱۰۰٪ رکوردها مستقیماً در موتور SQL" : "100% of rows analyzed in DuckDB SQL"}
+            >
+              <Database className="w-3.5 h-3.5" />
+              {isFa
+                ? `${bpmnAnalytics.active_source_rows.toLocaleString("fa-IR")} از ${bpmnAnalytics.total_source_rows.toLocaleString("fa-IR")} رکورد (SQL)`
+                : `${bpmnAnalytics.active_source_rows.toLocaleString()} / ${bpmnAnalytics.total_source_rows.toLocaleString()} rows`}
+            </span>
+          )}
           <span
             className="px-2 py-1 rounded-md border font-semibold flex items-center gap-1"
             style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}
           >
             <Inbox className="w-3.5 h-3.5 text-blue-500" />
-            {isFa ? `در کارتابل: ${totalPendingRequests}` : `Pending: ${totalPendingRequests}`}
+            {isFa ? `در کارتابل: ${totalPendingRequests.toLocaleString("fa-IR")}` : `Pending: ${totalPendingRequests}`}
           </span>
           <span
             className="px-2 py-1 rounded-md border font-semibold flex items-center gap-1"
@@ -507,7 +852,10 @@ export default function BpmnProcessViewer({
           {bottleneckStep && (
             <button
               type="button"
-              onClick={() => setSelectedStepKey(bottleneckStep.stepKey)}
+              onClick={() => {
+                setSelectedStepKey(bottleneckStep.stepKey);
+                setDrillOffset(0);
+              }}
               className="px-2 py-1 rounded-md border border-red-500/40 bg-red-500/10 text-red-500 font-bold flex items-center gap-1 hover:bg-red-500/20"
               title={isFa ? "کلیک برای مشاهده کارتابل گلوگاه" : "Click to inspect bottleneck cartable"}
             >
@@ -519,8 +867,23 @@ export default function BpmnProcessViewer({
           )}
         </div>
 
-        {/* Heatmap Toggle + Metric + Zoom */}
+        {/* Column Mapper + Heatmap Toggle + Metric + Zoom */}
         <div className="flex flex-wrap items-center gap-1.5">
+          {availableCols.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowMapper((s) => !s)}
+              className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-semibold transition ${
+                showMapper ? "bg-blue-500/15 border-blue-500/50 text-blue-500" : ""
+              }`}
+              style={showMapper ? undefined : { borderColor: activeThemeTokens.border }}
+              title={isFa ? "تنظیم ستون‌های فرآیند، گام و نام فرد در کارتابل" : "Map Process/Step/Assignee columns"}
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5" />
+              {isFa ? "ستون‌ها" : "Columns"}
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => setHeatmapEnabled((v) => !v)}
@@ -565,6 +928,8 @@ export default function BpmnProcessViewer({
         </div>
       </div>
 
+      {renderFieldMapperPanel()}
+
       {/* Interactive BPMN Canvas */}
       <div
         className="flex-1 min-h-0 relative rounded-xl border overflow-auto"
@@ -604,7 +969,6 @@ export default function BpmnProcessViewer({
               </marker>
             </defs>
 
-            {/* 1. Heatmap Aura Underlay behind Hot Task Nodes */}
             {heatmapEnabled &&
               graph.nodes.map((node) => {
                 const st = stepMap[node.id];
@@ -624,7 +988,6 @@ export default function BpmnProcessViewer({
                 );
               })}
 
-            {/* 2. Sequence Flows (Edges) with Heat Gradient */}
             {graph.edges.map((edge) => {
               const src = graph.nodes.find((n) => n.id === edge.source);
               const dst = graph.nodes.find((n) => n.id === edge.target);
@@ -691,7 +1054,6 @@ export default function BpmnProcessViewer({
               );
             })}
 
-            {/* 3. BPMN Nodes */}
             {graph.nodes.map((node) => {
               if (node.type === "startEvent" || node.type === "endEvent") {
                 const cx = node.x + node.width / 2;
@@ -752,7 +1114,6 @@ export default function BpmnProcessViewer({
                 );
               }
 
-              // Task / UserTask / ServiceTask
               const st = stepMap[node.id];
               const pal = heatmapEnabled && st
                 ? getHeatPalette(st.heatRatio, isDark)
@@ -768,7 +1129,12 @@ export default function BpmnProcessViewer({
               return (
                 <g
                   key={node.id}
-                  onClick={() => st && setSelectedStepKey(st.stepKey)}
+                  onClick={() => {
+                    if (st) {
+                      setSelectedStepKey(st.stepKey);
+                      setDrillOffset(0);
+                    }
+                  }}
                   onMouseEnter={() => setHoveredStepId(node.id)}
                   onMouseLeave={() => setHoveredStepId((cur) => (cur === node.id ? null : cur))}
                   className="cursor-pointer"
@@ -783,7 +1149,6 @@ export default function BpmnProcessViewer({
                     stroke={pal.stroke}
                     strokeWidth={isHovered || st?.isBottleneck ? 2.8 : 1.8}
                   />
-                  {/* Top heat/accent strip */}
                   <rect
                     x={node.x + 1}
                     y={node.y + 1}
@@ -794,7 +1159,6 @@ export default function BpmnProcessViewer({
                     opacity={0.85}
                   />
 
-                  {/* Bottleneck pill */}
                   {st?.isBottleneck && (
                     <g>
                       <rect x={node.x + node.width - 54} y={node.y - 11} width={50} height={17} rx={8} fill="#ef4444" />
@@ -804,7 +1168,6 @@ export default function BpmnProcessViewer({
                     </g>
                   )}
 
-                  {/* Step Title via foreignObject for crisp RTL Persian wrapping */}
                   <foreignObject x={node.x + 6} y={node.y + 10} width={node.width - 12} height={node.height - 14}>
                     <div
                       dir={isFa ? "rtl" : "ltr"}
@@ -822,7 +1185,9 @@ export default function BpmnProcessViewer({
                             color: activeThemeTokens.text,
                           }}
                         >
-                          {isFa ? `${st?.pendingCount ?? 0} درخواست` : `${st?.pendingCount ?? 0} req`}
+                          {isFa
+                            ? `${(st?.pendingCount ?? 0).toLocaleString("fa-IR")} درخواست`
+                            : `${st?.pendingCount ?? 0} req`}
                         </span>
                         <span
                           className="px-1.5 py-0.5 rounded text-[10px] font-bold"
@@ -846,7 +1211,7 @@ export default function BpmnProcessViewer({
         {hoveredStepMetrics && (
           <div
             dir={isFa ? "rtl" : "ltr"}
-            className="absolute top-2 end-2 z-10 p-2.5 rounded-lg border shadow-lg text-[11px] max-w-[235px] pointer-events-none"
+            className="absolute top-2 end-2 z-10 p-2.5 rounded-lg border shadow-lg text-[11px] max-w-[245px] pointer-events-none"
             style={{
               backgroundColor: activeThemeTokens.card_bg,
               borderColor: activeThemeTokens.border,
@@ -857,7 +1222,10 @@ export default function BpmnProcessViewer({
             <div className="space-y-0.5 text-[10px]">
               <div>
                 {isFa ? "درخواست در گام (کارتابل):" : "Pending in step:"}{" "}
-                <b>{hoveredStepMetrics.pendingCount}</b> {isFa ? `(کل عبوری: ${hoveredStepMetrics.totalCount})` : `(Total: ${hoveredStepMetrics.totalCount})`}
+                <b>{hoveredStepMetrics.pendingCount.toLocaleString(isFa ? "fa-IR" : "en-US")}</b>{" "}
+                {isFa
+                  ? `(کل عبوری: ${hoveredStepMetrics.totalCount.toLocaleString("fa-IR")})`
+                  : `(Total: ${hoveredStepMetrics.totalCount})`}
               </div>
               <div>
                 {isFa ? "میانگین زمان انتظار:" : "Avg wait time:"}{" "}
@@ -873,7 +1241,7 @@ export default function BpmnProcessViewer({
               </div>
             </div>
             <div className="mt-1.5 pt-1 border-t text-[10px] font-semibold text-blue-500" style={{ borderColor: activeThemeTokens.border }}>
-              {isFa ? "برای دریل‌داون کارتابل روی گام کلیک کنید" : "Click step to drill into assignee cartable"}
+              {isFa ? "برای دریل‌داون کارتابل و اسامی افراد کلیک کنید" : "Click step to drill into assignee cartable"}
             </div>
           </div>
         )}
@@ -898,7 +1266,7 @@ export default function BpmnProcessViewer({
         )}
         <span>
           {isFa
-            ? "💡 روی هر گام نمودار کلیک کنید تا لیست افراد و زمان انتظار درخواست‌ها در کارتابل را ببینید."
+            ? "💡 روی هر گام کلیک کنید تا اسامی افراد در کارتابل و زمان انتظار درخواست‌ها را ببینید."
             : "💡 Click any BPMN task node to drill down into pending cartable assignees and request wait times."}
         </span>
       </div>

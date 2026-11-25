@@ -91,6 +91,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [drillStates, setDrillStates] = useState<
     Record<string, { field: string; value: any }[]>
   >({});
+  const [bpmnProcessMap, setBpmnProcessMap] = useState<Record<string, string>>({});
+  const [bpmnFieldOverridesMap, setBpmnFieldOverridesMap] = useState<Record<string, Record<string, string | null>>>({});
   const [widgetChartOverrides, setWidgetChartOverrides] = useState<Record<string, string>>({});
   const [clickModes, setClickModes] = useState<Record<string, "drill" | "cross_filter">>({});
 
@@ -255,6 +257,14 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       setLoadingWidgets((prev) => ({ ...prev, ...loadingMap }));
 
       try {
+        const cleanOverridesMap: Record<string, Record<string, string>> = {};
+        for (const [wid, ov] of Object.entries(bpmnFieldOverridesMap)) {
+          const clean: Record<string, string> = {};
+          for (const [k, v] of Object.entries(ov || {})) {
+            if (v) clean[k] = v;
+          }
+          if (Object.keys(clean).length > 0) cleanOverridesMap[wid] = clean;
+        }
         const res = await apiFetch<any>(`/dashboards/${dash.id}/execute-batch`, {
           method: "POST",
           body: JSON.stringify({
@@ -263,6 +273,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             cross_filters: crossFilters,
             drill_states: drillStates,
             use_cache: useCache,
+            bpmn_process_map: bpmnProcessMap,
+            bpmn_field_overrides_map: cleanOverridesMap,
           }),
         }).catch(() => ({ widgets: {}, load_ms: 1 }));
         const mergedWidgets: Record<string, any> = { ...(res.widgets || {}) };
@@ -312,7 +324,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         setLoadingWidgets((prev) => ({ ...prev, ...doneMap }));
       }
     },
-    [dash, compiledActiveFilters, crossFilters, drillStates]
+    [dash, compiledActiveFilters, crossFilters, drillStates, bpmnProcessMap, bpmnFieldOverridesMap]
   );
 
   useEffect(() => {
@@ -321,8 +333,14 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     }
   }, [dash, activePageId, compiledActiveFilters, crossFilters, drillStates]);
 
-  // Execute single widget (used on drill down / manual widget refresh)
-  const executeSingleWidget = async (w: DashboardWidget, nextDrillStack: { field: string; value: any }[], useCache = true) => {
+  // Execute single widget (used on drill down / manual widget refresh / BPMN process switch)
+  const executeSingleWidget = async (
+    w: DashboardWidget,
+    nextDrillStack: { field: string; value: any }[],
+    useCache = true,
+    overrideProcessName?: string | null,
+    overrideFields?: Record<string, string | null>
+  ) => {
     const prevLen = (drillStates[w.id] || []).length;
     if (nextDrillStack.length !== prevLen) {
       setWidgetChartOverrides((prev) => {
@@ -334,6 +352,13 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     }
     setLoadingWidgets((p) => ({ ...p, [w.id]: true }));
     try {
+      const effectiveProc =
+        overrideProcessName !== undefined ? overrideProcessName : bpmnProcessMap[w.id] ?? null;
+      const rawFieldOv = overrideFields !== undefined ? overrideFields : bpmnFieldOverridesMap[w.id] || {};
+      const cleanFieldOv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(rawFieldOv)) {
+        if (v) cleanFieldOv[k] = v;
+      }
       const res = await apiFetch<WidgetDataResult>(`/dashboards/widgets/${w.id}/data`, {
         method: "POST",
         body: JSON.stringify({
@@ -341,6 +366,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           cross_filters: crossFilters,
           drill_stack: nextDrillStack,
           use_cache: useCache,
+          bpmn_process_name: effectiveProc,
+          bpmn_field_overrides: Object.keys(cleanFieldOv).length > 0 ? cleanFieldOv : null,
         }),
       });
       setWidgetData((prev) => ({ ...prev, [w.id]: res }));
@@ -350,6 +377,16 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     } finally {
       setLoadingWidgets((p) => ({ ...p, [w.id]: false }));
     }
+  };
+
+  const handleBpmnProcessSelect = async (w: DashboardWidget, processName: string) => {
+    setBpmnProcessMap((prev) => ({ ...prev, [w.id]: processName }));
+    await executeSingleWidget(w, drillStates[w.id] || [], false, processName, undefined);
+  };
+
+  const handleBpmnFieldOverride = async (w: DashboardWidget, overrides: Record<string, string | null>) => {
+    setBpmnFieldOverridesMap((prev) => ({ ...prev, [w.id]: overrides }));
+    await executeSingleWidget(w, drillStates[w.id] || [], false, undefined, overrides);
   };
 
   const getWidgetClickMode = (w: DashboardWidget): "drill" | "cross_filter" => {
@@ -1196,6 +1233,12 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               vizConfig={w.config.visualization}
               visualSpec={w.query.visual_spec}
               onPointClick={(field, val) => handleWidgetPointClick(w, field, val)}
+              widgetId={w.id}
+              activeFilters={compiledActiveFilters}
+              crossFilters={crossFilters}
+              bpmnAnalytics={wd?.bpmn_analytics}
+              onProcessSelect={(proc) => handleBpmnProcessSelect(w, proc)}
+              onFieldMappingOverride={(ov) => handleBpmnFieldOverride(w, ov)}
             />
           )}
         </div>

@@ -1,6 +1,6 @@
 import rawDemoData from "@/lib/vercelDemoData.json";
 import { parseSpreadsheetBuffer } from "@/lib/excelParser";
-import { DEFAULT_PROCUREMENT_BPMN_GRAPH, inferBpmnFieldMapping } from "@/lib/bpmnParser";
+import { computeBpmnAnalytics, DEFAULT_PROCUREMENT_BPMN_GRAPH, inferBpmnFieldMapping, normalizeBpmnText } from "@/lib/bpmnParser";
 import { handleDemoDescriptiveBuilder } from "@/lib/vercelDemoDescriptiveBuilder";
 import {
   evaluateDemoKpiFormula,
@@ -217,13 +217,222 @@ function executeVisualSpec(
   return { columns: cols, rows: sliced, row_count: sliced.length };
 }
 
+function buildDemoBpmnPayload(
+  widget: any,
+  username: string | null,
+  combinedFilters: any[],
+  extraDatasets: any[] = [],
+  bpmnProcessName: string | null = null,
+  bpmnFieldOverrides: Record<string, string> | null = null
+) {
+  const tbl = getTableForDataset(widget.dataset_id, extraDatasets);
+  const cols = tbl.columns || [];
+  const baseRows = applyRlsAndFilters(tbl.rows || [], username, combinedFilters);
+  const spec = widget.query?.visual_spec || {};
+  const viz = widget.config?.visualization || {};
+  const rawCfg = {
+    ...(spec.bpmn_config || {}),
+    ...(viz.bpmn_config || {}),
+    ...(bpmnFieldOverrides || {}),
+  };
+  const mapping = inferBpmnFieldMapping(cols, rawCfg);
+  const procCol = mapping.process_field;
+  const processesMap = new Map<string, { total: number; steps: Set<string>; waits: number[] }>();
+  if (procCol) {
+    for (const r of baseRows) {
+      const pName = String(r[procCol] ?? "").trim();
+      if (!pName) continue;
+      if (!processesMap.has(pName)) processesMap.set(pName, { total: 0, steps: new Set(), waits: [] });
+      const cur = processesMap.get(pName)!;
+      cur.total += 1;
+      if (mapping.step_field && r[mapping.step_field]) cur.steps.add(String(r[mapping.step_field]).trim());
+      if (mapping.wait_field) cur.waits.push(Number(r[mapping.wait_field] || 0) || 0);
+    }
+  }
+  const processes = Array.from(processesMap.entries())
+    .map(([process_name, info]) => ({
+      process_name,
+      total_count: info.total,
+      step_count: info.steps.size,
+      avg_wait_hours: info.waits.length
+        ? Math.round((info.waits.reduce((a, b) => a + b, 0) / info.waits.length) * 10) / 10
+        : 0,
+    }))
+    .sort((a, b) => b.total_count - a.total_count);
+
+  let activeProcess: string | null = null;
+  if (bpmnProcessName && bpmnProcessName !== "__ALL__" && bpmnProcessName !== "ALL") {
+    activeProcess = bpmnProcessName;
+  } else if (!bpmnProcessName && processes.length > 1) {
+    activeProcess = processes[0].process_name;
+  }
+  const scopedRows =
+    procCol && activeProcess
+      ? baseRows.filter((r) => normalizeBpmnText(r[procCol]) === normalizeBpmnText(activeProcess))
+      : baseRows;
+
+  const computed = computeBpmnAnalytics(scopedRows, cols, rawCfg, "avg_wait");
+  const stepList = Object.values(computed.stepMap);
+  const assignees_by_step: Record<string, any[]> = {};
+  for (const st of stepList) {
+    assignees_by_step[st.stepKey] = st.assignees.map((a) => ({
+      assigneeName: a.assigneeName,
+      assigneeRole: a.assigneeRole,
+      pendingCount: a.pendingCount,
+      totalCount: a.totalCount,
+      avgWaitHours: a.avgWaitHours,
+      maxWaitHours: a.maxWaitHours,
+      overdueCount: a.overdueCount,
+    }));
+  }
+
+  return {
+    mode: "sql_aggregated",
+    total_source_rows: baseRows.length,
+    active_source_rows: scopedRows.length,
+    sampled_raw_rows: Math.min(scopedRows.length, 1500),
+    processes: processes.map((p) => ({ ...p, pending_count: p.total_count })),
+    active_process: activeProcess,
+    mapping: {
+      process_field: mapping.process_field || null,
+      step_field: mapping.step_field,
+      assignee_field: mapping.assignee_field || null,
+      assignee_role_field: mapping.assignee_role_field || null,
+      wait_field: mapping.wait_field || null,
+      sla_field: mapping.sla_field || null,
+      status_field: mapping.status_field || null,
+      request_id_field: mapping.request_id_field || null,
+      request_title_field: mapping.request_title_field || null,
+      department_field: mapping.department_field || null,
+      entered_at_field: mapping.entered_at_field || null,
+    },
+    available_columns: cols,
+    step_summary: stepList.map((st, idx) => ({
+      step_name: st.stepKey,
+      step_order: idx + 1,
+      total_count: st.totalCount,
+      pending_count: st.pendingCount,
+      completed_count: st.completedCount,
+      avg_wait_hours: st.avgWaitHours,
+      max_wait_hours: st.maxWaitHours,
+      sla_hours: st.slaHours,
+      overdue_count: st.overdueCount,
+      assignee_count: st.assignees.length,
+    })),
+    transitions: [],
+    assignees_by_step,
+  };
+}
+
+function executeDemoBpmnStepDrill(
+  widget: any,
+  username: string | null,
+  body: any,
+  extraDatasets: any[] = []
+) {
+  const combinedFilters = [
+    ...(body?.active_filters || []),
+    ...(body?.cross_filters || []).filter((c: any) => c?.source_widget_id !== widget.id),
+  ];
+  const tbl = getTableForDataset(widget.dataset_id, extraDatasets);
+  const cols = tbl.columns || [];
+  let rows = applyRlsAndFilters(tbl.rows || [], username, combinedFilters);
+  const spec = widget.query?.visual_spec || {};
+  const viz = widget.config?.visualization || {};
+  const rawCfg = {
+    ...(spec.bpmn_config || {}),
+    ...(viz.bpmn_config || {}),
+    ...(body?.field_overrides || {}),
+  };
+  const mapping = inferBpmnFieldMapping(cols, rawCfg);
+  if (mapping.process_field && body?.process_name && body.process_name !== "__ALL__") {
+    const pNorm = normalizeBpmnText(body.process_name);
+    rows = rows.filter((r) => normalizeBpmnText(r[mapping.process_field!]) === pNorm);
+  }
+  const computed = computeBpmnAnalytics(rows, cols, rawCfg, "avg_wait");
+  const targetNorm = normalizeBpmnText(body?.step_name);
+  const stepStats = Object.values(computed.stepMap).find(
+    (s) => normalizeBpmnText(s.stepKey) === targetNorm || normalizeBpmnText(s.stepLabel) === targetNorm
+  );
+  if (!stepStats) {
+    return {
+      step_name: body?.step_name || "",
+      process_name: body?.process_name || null,
+      available_columns: cols,
+      step_summary: {
+        step_key: body?.step_name || "",
+        total_count: 0,
+        pending_count: 0,
+        completed_count: 0,
+        avg_wait_hours: 0,
+        max_wait_hours: 0,
+        sla_hours: 48,
+        overdue_count: 0,
+      },
+      assignees: [],
+      items: [],
+      total_items: 0,
+      limit: Number(body?.limit || 80),
+      offset: Number(body?.offset || 0),
+    };
+  }
+  let items = body?.pending_only && stepStats.pendingItems.length > 0 ? stepStats.pendingItems : stepStats.items;
+  if (body?.assignee_name) {
+    const aNorm = normalizeBpmnText(body.assignee_name);
+    items = items.filter((it) => normalizeBpmnText(it.assigneeName) === aNorm);
+  }
+  if (body?.search) {
+    const qNorm = normalizeBpmnText(body.search);
+    items = items.filter(
+      (it) =>
+        normalizeBpmnText(it.requestId).includes(qNorm) ||
+        normalizeBpmnText(it.requestTitle).includes(qNorm) ||
+        normalizeBpmnText(it.assigneeName).includes(qNorm) ||
+        normalizeBpmnText(it.department).includes(qNorm)
+    );
+  }
+  const limit = Math.max(1, Math.min(Number(body?.limit || 80), 200));
+  const offset = Math.max(0, Number(body?.offset || 0));
+  return {
+    step_name: stepStats.stepKey,
+    process_name: body?.process_name || null,
+    available_columns: cols,
+    step_summary: {
+      step_key: stepStats.stepKey,
+      step_label: stepStats.stepLabel,
+      total_count: stepStats.totalCount,
+      pending_count: stepStats.pendingCount,
+      completed_count: stepStats.completedCount,
+      avg_wait_hours: stepStats.avgWaitHours,
+      max_wait_hours: stepStats.maxWaitHours,
+      sla_hours: stepStats.slaHours,
+      overdue_count: stepStats.overdueCount,
+    },
+    assignees: stepStats.assignees.map((a) => ({
+      assigneeName: a.assigneeName,
+      assigneeRole: a.assigneeRole,
+      pendingCount: a.pendingCount,
+      totalCount: a.totalCount,
+      avgWaitHours: a.avgWaitHours,
+      maxWaitHours: a.maxWaitHours,
+      overdueCount: a.overdueCount,
+    })),
+    items: items.slice(offset, offset + limit),
+    total_items: items.length,
+    limit,
+    offset,
+  };
+}
+
 function executeWidgetForDemo(
   widget: any,
   username: string | null,
   activeFilters: any[] = [],
   crossFilters: any[] = [],
   drillStack: any[] = [],
-  extraDatasets: any[] = []
+  extraDatasets: any[] = [],
+  bpmnProcessName: string | null = null,
+  bpmnFieldOverrides: Record<string, string> | null = null
 ) {
   const drillRule = widget.drill_rule;
   const hierarchy = drillRule?.hierarchy || [];
@@ -265,6 +474,9 @@ function executeWidgetForDemo(
   const spec = widget.query?.visual_spec || {};
   const isBpmn = effectiveChartType === "bpmn";
   const res = executeVisualSpec(widget.dataset_id, spec, username, combinedFilters, effectiveDim, isRaw || isBpmn, extraDatasets);
+  const bpmnPayload = isBpmn
+    ? buildDemoBpmnPayload(widget, username, combinedFilters, extraDatasets, bpmnProcessName, bpmnFieldOverrides)
+    : undefined;
 
   return {
     widget_id: widget.id,
@@ -284,6 +496,7 @@ function executeWidgetForDemo(
     cache_hit: false,
     data_version: 2,
     generated_sql: "-- Preview Demo Snapshot Engine",
+    ...(bpmnPayload ? { bpmn_analytics: bpmnPayload } : {}),
   };
 }
 
@@ -1792,6 +2005,16 @@ export async function handleVercelDemoApi(
     }
     return { status: 200, body: { ...pub, themes: demoData.themes || [] } };
   }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "public" && segments[2] && segments[3] === "widgets" && segments[4] && segments[5] === "bpmn-drill") {
+    const token = segments[2];
+    const detMatch = Object.values(demoData.dashboards_detail || {}).find(
+      (d: any) => d.is_public && d.embed_token === token
+    ) as any;
+    if (!detMatch) return { status: 404, body: { detail: "Public dashboard not found" } };
+    const w = (detMatch.widgets || []).find((x: any) => x.id === segments[4]);
+    if (!w) return { status: 404, body: { detail: "Widget not found" } };
+    return { status: 200, body: executeDemoBpmnStepDrill(w, null, body, getExtraDatasets(body)) };
+  }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "public" && segments[2] && segments[3] === "execute-batch") {
     const token = segments[2];
     const detMatch = Object.values(demoData.dashboards_detail || {}).find(
@@ -1803,7 +2026,16 @@ export async function handleVercelDemoApi(
       const hierarchy = w.drill_rule?.hierarchy || [];
       const rawStack = body?.drill_states?.[w.id] || [];
       const dStack = hierarchy.length > 0 ? rawStack.slice(0, Math.max(0, hierarchy.length - 1)) : [];
-      widgets[w.id] = executeWidgetForDemo(w, null, body?.active_filters || [], body?.cross_filters || [], dStack);
+      widgets[w.id] = executeWidgetForDemo(
+        w,
+        null,
+        body?.active_filters || [],
+        body?.cross_filters || [],
+        dStack,
+        [],
+        body?.bpmn_process_map?.[w.id] || null,
+        body?.bpmn_field_overrides_map?.[w.id] || null
+      );
     }
     return {
       status: 200,
@@ -1879,7 +2111,16 @@ export async function handleVercelDemoApi(
     for (const w of det.widgets || []) {
       if (pageId && w.page_id !== pageId) continue;
       const dStack = body?.drill_states?.[w.id] || [];
-      widgets[w.id] = executeWidgetForDemo(w, username, body?.active_filters || [], body?.cross_filters || [], dStack, extraDatasets);
+      widgets[w.id] = executeWidgetForDemo(
+        w,
+        username,
+        body?.active_filters || [],
+        body?.cross_filters || [],
+        dStack,
+        extraDatasets,
+        body?.bpmn_process_map?.[w.id] || null,
+        body?.bpmn_field_overrides_map?.[w.id] || null
+      );
     }
     return {
       status: 200,
@@ -1911,9 +2152,24 @@ export async function handleVercelDemoApi(
         body?.active_filters || [],
         body?.cross_filters || [],
         body?.drill_stack || [],
-        extraDatasets
+        extraDatasets,
+        body?.bpmn_process_name || null,
+        body?.bpmn_field_overrides || null
       ),
     };
+  }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "bpmn-drill") {
+    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
+    let foundWidget: any = null;
+    for (const d of customDashes) {
+      const hit = (d?.widgets || []).find((x: any) => x.id === segments[2]);
+      if (hit) { foundWidget = hit; break; }
+    }
+    if (!foundWidget) {
+      foundWidget = findWidget(segments[2])?.widget || null;
+    }
+    if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
+    return { status: 200, body: executeDemoBpmnStepDrill(foundWidget, username, body, extraDatasets) };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "drill-details") {
     const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
@@ -2646,17 +2902,41 @@ export async function handleVercelDemoApi(
       const dsId = segments[2];
       const tbl = getTableForDataset(dsId, extraDatasets);
       const cols = (tbl.columns || []).map((c) => ({ field_name: c, display_name: c, type: "string" }));
+      const bpmnInf = inferBpmnFieldMapping(tbl.columns || []);
       const inferCol = (pats: string[]) => tbl.columns.find((c) => pats.some((p) => c.toLowerCase().includes(p))) || null;
       const mapping = {
-        case_id: inferCol(["request_code", "case_id", "request_id", "order_id"]),
-        activity: inferCol(["step_name", "activity", "stage"]),
-        timestamp: inferCol(["event_time", "timestamp", "started_at", "order_date", "date"]),
-        wait_hours: inferCol(["wait_hours", "wait"]),
-        sla_hours: inferCol(["sla_hours", "sla"]),
-        actor: inferCol(["assignee", "actor", "sales_rep"]),
-        department: inferCol(["department", "region"]),
-        status: inferCol(["status"]),
+        case_id: bpmnInf.request_id_field || inferCol(["request_code", "case_id", "request_id", "order_id"]),
+        activity: bpmnInf.step_field || inferCol(["step_name", "activity", "stage"]),
+        timestamp: bpmnInf.entered_at_field || inferCol(["event_time", "timestamp", "started_at", "order_date", "date"]),
+        wait_hours: bpmnInf.wait_field || inferCol(["wait_hours", "wait"]),
+        sla_hours: bpmnInf.sla_field || inferCol(["sla_hours", "sla"]),
+        actor: bpmnInf.assignee_field || inferCol(["assignee", "actor", "sales_rep"]),
+        department: bpmnInf.department_field || inferCol(["department", "region"]),
+        status: bpmnInf.status_field || inferCol(["status"]),
+        process_name: bpmnInf.process_field || null,
       };
+      if (segments[3] === "processes") {
+        const allRows = applyRlsAndFilters(tbl.rows, username, []);
+        const pCol = mapping.process_name;
+        const pMap = new Map<string, number>();
+        if (pCol) {
+          for (const r of allRows) {
+            const pv = String(r[pCol] || "").trim();
+            if (pv) pMap.set(pv, (pMap.get(pv) || 0) + 1);
+          }
+        }
+        return {
+          status: 200,
+          body: {
+            dataset_id: dsId,
+            process_field: pCol,
+            total_rows: allRows.length,
+            processes: Array.from(pMap.entries())
+              .map(([process_name, total_count]) => ({ process_name, total_count }))
+              .sort((a, b) => b.total_count - a.total_count),
+          },
+        };
+      }
       if (segments[3] === "mapping") {
         return {
           status: 200,
@@ -2672,7 +2952,11 @@ export async function handleVercelDemoApi(
         };
       }
       if (segments[3] === "analyze") {
-        const rows = applyRlsAndFilters(tbl.rows, username, []);
+        let rows = applyRlsAndFilters(tbl.rows, username, []);
+        if (mapping.process_name && body?.process_name) {
+          const pn = normalizeBpmnText(body.process_name);
+          rows = rows.filter((r) => normalizeBpmnText(r[mapping.process_name!]) === pn);
+        }
         if (!mapping.case_id || !mapping.activity) {
           return {
             status: 200,

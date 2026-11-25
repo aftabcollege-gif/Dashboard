@@ -6,6 +6,7 @@ import { ArrowDownRight, ArrowUpRight, Search } from "lucide-react";
 import { formatBIValue } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
 import BpmnProcessViewer from "@/components/charts/BpmnProcessViewer";
+import type { BpmnAnalyticsPayload } from "@/types/bi";
 
 interface Props {
   chartType: string;
@@ -16,6 +17,13 @@ interface Props {
   visualSpec?: Record<string, any>;
   onPointClick?: (field: string, value: any) => void;
   chartInstanceRef?: React.MutableRefObject<echarts.ECharts | null>;
+  widgetId?: string;
+  publicShareToken?: string;
+  activeFilters?: any[];
+  crossFilters?: any[];
+  bpmnAnalytics?: BpmnAnalyticsPayload;
+  onProcessSelect?: (processName: string) => void;
+  onFieldMappingOverride?: (overrides: Record<string, string | null>) => void;
 }
 
 const GEO_CITY_COORDS: Record<string, [number, number]> = {
@@ -46,6 +54,13 @@ export default function WidgetRenderer(props: Props) {
         vizConfig={props.vizConfig}
         visualSpec={props.visualSpec}
         onPointClick={props.onPointClick}
+        widgetId={props.widgetId}
+        publicShareToken={props.publicShareToken}
+        activeFilters={props.activeFilters}
+        crossFilters={props.crossFilters}
+        bpmnAnalytics={props.bpmnAnalytics}
+        onProcessSelect={props.onProcessSelect}
+        onFieldMappingOverride={props.onFieldMappingOverride}
       />
     );
   }
@@ -61,6 +76,7 @@ function StandardWidgetRenderer({
   visualSpec = {},
   onPointClick,
   chartInstanceRef,
+  bpmnAnalytics,
 }: Props) {
   const { locale, activeThemeTokens, activeThemeMode } = useBi();
   const [tableSearch, setTableSearch] = useState("");
@@ -69,6 +85,19 @@ function StandardWidgetRenderer({
   const [isMobile, setIsMobile] = useState(false);
 
   const { columns, rows } = useMemo(() => {
+    if (
+      bpmnAnalytics?.step_summary &&
+      bpmnAnalytics.step_summary.length > 0 &&
+      chartType !== "table"
+    ) {
+      const stepCol = bpmnAnalytics.mapping?.step_field || visualSpec?.bpmn_config?.step_field || "step";
+      const aggRows = bpmnAnalytics.step_summary.map((st) => ({
+        [stepCol]: st.step_name,
+        value: st.avg_wait_hours > 0 ? st.avg_wait_hours : st.total_count,
+        secondary_value: st.pending_count || st.total_count,
+      }));
+      return { columns: [stepCol, "value", "secondary_value"], rows: aggRows };
+    }
     if (
       visualSpec?.bpmn_config &&
       chartType !== "table" &&
@@ -93,7 +122,7 @@ function StandardWidgetRenderer({
       return { columns: [stepCol, "value"], rows: aggRows };
     }
     return { columns: rawColumns, rows: rawRows };
-  }, [rawColumns, rawRows, visualSpec, chartType]);
+  }, [rawColumns, rawRows, visualSpec, chartType, bpmnAnalytics]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;

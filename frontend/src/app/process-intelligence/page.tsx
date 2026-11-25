@@ -7,6 +7,7 @@ import {
   ArrowRight,
   CheckCircle2,
   Clock,
+  Database,
   GitBranch,
   Layers,
   ListChecks,
@@ -43,6 +44,8 @@ export default function ProcessIntelligencePage() {
 
   const [datasets, setDatasets] = useState<any[]>([]);
   const [datasetId, setDatasetId] = useState("");
+  const [processList, setProcessList] = useState<{ process_name: string; total_count: number }[]>([]);
+  const [selectedProcess, setSelectedProcess] = useState<string>("");
   const [mappingInfo, setMappingInfo] = useState<any>(null);
   const [mappingEdits, setMappingEdits] = useState<Record<string, string>>({});
   const [refSequenceText, setRefSequenceText] = useState("");
@@ -79,16 +82,22 @@ export default function ProcessIntelligencePage() {
   }, []);
 
   const loadProcessIntelligence = useCallback(
-    async (dsId: string) => {
+    async (dsId: string, procName: string = "") => {
       if (!dsId) return;
       setLoading(true);
       try {
-        const [mapRes, anaRes, actRes] = await Promise.all([
+        const [mapRes, procRes, anaRes, actRes] = await Promise.all([
           apiFetch<any>(`/process-intelligence/datasets/${dsId}/mapping`),
-          apiFetch<any>(`/process-intelligence/datasets/${dsId}/analyze`, { method: "POST", body: JSON.stringify({}) }),
+          apiFetch<any>(`/process-intelligence/datasets/${dsId}/processes`).catch(() => ({ processes: [] })),
+          apiFetch<any>(`/process-intelligence/datasets/${dsId}/analyze`, {
+            method: "POST",
+            body: JSON.stringify(procName ? { process_name: procName } : {}),
+          }),
           apiFetch<any[]>(`/process-intelligence/datasets/${dsId}/actions`).catch(() => []),
         ]);
         setMappingInfo(mapRes);
+        const pList = procRes?.processes || [];
+        setProcessList(pList);
         const initM: Record<string, string> = {};
         for (const r of MAPPING_ROLES) {
           initM[r.key] = mapRes?.mapping?.[r.key] || "";
@@ -108,9 +117,17 @@ export default function ProcessIntelligencePage() {
 
   useEffect(() => {
     if (datasetId) {
-      loadProcessIntelligence(datasetId);
+      setSelectedProcess("");
+      loadProcessIntelligence(datasetId, "");
     }
   }, [datasetId, loadProcessIntelligence]);
+
+  const handleSelectProcess = async (procName: string) => {
+    setSelectedProcess(procName);
+    if (datasetId) {
+      await loadProcessIntelligence(datasetId, procName);
+    }
+  };
 
   const handleSaveMapping = async () => {
     if (!datasetId) return;
@@ -129,7 +146,7 @@ export default function ProcessIntelligencePage() {
         body: JSON.stringify({ mapping: payloadMapping, reference_sequence: refSeq, confirmed: true }),
       });
       showToast(isFa ? "نگاشت رویداد فرآیندی تأیید و ذخیره شد" : "Event log mapping confirmed");
-      await loadProcessIntelligence(datasetId);
+      await loadProcessIntelligence(datasetId, selectedProcess);
     } catch (err: any) {
       showToast(err.message);
     } finally {
@@ -145,6 +162,7 @@ export default function ProcessIntelligencePage() {
     try {
       const qp = new URLSearchParams();
       if (activityName) qp.set("activity", activityName);
+      if (selectedProcess) qp.set("process_name", selectedProcess);
       qp.set("limit", "40");
       const res = await apiFetch<any>(`/process-intelligence/datasets/${datasetId}/cases?${qp.toString()}`);
       setCasesList(res.cases || []);
@@ -182,7 +200,7 @@ export default function ProcessIntelligencePage() {
       });
       setActTitle("");
       showToast(isFa ? "اقدام اصلاحی ثبت و ارزیابی شد" : "Corrective action recorded");
-      await loadProcessIntelligence(datasetId);
+      await loadProcessIntelligence(datasetId, selectedProcess);
     } catch (err: any) {
       showToast(err.message);
     }
@@ -205,11 +223,19 @@ export default function ProcessIntelligencePage() {
             </h1>
             <p className="text-xs mt-1" style={{ color: "var(--bi-muted)" }}>
               {isFa
-                ? "بازسازی مسیر پرونده‌ها، واریانت‌ها، دوباره‌کاری، گلوگاه‌های چندعاملی، فرضیات غیرعلّی و مقایسه قبل/بعد اقدامات اصلاحی"
-                : "Case trace reconstruction, variants, rework & skip detection, composite bottlenecks, and corrective action evaluation"}
+                ? "تحلیل ۱۰۰٪ ردیف‌ها در موتور SQL · بازسازی مسیر پرونده‌ها، واریانت‌ها، دوباره‌کاری و گلوگاه‌های چندعاملی"
+                : "100% DuckDB SQL-backed trace reconstruction, variants, rework & skip detection, and composite bottlenecks"}
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            {summary?.total_events_analyzed > 0 && (
+              <span className="px-2.5 py-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[11px] font-semibold flex items-center gap-1.5">
+                <Database className="w-3.5 h-3.5" />
+                {isFa
+                  ? `${Number(summary.total_events_analyzed).toLocaleString("fa-IR")} رویداد (۱۰۰٪ SQL)`
+                  : `${Number(summary.total_events_analyzed).toLocaleString()} events (100% SQL)`}
+              </span>
+            )}
             <select
               value={datasetId}
               onChange={(e) => setDatasetId(e.target.value)}
@@ -224,7 +250,7 @@ export default function ProcessIntelligencePage() {
             </select>
             <button
               type="button"
-              onClick={() => datasetId && loadProcessIntelligence(datasetId)}
+              onClick={() => datasetId && loadProcessIntelligence(datasetId, selectedProcess)}
               disabled={loading}
               className="px-3 py-2 rounded-lg border text-xs font-semibold flex items-center gap-1.5"
               style={{ borderColor: "var(--bi-border)" }}
@@ -234,6 +260,44 @@ export default function ProcessIntelligencePage() {
             </button>
           </div>
         </div>
+
+        {/* Multi-Process Switcher Bar */}
+        {processList.length > 0 && (
+          <div className="bi-card p-3 flex flex-wrap items-center gap-2 text-xs">
+            <span className="font-bold flex items-center gap-1.5" style={{ color: "var(--bi-muted)" }}>
+              <GitBranch className="w-4 h-4 text-violet-500" />
+              {isFa ? `فرآیندهای سازمان (${processList.length}):` : `Processes (${processList.length}):`}
+            </span>
+            <button
+              type="button"
+              onClick={() => handleSelectProcess("")}
+              className={`px-2.5 py-1 rounded-lg font-semibold border transition ${
+                !selectedProcess ? "text-white" : "hover:opacity-80"
+              }`}
+              style={!selectedProcess ? { background: "var(--bi-primary)", borderColor: "var(--bi-primary)" } : { borderColor: "var(--bi-border)" }}
+            >
+              {isFa ? "همه فرآیندها" : "All Processes"}
+            </button>
+            {processList.slice(0, 14).map((p) => (
+              <button
+                key={p.process_name}
+                type="button"
+                onClick={() => handleSelectProcess(p.process_name)}
+                className={`px-2.5 py-1 rounded-lg font-semibold border transition ${
+                  selectedProcess === p.process_name ? "text-white" : "hover:opacity-80"
+                }`}
+                style={
+                  selectedProcess === p.process_name
+                    ? { background: "var(--bi-primary)", borderColor: "var(--bi-primary)" }
+                    : { borderColor: "var(--bi-border)" }
+                }
+              >
+                {p.process_name}{" "}
+                <span className="opacity-75">({Number(p.total_count).toLocaleString(isFa ? "fa-IR" : "en-US")})</span>
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Column Mapping & Confirmation Banner */}
         {mappingInfo && (
@@ -318,9 +382,11 @@ export default function ProcessIntelligencePage() {
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 text-xs">
               <div className="bi-card p-3">
                 <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>کل پرونده‌ها / رویدادها</div>
-                <div className="text-lg font-bold mt-1">{summary.total_cases.toLocaleString()}</div>
+                <div className="text-lg font-bold mt-1">
+                  {summary.total_cases != null ? Number(summary.total_cases).toLocaleString() : "—"}
+                </div>
                 <div className="text-[10px]" style={{ color: "var(--bi-muted)" }}>
-                  {summary.total_events_analyzed.toLocaleString()} رویداد · {summary.unique_variants} واریانت
+                  {Number(summary.total_events_analyzed || 0).toLocaleString()} رویداد · {summary.unique_variants ?? 0} واریانت
                 </div>
               </div>
               <div className="bi-card p-3">

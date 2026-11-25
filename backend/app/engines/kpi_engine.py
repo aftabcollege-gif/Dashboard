@@ -4107,22 +4107,64 @@ class IntelligentKpiEngine:
 
         # Always guarantee BPMN diagram on Overview when process schema detected!
         if bpmn_cfg:
+            proc_c = bpmn_cfg.get("process_field")
             step_c = bpmn_cfg["step_field"]
             wait_c = bpmn_cfg.get("wait_field") or step_c
             agg_b = "AVG" if bpmn_cfg.get("wait_field") else "COUNT"
-            bpmn_cols = [c for c in [step_c, bpmn_cfg.get("wait_field"), bpmn_cfg.get("sla_field"), bpmn_cfg.get("assignee_field"), bpmn_cfg.get("request_id_field"), bpmn_cfg.get("status_field")] if c]
+            bpmn_cols = [
+                c for c in [
+                    proc_c,
+                    step_c,
+                    bpmn_cfg.get("wait_field"),
+                    bpmn_cfg.get("sla_field"),
+                    bpmn_cfg.get("assignee_field"),
+                    bpmn_cfg.get("assignee_role_field"),
+                    bpmn_cfg.get("request_id_field"),
+                    bpmn_cfg.get("request_title_field"),
+                    bpmn_cfg.get("entered_at_field"),
+                    bpmn_cfg.get("status_field"),
+                    bpmn_cfg.get("department_field"),
+                ] if c
+            ]
+            if proc_c:
+                # Add high-level Process Distribution widget before BPMN flow diagram so multi-process datasets stay clear
+                proc_dist_spec = {
+                    "x_field": proc_c,
+                    "y_field": wait_c if bpmn_cfg.get("wait_field") else "*",
+                    "aggregation": "AVG" if bpmn_cfg.get("wait_field") else "COUNT",
+                    "limit": 25,
+                }
+                w_pdist = _make_widget(
+                    title=f"مقایسه فرآیندهای سازمان ({proc_c})",
+                    chart_type="horizontal_bar",
+                    visual_spec=proc_dist_spec,
+                    layout={"x": 0, "y": cur_y, "w": 12, "h": 6},
+                    narrative_fa=f"توزیع فرآیندهای سازمان بر اساس ستون «{proc_c}» در «{ds.name}» ({row_count:,} رکورد).",
+                    dedup_key="ov_process_distribution",
+                )
+                if w_pdist:
+                    p1_widgets.append(w_pdist)
+                    cur_y += 6
+
             w_bpmn = _make_widget(
                 title="نقشه فرآیند و گلوگاه‌ها (BPMN)",
                 chart_type="bpmn",
-                visual_spec={"columns": list(dict.fromkeys(bpmn_cols)), "x_field": step_c, "y_field": wait_c, "aggregation": agg_b, "limit": 500},
-                layout={"x": 0, "y": cur_y, "w": 12, "h": 10},
+                visual_spec={
+                    "columns": list(dict.fromkeys(bpmn_cols)),
+                    "x_field": step_c,
+                    "y_field": wait_c if bpmn_cfg.get("wait_field") else "*",
+                    "aggregation": agg_b,
+                    "bpmn_config": bpmn_cfg,
+                    "limit": 5000,
+                },
+                layout={"x": 0, "y": cur_y, "w": 12, "h": 11},
                 visualization={"bpmn_config": bpmn_cfg, "show_legend": True, "show_tooltip": True},
-                narrative_fa=f"نمای فرآیندی بر اساس گام «{step_c}» در «{ds.name}» ({row_count:,} رکورد) جهت شناسایی گلوگاه‌ها و SLA.",
+                narrative_fa=f"نمای فرآیندی SQL بر اساس {'ستون فرآیند «' + proc_c + '» و ' if proc_c else ''}گام «{step_c}» در «{ds.name}» ({row_count:,} رکورد) جهت شناسایی گلوگاه‌ها و کارتابل افراد.",
                 dedup_key="ov_bpmn_process",
             )
             if w_bpmn:
                 p1_widgets.append(w_bpmn)
-                cur_y += 10
+                cur_y += 11
 
         if p1_widgets:
             pages.append({
@@ -4714,6 +4756,17 @@ class IntelligentKpiEngine:
 
         # Suggested global dashboard filters
         suggested_filters: list[dict[str, Any]] = []
+        seen_filter_fields: set[str] = set()
+        if bpmn_cfg and bpmn_cfg.get("process_field"):
+            pf_name = bpmn_cfg["process_field"]
+            pf_meta = next((c for c in classifications if c["field_name"] == pf_name), None)
+            suggested_filters.append({
+                "name": pf_meta["display_name"] if pf_meta else pf_name,
+                "field_name": pf_name,
+                "filter_type": "multi_select",
+                "operator": "in",
+            })
+            seen_filter_fields.add(pf_name)
         if primary_time:
             suggested_filters.append({
                 "name": primary_time["display_name"],
@@ -4721,13 +4774,19 @@ class IntelligentKpiEngine:
                 "filter_type": "date_range",
                 "operator": "date_range",
             })
-        for df in dim_cols[:2]:
+            seen_filter_fields.add(primary_time["field_name"])
+        for df in dim_cols:
+            if df["field_name"] in seen_filter_fields:
+                continue
             suggested_filters.append({
                 "name": df["display_name"],
                 "field_name": df["field_name"],
                 "filter_type": "multi_select",
                 "operator": "in",
             })
+            seen_filter_fields.add(df["field_name"])
+            if len(suggested_filters) >= 4:
+                break
 
         return {
             "dataset_id": ds.id,

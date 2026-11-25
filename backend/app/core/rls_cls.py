@@ -7,6 +7,18 @@ from sqlalchemy.orm import Session
 from app.models.identity import AccessPolicy, User, GroupMember, UserRole, GroupRole
 
 SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SAFE_COLUMN_RE = re.compile(r'^[^\x00-\x1f"\';`\\]+$')
+
+
+def is_safe_column_ident(col: Any) -> bool:
+    if not isinstance(col, str):
+        return False
+    s = col.strip()
+    if not s or len(s) > 180:
+        return False
+    if "--" in s or "/*" in s or "*/" in s:
+        return False
+    return bool(SAFE_COLUMN_RE.match(col))
 
 
 @dataclass
@@ -43,7 +55,7 @@ def _resolve_user_attr(user: User, group_names: list[str], expr: str) -> Any:
 def _compile_rls_rule(rule: dict[str, Any], resolved_val: Any) -> Optional[tuple[str, list[Any]]]:
     col = str(rule.get("column", ""))
     op = str(rule.get("operator", "eq")).lower()
-    if not SAFE_IDENT_RE.match(col):
+    if not is_safe_column_ident(col):
         return None
     if op == "eq":
         return f'"{col}" = ?', [resolved_val]
@@ -117,12 +129,12 @@ def build_data_security_context(
                 rls_params.extend(compiled[1])
         elif pol.policy_type == "cls":
             for c in rule.get("hidden_columns", []):
-                if SAFE_IDENT_RE.match(str(c)):
+                if is_safe_column_ident(str(c)):
                     hidden_cols.add(str(c))
         elif pol.policy_type == "masking":
             col = str(rule.get("column", ""))
             strategy = str(rule.get("strategy", "redact"))
-            if SAFE_IDENT_RE.match(col):
+            if is_safe_column_ident(col):
                 masked_cols[col] = strategy
 
     ctx_payload = {
@@ -169,12 +181,12 @@ def build_public_data_security_context(
         rule = pol.rule_json or {}
         if pol.policy_type == "cls":
             for c in rule.get("hidden_columns", []):
-                if SAFE_IDENT_RE.match(str(c)):
+                if is_safe_column_ident(str(c)):
                     hidden_cols.add(str(c))
         elif pol.policy_type == "masking":
             col = str(rule.get("column", ""))
             strategy = str(rule.get("strategy", "redact"))
-            if SAFE_IDENT_RE.match(col):
+            if is_safe_column_ident(col):
                 masked_cols[col] = strategy
         elif pol.policy_type == "rls" and pol.target_type == "all":
             val_expr = rule.get("value")
@@ -247,7 +259,7 @@ def inspect_dataset_public_safety(db: Session, organization_id: str, dataset) ->
 
 
 def build_masked_column_sql(col_name: str, strategy: str) -> str:
-    if not SAFE_IDENT_RE.match(col_name):
+    if not is_safe_column_ident(col_name):
         raise ValueError(f"Unsafe column identifier: {col_name}")
     qcol = f'"{col_name}"'
     st = (strategy or "redact").lower()
@@ -284,7 +296,7 @@ def build_security_projection_and_where(
     visible_cols: list[str] = []
     for c in columns_meta:
         cname = c["column_name"]
-        if not SAFE_IDENT_RE.match(cname):
+        if not is_safe_column_ident(cname):
             continue
         if cname in sec_ctx.hidden_columns:
             continue

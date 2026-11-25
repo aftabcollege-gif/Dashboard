@@ -10,6 +10,7 @@ from app.core.tenant import get_dataset_for_org
 from app.database import get_db
 from app.engines.process_intelligence import (
     analyze_process_intelligence,
+    discover_dataset_processes,
     evaluate_corrective_action,
     infer_event_log_mapping,
     list_or_get_case_details,
@@ -33,6 +34,7 @@ class ProcessAnalyzeRequest(BaseModel):
     date_start: Optional[str] = None
     date_end: Optional[str] = None
     filters: Optional[dict[str, Any]] = None
+    process_name: Optional[str] = None
 
 
 class CorrectiveActionCreate(BaseModel):
@@ -83,6 +85,18 @@ def update_process_mapping(
     return res
 
 
+@router.get("/datasets/{dataset_id}/processes")
+def list_dataset_processes(
+    dataset_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
+    enforce_permission(db, user, "process_intel", "*", "view")
+    return discover_dataset_processes(db, ds, user)
+
+
 @router.post("/datasets/{dataset_id}/analyze")
 def run_process_analysis(
     dataset_id: str,
@@ -102,6 +116,7 @@ def run_process_analysis(
         date_start=body.date_start,
         date_end=body.date_end,
         filters=body.filters,
+        process_name=body.process_name,
     )
 
 
@@ -109,6 +124,7 @@ def run_process_analysis(
 def drill_down_cases(
     dataset_id: str,
     activity: Optional[str] = Query(None),
+    process_name: Optional[str] = Query(None),
     only_rework: bool = Query(False),
     only_sla_breach: bool = Query(False),
     limit: int = Query(50, ge=1, le=500),
@@ -128,6 +144,7 @@ def drill_down_cases(
     return list_or_get_case_details(
         db, ds, user,
         activity_filter=activity,
+        process_name=process_name,
         only_rework=only_rework,
         only_sla_breach=only_sla_breach,
         limit=limit,
@@ -139,6 +156,7 @@ def drill_down_cases(
 def drill_down_single_case(
     dataset_id: str,
     case_id: str,
+    process_name: Optional[str] = Query(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -151,7 +169,7 @@ def drill_down_single_case(
     )
     if not d_raw.allowed and d_raw.reason.startswith("explicit_deny"):
         raise HTTPException(status_code=403, detail="Access denied: raw record drill-down is explicitly denied")
-    return list_or_get_case_details(db, ds, user, case_id=case_id)
+    return list_or_get_case_details(db, ds, user, case_id=case_id, process_name=process_name)
 
 
 @router.get("/datasets/{dataset_id}/actions")

@@ -31,6 +31,7 @@ from app.core.tenant import (
     list_org_allowed_dataset_tables,
 )
 from app.database import get_db
+from app.engines.bpmn_analytics import execute_bpmn_step_drill, execute_bpmn_widget_sql
 from app.engines.drill_engine import resolve_drill_state
 from app.engines.query_engine import build_visual_query_sql, execute_dataset_sql
 from app.engines.warehouse import warehouse
@@ -192,6 +193,8 @@ class WidgetExecuteRequest(BaseModel):
     cross_filters: list[dict[str, Any]] = []
     drill_stack: list[dict[str, Any]] = []
     use_cache: bool = True
+    bpmn_process_name: Optional[str] = None
+    bpmn_field_overrides: Optional[dict[str, Any]] = None
 
 
 class WidgetDrillDetailsRequest(BaseModel):
@@ -201,12 +204,27 @@ class WidgetDrillDetailsRequest(BaseModel):
     limit: int = 100
 
 
+class BpmnDrillRequest(BaseModel):
+    step_name: str
+    process_name: Optional[str] = None
+    assignee_name: Optional[str] = None
+    pending_only: bool = False
+    search: Optional[str] = None
+    limit: int = 100
+    offset: int = 0
+    active_filters: list[dict[str, Any]] = []
+    cross_filters: list[dict[str, Any]] = []
+    field_overrides: Optional[dict[str, Any]] = None
+
+
 class BatchExecuteRequest(BaseModel):
     page_id: Optional[str] = None
     active_filters: list[dict[str, Any]] = []
     cross_filters: list[dict[str, Any]] = []
     drill_states: dict[str, list[dict[str, Any]]] = {}  # widget_id -> drill_stack
     use_cache: bool = True
+    bpmn_process_map: dict[str, str] = {}
+    bpmn_field_overrides_map: dict[str, dict[str, Any]] = {}
 
 
 class StateSaveRequest(BaseModel):
@@ -909,6 +927,17 @@ def get_public_dashboard(embed_token: str, request: Request, db: Session = Depen
                     data = _execute_public_sql_widget(
                         db, dash_org_id, ds, wq.sql_text, [], named_params=wq.parameters_json or {}
                     )
+                elif w.chart_type == "bpmn":
+                    data = execute_bpmn_widget_sql(
+                        db,
+                        ds,
+                        wq.visual_spec_json or {},
+                        cfg.visualization_json if cfg else {},
+                        [],
+                        [],
+                        [],
+                        public_mode=True,
+                    )
                 else:
                     sec_bundle: dict[str, Any] = {}
                     sql, params, _ = build_visual_query_sql(
@@ -918,7 +947,7 @@ def get_public_dashboard(embed_token: str, request: Request, db: Session = Depen
                         [],
                         [],
                         [],
-                        raw_mode=(w.chart_type == "bpmn"),
+                        raw_mode=False,
                         public_mode=True,
                         security_bundle_out=sec_bundle,
                     )
@@ -1061,6 +1090,20 @@ def execute_public_dashboard_batch(
                     data = _execute_public_sql_widget(
                         db, dash_org_id, ds, wq.sql_text, eff_filters, named_params=wq.parameters_json or {}
                     )
+                elif eff_chart == "bpmn":
+                    wcfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
+                    data = execute_bpmn_widget_sql(
+                        db,
+                        ds,
+                        wq.visual_spec_json or {},
+                        wcfg.visualization_json if wcfg else {},
+                        eff_filters,
+                        [],
+                        [],
+                        public_mode=True,
+                        process_name_override=(body.bpmn_process_map or {}).get(w.id),
+                        field_overrides=(body.bpmn_field_overrides_map or {}).get(w.id),
+                    )
                 else:
                     sec_bundle: dict[str, Any] = {}
                     sql, params, _ = build_visual_query_sql(
@@ -1071,7 +1114,7 @@ def execute_public_dashboard_batch(
                         [],
                         [],
                         override_dimension=eff_dim,
-                        raw_mode=(eff_chart == "bpmn"),
+                        raw_mode=False,
                         public_mode=True,
                         security_bundle_out=sec_bundle,
                     )
@@ -1826,6 +1869,8 @@ def _execute_single_widget(
     drill_stack: list[dict[str, Any]],
     use_cache: bool,
     ip_address: Optional[str] = None,
+    bpmn_process_name: Optional[str] = None,
+    bpmn_field_overrides: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
     enforce_permission(db, user, "widget", w.id, "view", parent_chain=parent_chain, ip_address=ip_address)
@@ -1903,12 +1948,13 @@ def _execute_single_widget(
     elif ds:
         sec_ctx = build_data_security_context(db, user, ds.id)
         visual_spec = dict(wq.visual_spec_json) if wq else {}
-        is_bpmn_raw = drill_info["effective_chart_type"] == "bpmn"
+        is_bpmn_chart = drill_info["effective_chart_type"] == "bpmn"
+        is_bpmn_raw = is_bpmn_chart and not drill_info["is_raw_level"]
         sec_bundle: dict[str, Any] = {}
         sql, params, _ = build_visual_query_sql(
             db, ds, visual_spec, effective_filters, sec_ctx.rls_where_clauses, sec_ctx.rls_params,
             override_dimension=drill_info["effective_dimension"],
-            raw_mode=drill_info["is_raw_level"] or is_bpmn_raw,
+            raw_mode=drill_info["is_raw_level"] or is_bpmn_chart,
             user=user,
             enforce_join_rbac=True,
             security_bundle_out=sec_bundle,
@@ -1919,8 +1965,10 @@ def _execute_single_widget(
         perm_hash = permission_resolver.get_permission_context_hash(db, user) + ":" + combined_sec_hash
         q_hash = cache_manager.hash_dict({
             "spec": visual_spec, "dim": drill_info["effective_dimension"],
-            "raw": drill_info["is_raw_level"] or is_bpmn_raw, "chart": drill_info["effective_chart_type"],
+            "raw": drill_info["is_raw_level"] or is_bpmn_chart, "chart": drill_info["effective_chart_type"],
             "joined_versions": joined_versions,
+            "bpmn_process_name": bpmn_process_name if is_bpmn_raw else None,
+            "bpmn_field_overrides": bpmn_field_overrides if is_bpmn_raw else None,
         })
         f_hash = cache_manager.hash_dict(effective_filters)
         cache_key = cache_manager.build_key(
@@ -1932,17 +1980,33 @@ def _execute_single_widget(
         if cached is not None:
             res = {**cached, "cache_hit": True}
         else:
-            raw_res = warehouse.execute_query(sql, params)
-            vis_cols, masked_rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], eff_ctx)
-            res = {
-                "columns": vis_cols,
-                "rows": masked_rows,
-                "row_count": len(masked_rows),
-                "execution_ms": raw_res["execution_ms"],
-                "cache_hit": False,
-                "data_version": ds.data_version,
-                "generated_sql": sql,
-            }
+            if is_bpmn_raw:
+                wcfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
+                res = execute_bpmn_widget_sql(
+                    db,
+                    ds,
+                    visual_spec,
+                    wcfg.visualization_json if wcfg else {},
+                    effective_filters,
+                    sec_ctx.rls_where_clauses,
+                    sec_ctx.rls_params,
+                    user=user,
+                    enforce_join_rbac=True,
+                    process_name_override=bpmn_process_name,
+                    field_overrides=bpmn_field_overrides,
+                )
+            else:
+                raw_res = warehouse.execute_query(sql, params)
+                vis_cols, masked_rows = apply_cls_and_masking(raw_res["columns"], raw_res["rows"], eff_ctx)
+                res = {
+                    "columns": vis_cols,
+                    "rows": masked_rows,
+                    "row_count": len(masked_rows),
+                    "execution_ms": raw_res["execution_ms"],
+                    "cache_hit": False,
+                    "data_version": ds.data_version,
+                    "generated_sql": sql,
+                }
             if use_cache:
                 cache_manager.set(
                     cache_key, res,
@@ -2004,7 +2068,9 @@ def get_widget_data(
     try:
         return _execute_single_widget(
             db, user, w, body.active_filters, body.cross_filters, body.drill_stack,
-            body.use_cache, ip_address=ip
+            body.use_cache, ip_address=ip,
+            bpmn_process_name=body.bpmn_process_name,
+            bpmn_field_overrides=body.bpmn_field_overrides,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
@@ -2141,6 +2207,173 @@ def get_widget_drill_details(
     }
 
 
+@router.post("/widgets/{widget_id}/bpmn-drill")
+def get_widget_bpmn_step_drill(
+    widget_id: str,
+    body: BpmnDrillRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "widget_data",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_WIDGET_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_WIDGET_PER_MIN,
+        org_limit=settings.RATE_LIMIT_WIDGET_PER_MIN * 5,
+    )
+    w, _ = get_widget_for_org(db, widget_id, user.organization_id)
+    parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
+    enforce_permission(db, user, "widget", w.id, "view", parent_chain=parent_chain, ip_address=ip)
+
+    wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
+    wcfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
+    target_ds_id = wq.dataset_id if wq and wq.dataset_id else w.dataset_id
+    ds = (
+        db.query(Dataset)
+        .filter(Dataset.id == target_ds_id, Dataset.organization_id == user.organization_id)
+        .first()
+        if target_ds_id
+        else None
+    )
+    if not ds:
+        raise HTTPException(status_code=400, detail="Widget has no underlying dataset for BPMN drill-down")
+
+    ds_dec = permission_resolver.resolve(db, user, "dataset", ds.id, "view")
+    if not ds_dec.allowed and ds_dec.reason.startswith("explicit_deny"):
+        raise HTTPException(status_code=403, detail=f"Permission denied for dataset '{ds.name}' ({ds_dec.reason})")
+
+    dash_filters_db = db.query(DashboardFilter).filter(DashboardFilter.dashboard_id == w.dashboard_id).all()
+    df_meta = {df.id: df for df in dash_filters_db}
+    effective_filters: list[dict[str, Any]] = []
+    for af in body.active_filters:
+        fid = af.get("filter_id")
+        meta = df_meta.get(fid) if fid else None
+        if meta:
+            if meta.scope == "dashboard" and meta.page_id and meta.page_id != w.page_id:
+                continue
+            if meta.excluded_widget_ids and w.id in meta.excluded_widget_ids:
+                continue
+            if meta.target_widget_ids and w.id not in meta.target_widget_ids:
+                continue
+        effective_filters.append(af)
+    for cf in body.cross_filters:
+        if cf.get("source_widget_id") != w.id:
+            effective_filters.append(cf)
+    for wf in db.query(WidgetFilter).filter(WidgetFilter.widget_id == w.id, WidgetFilter.is_active == True).all():
+        val = wf.value_json.get("value") if isinstance(wf.value_json, dict) and "value" in wf.value_json else wf.value_json
+        effective_filters.append({"field_name": wf.field_name, "operator": wf.operator, "value": val, "is_active": True})
+
+    sec_ctx = build_data_security_context(db, user, ds.id)
+    visual_spec = dict(wq.visual_spec_json) if wq and isinstance(wq.visual_spec_json, dict) else {}
+    try:
+        drill_res = execute_bpmn_step_drill(
+            db,
+            ds,
+            visual_spec,
+            wcfg.visualization_json if wcfg else {},
+            effective_filters,
+            sec_ctx.rls_where_clauses,
+            sec_ctx.rls_params,
+            step_name=body.step_name,
+            process_name=body.process_name,
+            assignee_name=body.assignee_name,
+            pending_only=body.pending_only,
+            search=body.search,
+            limit=body.limit,
+            offset=body.offset,
+            field_overrides=body.field_overrides,
+            user=user,
+            enforce_join_rbac=True,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    record_audit(
+        db, user.organization_id, "bpmn_drill_step", "widget", resource_id=w.id,
+        status="success", user_id=user.id, username=user.username, ip_address=ip,
+        details={"step_name": body.step_name, "process_name": body.process_name, "items": drill_res.get("total_items", 0)},
+    )
+    return drill_res
+
+
+@router.post("/public/{embed_token}/widgets/{widget_id}/bpmn-drill")
+def get_public_widget_bpmn_step_drill(
+    embed_token: str,
+    widget_id: str,
+    body: BpmnDrillRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "public_batch", ip=ip, ip_limit=settings.RATE_LIMIT_PUBLIC_PER_MIN, window_seconds=60
+    )
+    row = (
+        db.query(Dashboard, Workspace.organization_id)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(Dashboard.embed_token == embed_token, Dashboard.is_public == True)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Shared dashboard not found or not public")
+    dash, dash_org_id = row
+    _assert_dashboard_public_safe(db, dash_org_id, dash)
+    override_verified = _has_verified_public_override(db, dash_org_id, dash)
+
+    w = db.query(Widget).filter(Widget.id == widget_id, Widget.dashboard_id == dash.id).first()
+    if not w:
+        raise HTTPException(status_code=404, detail="Widget not found in shared dashboard")
+    wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
+    wcfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
+    target_ds_id = wq.dataset_id if wq and wq.dataset_id else w.dataset_id
+    ds = (
+        db.query(Dataset)
+        .filter(Dataset.id == target_ds_id, Dataset.organization_id == dash_org_id)
+        .first()
+        if target_ds_id
+        else None
+    )
+    if not ds:
+        raise HTTPException(status_code=400, detail="Widget has no underlying dataset")
+    if not override_verified:
+        _assert_dataset_public_safe(db, dash_org_id, ds)
+
+    eff_filters = list(body.active_filters or [])
+    for cf in body.cross_filters or []:
+        if cf.get("source_widget_id") != w.id:
+            eff_filters.append(cf)
+
+    try:
+        return execute_bpmn_step_drill(
+            db,
+            ds,
+            wq.visual_spec_json or {} if wq else {},
+            wcfg.visualization_json if wcfg else {},
+            eff_filters,
+            [],
+            [],
+            step_name=body.step_name,
+            process_name=body.process_name,
+            assignee_name=body.assignee_name,
+            pending_only=body.pending_only,
+            search=body.search,
+            limit=body.limit,
+            offset=body.offset,
+            field_overrides=body.field_overrides,
+            public_mode=True,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @router.post("/{dashboard_id}/execute-batch")
 def execute_dashboard_batch(
     dashboard_id: str,
@@ -2180,7 +2413,9 @@ def execute_dashboard_batch(
             d_stack = body.drill_states.get(w.id, [])
             r = _execute_single_widget(
                 db, user, w, body.active_filters, body.cross_filters, d_stack,
-                body.use_cache, ip_address=get_client_ip(request)
+                body.use_cache, ip_address=get_client_ip(request),
+                bpmn_process_name=(body.bpmn_process_map or {}).get(w.id),
+                bpmn_field_overrides=(body.bpmn_field_overrides_map or {}).get(w.id),
             )
             results[w.id] = r
             if r.get("cache_hit"):
