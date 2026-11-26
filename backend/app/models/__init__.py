@@ -34,6 +34,7 @@ from app.models.dashboard import (
     DashboardVersion,
     DashboardComment,
     DashboardState,
+    NamedDashboardLayout,
 )
 from app.models.data import (
     DataSource,
@@ -47,6 +48,7 @@ from app.models.data import (
     DataModel,
     DataTransformation,
     DataLineage,
+    CompositeDataset,
 )
 from app.models.etl import (
     EtlPipeline,
@@ -65,6 +67,7 @@ from app.models.performance import (
     QueryExecutionLog,
     DashboardPerformanceLog,
     WidgetPerformanceLog,
+    BackgroundJob,
 )
 from app.models.intelligence import (
     ProcessDatasetMapping,
@@ -75,6 +78,12 @@ from app.models.intelligence import (
     SecurityAlertRule,
     SecurityAlert,
     SecurityIncident,
+    BpmnBottleneckRule,
+    BpmnLayoutConfig,
+    SecurityClassificationRule,
+    SecurityVulnerability,
+    SecurityAssetExposure,
+    ActionItem,
 )
 
 __all__ = [
@@ -111,6 +120,7 @@ __all__ = [
     "DashboardVersion",
     "DashboardComment",
     "DashboardState",
+    "NamedDashboardLayout",
     "DataSource",
     "DataSourceCredential",
     "Dataset",
@@ -122,6 +132,7 @@ __all__ = [
     "DataModel",
     "DataTransformation",
     "DataLineage",
+    "CompositeDataset",
     "EtlPipeline",
     "EtlPipelineStep",
     "EtlSchedule",
@@ -136,6 +147,7 @@ __all__ = [
     "QueryExecutionLog",
     "DashboardPerformanceLog",
     "WidgetPerformanceLog",
+    "BackgroundJob",
     "ProcessDatasetMapping",
     "ProcessCorrectiveAction",
     "SecurityCollector",
@@ -144,4 +156,10 @@ __all__ = [
     "SecurityAlertRule",
     "SecurityAlert",
     "SecurityIncident",
+    "BpmnBottleneckRule",
+    "BpmnLayoutConfig",
+    "SecurityClassificationRule",
+    "SecurityVulnerability",
+    "SecurityAssetExposure",
+    "ActionItem",
 ]

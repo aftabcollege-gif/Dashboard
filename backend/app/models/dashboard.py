@@ -239,3 +239,20 @@ class DashboardState(Base, TimestampMixin):
     filter_state_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     drill_state_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     widget_overrides_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class NamedDashboardLayout(Base, TimestampMixin):
+    """Named layout presets per dashboard allowing multiple saved layouts and quick switching."""
+    __tablename__ = "named_dashboard_layouts"
+    __table_args__ = (UniqueConstraint("dashboard_id", "name", name="uq_dash_named_layout"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    dashboard_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("dashboards.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    layout_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )

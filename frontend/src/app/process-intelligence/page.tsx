@@ -51,6 +51,9 @@ export default function ProcessIntelligencePage() {
   const [refSequenceText, setRefSequenceText] = useState("");
   const [analysis, setAnalysis] = useState<any>(null);
   const [actions, setActions] = useState<any[]>([]);
+  const [rulePresets, setRulePresets] = useState<any[]>([]);
+  const [activeRules, setActiveRules] = useState<any[]>([]);
+  const [selectedPresetKey, setSelectedPresetKey] = useState<string>("weighted_wait_sla");
   const [loading, setLoading] = useState(false);
   const [savingMap, setSavingMap] = useState(false);
 
@@ -86,7 +89,7 @@ export default function ProcessIntelligencePage() {
       if (!dsId) return;
       setLoading(true);
       try {
-        const [mapRes, procRes, anaRes, actRes] = await Promise.all([
+        const [mapRes, procRes, anaRes, actRes, rulesRes] = await Promise.all([
           apiFetch<any>(`/process-intelligence/datasets/${dsId}/mapping`),
           apiFetch<any>(`/process-intelligence/datasets/${dsId}/processes`).catch(() => ({ processes: [] })),
           apiFetch<any>(`/process-intelligence/datasets/${dsId}/analyze`, {
@@ -94,7 +97,10 @@ export default function ProcessIntelligencePage() {
             body: JSON.stringify(procName ? { process_name: procName } : {}),
           }),
           apiFetch<any[]>(`/process-intelligence/datasets/${dsId}/actions`).catch(() => []),
+          apiFetch<any>(`/process-intelligence/datasets/${dsId}/bottleneck-rules`).catch(() => ({ presets: [], rules: [] })),
         ]);
+        setRulePresets(rulesRes?.presets || []);
+        setActiveRules(rulesRes?.rules || []);
         setMappingInfo(mapRes);
         const pList = procRes?.processes || [];
         setProcessList(pList);
@@ -206,6 +212,29 @@ export default function ProcessIntelligencePage() {
     }
   };
 
+  const handleApplyBottleneckPreset = async (presetKey: string) => {
+    setSelectedPresetKey(presetKey);
+    const p = rulePresets.find((x) => x.key === presetKey);
+    if (!p || !datasetId) return;
+    try {
+      await apiFetch(`/process-intelligence/datasets/${datasetId}/bottleneck-rules`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: p.label_fa,
+          process_name: selectedProcess || null,
+          weights: p.weights,
+          threshold_score: p.threshold_score,
+          severity: p.severity,
+          is_active: true,
+        }),
+      });
+      showToast(isFa ? `فرمول «${p.label_fa}» فعال شد` : `Activated rule: ${p.key}`);
+      await loadProcessIntelligence(datasetId, selectedProcess);
+    } catch (err: any) {
+      showToast(err.message);
+    }
+  };
+
   const summary = analysis?.summary;
   const dq = analysis?.data_quality;
   const bottlenecks: any[] = analysis?.bottlenecks || [];
@@ -260,6 +289,36 @@ export default function ProcessIntelligencePage() {
             </button>
           </div>
         </div>
+
+        {/* Configurable Bottleneck Formula Strip */}
+        {rulePresets.length > 0 && (
+          <div className="bi-card p-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2">
+              <Sliders className="w-4 h-4 text-violet-500" />
+              <span className="font-bold">{isFa ? "فرمول تشخیص گلوگاه:" : "Bottleneck Formula:"}</span>
+              {activeRules.find((r) => r.is_active) && (
+                <span className="px-2 py-0.5 rounded bg-violet-500/15 text-violet-500 text-[10px] font-semibold">
+                  فعال: {activeRules.find((r) => r.is_active)?.name} (آستانه {activeRules.find((r) => r.is_active)?.threshold_score})
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {rulePresets.map((p) => (
+                <button
+                  key={p.key}
+                  type="button"
+                  onClick={() => handleApplyBottleneckPreset(p.key)}
+                  className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold transition ${
+                    selectedPresetKey === p.key ? "bg-violet-600 text-white border-violet-600" : "hover:bg-violet-500/10"
+                  }`}
+                  style={selectedPresetKey === p.key ? undefined : { borderColor: "var(--bi-border)" }}
+                >
+                  {p.label_fa}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Multi-Process Switcher Bar */}
         {processList.length > 0 && (

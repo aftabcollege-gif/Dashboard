@@ -214,7 +214,19 @@ class AiAnalyticsEngine:
             "هزینه": ["cost", "expense", "amount"],
             "سود": ["profit", "net_profit", "margin"],
             "تعداد": ["quantity", "units", "count"],
+            "انتظار": ["wait_hours", "wait", "delay", "duration"],
+            "حقوق": ["salary", "payroll", "wage"],
+            "مالیات": ["tax", "vat"],
+            "تخفیف": ["discount"],
+            "موجودی": ["inventory", "stock", "balance"],
+            "بیمار": ["patient"],
         }
+        explicit_metric_concept: Optional[str] = None
+        for fa_k in fa_measure_hints:
+            if fa_k in q_low:
+                explicit_metric_concept = fa_k
+                break
+
         if not chosen_measure:
             for c in num_cols:
                 if c.replace("_", " ") in q_low or c in q_low:
@@ -230,8 +242,25 @@ class AiAnalyticsEngine:
                                 break
                         if chosen_measure:
                             break
+        if not chosen_measure and explicit_metric_concept and explicit_metric_concept != "تعداد":
+            return {
+                "status": "needs_data",
+                "question": question,
+                "answer_fa": (
+                    f"در مجموعه‌داده «{dataset.name}» هیچ ستون یا شاخصی متناظر با «{explicit_metric_concept}» یافت نشد. "
+                    f"برای جلوگیری از پاسخ نادرست، محاسبه‌ای انجام نشد. می‌توانید از ستون‌های موجود استفاده کنید: "
+                    f"{', '.join(num_cols[:8]) or 'ندارد'}."
+                ),
+                "missing_concept": explicit_metric_concept,
+                "available_measures": num_cols,
+                "available_dimensions": [c for c in col_names if c not in num_cols],
+                "source_datasets": [dataset.name],
+                "generated_sql": None,
+                "recommended_chart_type": "kpi",
+                "result": {"columns": [], "rows": [], "row_count": 0},
+            }
         if not chosen_measure:
-            chosen_measure = f'{agg}("{num_cols[0]}")' if num_cols else "COUNT(*)"
+            chosen_measure = f'{agg}("{num_cols[0]}")' if (num_cols and agg != "COUNT") else "COUNT(*)"
 
         # Dimension matching (EN + FA)
         dim_cols = [c["column_name"] for c in cols if c["column_name"] not in num_cols and not c["column_name"].endswith("_id")]
@@ -247,6 +276,10 @@ class AiAnalyticsEngine:
             "سال": ["year"],
             "تاریخ": ["order_date", "transaction_date", "date"],
             "کشور": ["country"],
+            "گام": ["step_name", "activity"],
+            "مرحله": ["step_name", "activity"],
+            "کارتابل": ["assignee_name", "assignee"],
+            "فرآیند": ["process_name"],
         }
         chosen_dim: Optional[str] = None
         for c in dim_cols:
@@ -265,7 +298,7 @@ class AiAnalyticsEngine:
                             break
 
         if not chosen_dim and any(k in q_low for k in ("by ", "بر اساس", "به تفکیک", "per ", "trend", "روند")):
-            for candidate in ("region", "department", "category", "month", "year", "product"):
+            for candidate in ("region", "department", "category", "step_name", "month", "year", "product"):
                 if candidate in col_names:
                     chosen_dim = candidate
                     break
@@ -284,12 +317,27 @@ class AiAnalyticsEngine:
             chart_type = "kpi"
 
         result = execute_dataset_sql(db, user, sql, dataset=dataset, use_cache=False)
+        rows = result.get("rows") or []
+        if not rows:
+            answer_fa = f"در مجموعه‌داده «{dataset.name}» هیچ داده‌ای مطابق با این پرسش یافت نشد."
+        elif chosen_dim:
+            top_items = [f"{r.get(chosen_dim)}: {r.get('value')}" for r in rows[:3]]
+            answer_fa = f"بر اساس منبع «{dataset.name}» ({result.get('row_count', len(rows))} گروه): " + " | ".join(top_items)
+        else:
+            val = rows[0].get("value")
+            answer_fa = f"مقدار محاسبه‌شده از منبع «{dataset.name}»: {val}"
+
         return {
+            "status": "answered",
             "question": question,
+            "answer_fa": answer_fa,
             "generated_sql": sql,
             "recommended_chart_type": chart_type,
             "x_field": chosen_dim,
             "y_field": "value",
+            "source_datasets": [dataset.name],
+            "confidence": 0.92,
+            "limitations": [],
             "result": result,
         }
 
@@ -2106,6 +2154,76 @@ class AiAnalyticsEngine:
         }
 
     @staticmethod
+    def _handle_qa_chat(
+        db: Session,
+        user: User,
+        prompt: str,
+        clarifications: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        clar = dict(clarifications or {})
+        datasets = db.query(Dataset).filter(Dataset.organization_id == user.organization_id).all()
+        if not datasets:
+            return {
+                "status": "needs_data",
+                "action": "qa",
+                "message_fa": "هنوز هیچ منبع داده‌ای در سامانه ثبت نشده است. لطفاً ابتدا فایل اکسل یا منبع داده وارد کنید.",
+                "source_datasets": [],
+            }
+
+        chosen_ds = None
+        if clar.get("dataset_id"):
+            chosen_ds = next((d for d in datasets if d.id == clar["dataset_id"]), None)
+        if not chosen_ds:
+            low = AiAnalyticsEngine._normalize_text(prompt).lower()
+            for d in datasets:
+                if d.name.lower() in low or any(tok in low for tok in d.name.lower().split() if len(tok) >= 3):
+                    chosen_ds = d
+                    break
+        if not chosen_ds and len(datasets) == 1:
+            chosen_ds = datasets[0]
+        if not chosen_ds:
+            return {
+                "status": "needs_clarification",
+                "action": "qa",
+                "message_fa": "این پرسش باید از روی کدام منبع داده پاسخ داده شود؟",
+                "questions": [
+                    {
+                        "key": "dataset_id",
+                        "question": "منبع داده مورد نظر را انتخاب کنید:",
+                        "options": [
+                            {"value": d.id, "label": d.name, "hint": f"{d.row_count or 0} ردیف"}
+                            for d in datasets[:8]
+                        ],
+                    }
+                ],
+                "parsed": {"mode": "qa"},
+            }
+
+        nlq = AiAnalyticsEngine.natural_language_query(db, user, prompt, chosen_ds)
+        if nlq.get("status") == "needs_data":
+            return {
+                "status": "needs_data",
+                "action": "qa",
+                "message_fa": nlq["answer_fa"],
+                "available_measures": nlq.get("available_measures", []),
+                "available_dimensions": nlq.get("available_dimensions", []),
+                "source_datasets": nlq.get("source_datasets", [chosen_ds.name]),
+            }
+        return {
+            "status": "qa_answered",
+            "action": "qa",
+            "message_fa": nlq["answer_fa"],
+            "generated_sql": nlq["generated_sql"],
+            "recommended_chart_type": nlq["recommended_chart_type"],
+            "x_field": nlq.get("x_field"),
+            "y_field": nlq.get("y_field"),
+            "source_datasets": nlq.get("source_datasets", [chosen_ds.name]),
+            "confidence": nlq.get("confidence", 0.9),
+            "limitations": nlq.get("limitations", []),
+            "preview_data": nlq.get("result"),
+        }
+
+    @staticmethod
     def handle_conversational_request(
         db: Session,
         user: User,
@@ -2144,11 +2262,15 @@ class AiAnalyticsEngine:
             )
             has_dash_word = any(k in norm_low for k in ("داشبورد", "dashboard", "صفحه گزارش"))
             has_widget_word = any(k in norm_low for k in ("ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget", "bpmn", "گلوگاه", "گردش کار"))
+            has_create_verb = any(k in norm_low for k in ("بساز", "ایجاد کن", "بکش", "اضافه کن", "بیفزا", "create", "build", "add"))
+            is_qa_kw = any(k in norm_low for k in ("چقدر", "کدام", "چند ", "میانگین", "مجموع", "جمع ", "بیشترین", "کمترین", "چرا", "چه کسی", "how many", "what is", "which", "؟", "?"))
 
             if widget_id or is_edit_kw:
                 eff_mode = "edit"
             elif has_dash_word and not has_widget_word:
                 eff_mode = "create_dashboard"
+            elif is_qa_kw and not has_create_verb and not has_widget_word:
+                eff_mode = "qa"
             elif has_widget_word or any(k in norm_low for k in ("از روی منبع", "بر اساس", "به تفکیک")):
                 eff_mode = "add_widget"
 
@@ -2162,6 +2284,7 @@ class AiAnalyticsEngine:
                         "key": "mode",
                         "question": "یکی از کارهای زیر را انتخاب کنید:",
                         "options": [
+                            {"value": "qa", "label": "پرسش و تحلیل مستقیم از داده‌ها (Q&A)", "hint": "محاسبه واقعی از SQL با منبع و عدم توهم"},
                             {"value": "create_dashboard", "label": "ساخت یک داشبورد کامل جدید", "hint": "با چند نمودار و کارت خلاصه آماده"},
                             {"value": "add_widget", "label": "افزودن یک نمودار یا عدد آماری جدید", "hint": "به داشبورد فعلی یا دلخواه"},
                             {"value": "edit", "label": "ویرایش داشبورد یا نمودارهای موجود", "hint": "تغییر رنگ/ظاهر، نام، نوع نمودار یا حذف"},
@@ -2171,6 +2294,8 @@ class AiAnalyticsEngine:
                 "parsed": {},
             }
 
+        if eff_mode == "qa":
+            return AiAnalyticsEngine._handle_qa_chat(db, user, prompt, clar)
         if eff_mode == "create_dashboard":
             return AiAnalyticsEngine._handle_create_dashboard_chat(db, user, prompt, clar)
         if eff_mode == "edit":

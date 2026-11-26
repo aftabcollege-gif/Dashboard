@@ -8,7 +8,7 @@ import sqlite3
 import ssl
 import time
 import zipfile
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 from urllib.parse import urljoin, urlparse
 import defusedxml.ElementTree as SafeET
 import httpcore
@@ -790,6 +790,61 @@ def _iter_xlsx_stream_batches(
         raise
 
 
+def inspect_workbook_sheets(file_path: str, filename: str, has_header: bool = True) -> list[dict[str, Any]]:
+    ext = os.path.splitext(filename.lower())[1]
+    if ext == ".xlsx":
+        import openpyxl
+
+        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        summaries: list[dict[str, Any]] = []
+        try:
+            for sname in wb.sheetnames:
+                ws = wb[sname]
+                row_iter = ws.iter_rows(values_only=True)
+                hdrs: list[str] = []
+                sample_cnt = 0
+                for raw in row_iter:
+                    trimmed = _trim_row_trailing_nones(raw)
+                    if not trimmed:
+                        continue
+                    if has_header and not hdrs:
+                        hdrs = [str(v).strip() if v is not None else f"col_{i+1}" for i, v in enumerate(trimmed)]
+                    else:
+                        if not hdrs:
+                            hdrs = [f"col_{i+1}" for i in range(len(trimmed))]
+                        sample_cnt += 1
+                    if sample_cnt >= 50:
+                        break
+                declared = int(ws.max_row or 0)
+                est_rows = max(sample_cnt, declared - (1 if has_header else 0))
+                summaries.append(
+                    {
+                        "sheet_name": sname,
+                        "estimated_rows": max(0, est_rows),
+                        "column_count": len(hdrs),
+                        "headers_preview": hdrs[:20],
+                    }
+                )
+        finally:
+            wb.close()
+        return summaries
+    if ext == ".xls":
+        xl = pd.ExcelFile(file_path, engine="xlrd")
+        out = []
+        for sname in xl.sheet_names:
+            df = pd.read_excel(file_path, sheet_name=sname, header=0 if has_header else None, nrows=5, engine="xlrd")
+            out.append(
+                {
+                    "sheet_name": sname,
+                    "estimated_rows": len(df),
+                    "column_count": len(df.columns),
+                    "headers_preview": [str(c) for c in df.columns[:20]],
+                }
+            )
+        return out
+    return []
+
+
 def preview_file_from_path(
     file_path: str,
     filename: str,
@@ -799,6 +854,7 @@ def preview_file_from_path(
     deduplicate: bool = False,
     column_renames: Optional[dict[str, str]] = None,
     type_overrides: Optional[dict[str, str]] = None,
+    selected_columns: Optional[list[str]] = None,
     preview_limit: int = 100,
 ) -> dict[str, Any]:
     if settings.MAX_UPLOAD_BYTES > 0 and os.path.getsize(file_path) > settings.MAX_UPLOAD_BYTES:
@@ -930,26 +986,63 @@ def preview_file_from_path(
     safe_cols, display_name_map = _sanitize_headers_and_renames(raw_headers, column_renames)
     df.columns = safe_cols
 
+    if selected_columns:
+        wanted = {sanitize_identifier(c) for c in selected_columns if c}
+        kept = [c for c in df.columns if c in wanted]
+        if kept:
+            df = df[kept]
+
+    input_sample_rows = len(df)
     duplicate_count = int(df.duplicated().sum()) if (len(df) <= 250_000 and len(df.columns) <= 100) else 0
     if deduplicate and duplicate_count > 0:
         df = df.drop_duplicates().reset_index(drop=True)
 
+    pre_nulls = {str(c): int(df[c].isna().sum()) for c in df.columns}
     df, null_counts = _normalize_dataframe_chunk(
         df, type_overrides=type_overrides, null_strategy=null_strategy
+    )
+    coerced_invalid_cells = sum(
+        max(0, int(null_counts.get(c, 0)) - int(pre_nulls.get(c, 0)))
+        for c in df.columns
     )
     dq = compute_dataframe_quality(df)
     dtypes_map = {str(c): str(df[c].dtype) for c in df.columns}
     columns_meta = _build_columns_meta(df.columns, dtypes_map, display_name_map, null_counts)
     preview_rows = _format_preview_rows(df, preview_limit)
+    sheet_summaries = inspect_workbook_sheets(file_path, filename, has_header=has_header) if ext in (".xlsx", ".xls") else []
+
+    dropped_sample_rows = max(0, input_sample_rows - len(df) - (duplicate_count if deduplicate else 0))
+    warnings_list: list[str] = []
+    if coerced_invalid_cells > 0:
+        warnings_list.append(
+            f"{coerced_invalid_cells} مقدار با فرمت نامعتبر هنگام تبدیل نوع داده تشخیص داده شد (به‌صورت صریح گزارش شد)."
+        )
+    if duplicate_count > 0:
+        warnings_list.append(f"{duplicate_count} ردیف تکراری در نمونه شناسایی شد.")
+    if dropped_sample_rows > 0:
+        warnings_list.append(f"{dropped_sample_rows} ردیف به‌علت راهبرد حذف مقادیر خالی کنار گذاشته شد.")
+
+    eff_final_total = eff_total if not deduplicate else (eff_total if total_rows_override is not None else len(df))
+    row_accounting = {
+        "input_rows": eff_total,
+        "processed_rows": eff_total,
+        "valid_rows": eff_final_total,
+        "invalid_rows": dropped_sample_rows,
+        "coerced_invalid_cells": coerced_invalid_cells,
+        "duplicate_rows_in_sample": duplicate_count,
+        "warnings": warnings_list,
+    }
 
     return {
         "dataframe": df,
         "sheets": sheets,
-        "total_rows": eff_total if not deduplicate else (eff_total if total_rows_override is not None else len(df)),
+        "sheet_summaries": sheet_summaries,
+        "total_rows": eff_final_total,
         "row_count_estimated": row_count_estimated,
         "duplicate_count": duplicate_count,
         "null_counts": null_counts,
         "data_quality": dq,
+        "row_accounting": row_accounting,
         "columns": columns_meta,
         "preview_rows": preview_rows,
     }
@@ -970,6 +1063,10 @@ def stream_import_file_to_warehouse(
     deduplicate: bool = False,
     column_renames: Optional[dict[str, str]] = None,
     type_overrides: Optional[dict[str, str]] = None,
+    selected_columns: Optional[list[str]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    append_mode: bool = False,
+    sheet_tag_value: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Streams Excel (.xlsx), CSV/TSV, JSONL/NDJSON, and Log (.log/.txt) files into DuckDB in bounded batches
@@ -982,6 +1079,9 @@ def stream_import_file_to_warehouse(
 
     ext = os.path.splitext(filename.lower())[1]
     total_rows = 0
+    input_rows = 0
+    coerced_invalid_cells = 0
+    estimated_total_rows = 0
     total_nulls_per_col: dict[str, int] = {}
     display_name_map: dict[str, str] = {}
     inferred_col_types: dict[str, str] = {}
@@ -989,9 +1089,10 @@ def stream_import_file_to_warehouse(
     dtypes_map: dict[str, str] = {}
     sheets: list[str] = []
     loaded_any = False
+    wanted_cols = {sanitize_identifier(c) for c in selected_columns if c} if selected_columns else None
 
     def _flush_chunk(raw_df: pd.DataFrame, *, chunk_raw_headers: Optional[list[str]] = None) -> None:
-        nonlocal loaded_any, total_rows, ordered_cols, display_name_map, dtypes_map
+        nonlocal loaded_any, total_rows, input_rows, coerced_invalid_cells, ordered_cols, display_name_map, dtypes_map
         if raw_df is None or (len(raw_df) == 0 and loaded_any):
             return
         if not ordered_cols:
@@ -1030,6 +1131,14 @@ def stream_import_file_to_warehouse(
 
         _enforce_row_col_limits(total_rows + len(raw_df), len(ordered_cols))
 
+        if wanted_cols:
+            kept = [c for c in raw_df.columns if c in wanted_cols]
+            if kept:
+                raw_df = raw_df[kept]
+
+        input_rows += len(raw_df)
+        pre_nulls = {str(c): int(raw_df[c].isna().sum()) for c in raw_df.columns}
+
         norm_df, chunk_nulls = _normalize_dataframe_chunk(
             raw_df,
             type_overrides=type_overrides,
@@ -1038,8 +1147,13 @@ def stream_import_file_to_warehouse(
         )
         for c, ncnt in chunk_nulls.items():
             total_nulls_per_col[c] = total_nulls_per_col.get(c, 0) + int(ncnt)
+            coerced_invalid_cells += max(0, int(ncnt) - int(pre_nulls.get(c, 0)))
 
-        if not loaded_any:
+        if sheet_tag_value is not None:
+            norm_df["_sheet_name"] = sheet_tag_value
+            display_name_map.setdefault("_sheet_name", "نام شیت اکسل")
+
+        if not loaded_any and not append_mode:
             dtypes_map = {str(c): str(norm_df[c].dtype) for c in norm_df.columns}
             warehouse_engine.load_dataframe(wh_table, norm_df, mode="replace")
             loaded_any = True
@@ -1048,13 +1162,17 @@ def stream_import_file_to_warehouse(
                 if str(c) not in dtypes_map:
                     dtypes_map[str(c)] = str(norm_df[c].dtype)
             warehouse_engine.load_dataframe(wh_table, norm_df, mode="append")
+            loaded_any = True
         total_rows += len(norm_df)
+        if progress_callback is not None:
+            progress_callback(total_rows, max(estimated_total_rows, total_rows), f"در حال بارگذاری در انبار داده ({total_rows:,} ردیف)...")
 
     if ext == ".xlsx":
         ctx = _iter_xlsx_stream_batches(file_path, sheet_name, has_header, preview_only=False)
         wb = ctx["wb"]
         try:
             sheets = ctx["sheets"]
+            estimated_total_rows = max(0, int(getattr(ctx["ws"], "max_row", 0) or 0) - (1 if has_header else 0))
             raw_hdr_row = ctx["raw_header_row"]
             first_data_row = ctx["first_data_row"]
             row_iter = ctx["row_iter"]
@@ -1173,18 +1291,26 @@ def stream_import_file_to_warehouse(
             deduplicate=deduplicate,
             column_renames=column_renames,
             type_overrides=type_overrides,
+            selected_columns=selected_columns,
             preview_limit=100,
         )
-        load_res = warehouse_engine.load_dataframe(wh_table, parsed["dataframe"], mode="replace")
+        df_load = parsed["dataframe"].copy()
+        if sheet_tag_value is not None:
+            df_load["_sheet_name"] = sheet_tag_value
+        load_res = warehouse_engine.load_dataframe(wh_table, df_load, mode="append" if append_mode else "replace")
         return {
             "total_rows": load_res["total_rows"],
             "data_quality": parsed["data_quality"],
+            "row_accounting": parsed["row_accounting"],
             "columns": parsed["columns"],
             "sheets": parsed["sheets"],
         }
 
+    pre_dedup_rows = total_rows
+    dedup_removed_rows = 0
     if deduplicate and loaded_any:
         total_rows = warehouse_engine.deduplicate_table(wh_table)
+        dedup_removed_rows = max(0, pre_dedup_rows - total_rows)
 
     # Refresh authoritative column types from DuckDB after any schema evolution
     if loaded_any:
@@ -1198,16 +1324,36 @@ def stream_import_file_to_warehouse(
     dq = {
         "dq_score": round((0.7 * completeness) + 30.0, 2),
         "completeness_pct": round(completeness, 2),
-        "uniqueness_pct": 100.0,
-        "duplicate_rows": 0,
+        "uniqueness_pct": round((total_rows / max(1, pre_dedup_rows)) * 100.0, 2) if pre_dedup_rows > 0 else 100.0,
+        "duplicate_rows": dedup_removed_rows,
         "total_null_cells": total_nulls,
         "total_cells": total_rows * len(ordered_cols) if total_rows > 0 else 0,
     }
     columns_meta = _build_columns_meta(ordered_cols, dtypes_map, display_name_map, total_nulls_per_col)
 
+    dropped_invalid_rows = max(0, input_rows - pre_dedup_rows)
+    warnings_list: list[str] = []
+    if dropped_invalid_rows > 0:
+        warnings_list.append(f"{dropped_invalid_rows:,} ردیف به‌علت وجود مقدار خالی و اعمال راهبرد حذف (drop_rows) مستثنی شدند.")
+    if dedup_removed_rows > 0:
+        warnings_list.append(f"{dedup_removed_rows:,} ردیف تکراری پاکسازی شدند.")
+    if coerced_invalid_cells > 0:
+        warnings_list.append(f"{coerced_invalid_cells:,} سلول با فرمت نامعتبر هنگام تبدیل نوع داده به NULL تبدیل و گزارش شد.")
+
+    row_accounting = {
+        "input_rows": input_rows,
+        "processed_rows": input_rows,
+        "valid_rows": total_rows,
+        "invalid_rows": dropped_invalid_rows,
+        "dedup_removed_rows": dedup_removed_rows,
+        "coerced_invalid_cells": coerced_invalid_cells,
+        "warnings": warnings_list,
+    }
+
     return {
         "total_rows": total_rows,
         "data_quality": dq,
+        "row_accounting": row_accounting,
         "columns": columns_meta,
         "sheets": sheets,
     }

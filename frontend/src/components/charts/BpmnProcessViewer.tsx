@@ -6,20 +6,25 @@ import {
   ArrowRight,
   Clock,
   Database,
+  Download,
   Filter,
   Flame,
   GitBranch,
   Inbox,
   Loader2,
   Maximize2,
+  Move,
+  RotateCcw,
+  Save,
   Search,
   SlidersHorizontal,
+  Sparkles,
   UserCheck,
   Users,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, getCsrfCookie, getStoredToken } from "@/lib/api";
 import {
   BpmnAssigneeSummary,
   BpmnCartableItem,
@@ -39,6 +44,7 @@ interface Props {
   visualSpec?: Record<string, any>;
   onPointClick?: (field: string, value: any) => void;
   widgetId?: string;
+  datasetId?: string;
   publicShareToken?: string;
   activeFilters?: any[];
   crossFilters?: any[];
@@ -52,6 +58,13 @@ interface ServerDrillPayload {
   process_name: string | null;
   available_columns: string[];
   step_summary: Record<string, any>;
+  timeline?: {
+    period: string;
+    total_count: number;
+    pending_count: number;
+    avg_wait_hours: number;
+    overdue_count: number;
+  }[];
   assignees: {
     assigneeName: string;
     assigneeRole: string;
@@ -173,6 +186,7 @@ export default function BpmnProcessViewer({
   visualSpec = {},
   onPointClick,
   widgetId,
+  datasetId,
   publicShareToken,
   activeFilters = [],
   crossFilters = [],
@@ -180,12 +194,42 @@ export default function BpmnProcessViewer({
   onProcessSelect,
   onFieldMappingOverride,
 }: Props) {
-  const { locale, activeThemeMode, activeThemeTokens } = useBi();
+  const { locale, activeThemeMode, activeThemeTokens, showToast } = useBi();
   const isFa = locale === "fa";
   const isDark = activeThemeMode === "dark";
 
   const [localFieldOverrides, setLocalFieldOverrides] = useState<Record<string, string | null>>({});
   const [showMapper, setShowMapper] = useState<boolean>(false);
+  const [showFormulaPanel, setShowFormulaPanel] = useState<boolean>(false);
+  const [dragMode, setDragMode] = useState<boolean>(false);
+  const [customPositions, setCustomPositions] = useState<Record<string, { x: number; y: number }>>({});
+  const [layoutDirty, setLayoutDirty] = useState<boolean>(false);
+  const [savingLayout, setSavingLayout] = useState<boolean>(false);
+  const [exportingDrill, setExportingDrill] = useState<boolean>(false);
+
+  // Bottleneck formula editor state
+  const [ruleName, setRuleName] = useState<string>("فرمول سفارشی گلوگاه");
+  const [ruleThreshold, setRuleThreshold] = useState<number>(60);
+  const [ruleWeights, setRuleWeights] = useState<Record<string, number>>({
+    avg_wait: 0.3,
+    max_wait: 0.15,
+    pending_count: 0.2,
+    overdue_ratio: 0.2,
+    rework_rate: 0.1,
+    volume_share: 0.05,
+  });
+  const [savingRule, setSavingRule] = useState<boolean>(false);
+
+  const dragStateRef = React.useRef<{
+    nodeId: string;
+    startClientX: number;
+    startClientY: number;
+    origX: number;
+    origY: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = React.useRef<boolean>(false);
+  const svgRef = React.useRef<SVGSVGElement | null>(null);
 
   const bpmnConfig: BpmnWidgetConfig = useMemo(() => {
     const base = {
@@ -221,8 +265,138 @@ export default function BpmnProcessViewer({
     [rows, columns, bpmnConfig, heatmapMetric, bpmnAnalytics]
   );
 
-  const { graph, stepMap, minMetricValue, maxMetricValue, totalPendingRequests, overallAvgWaitHours, bottleneckStep, mapping } =
+  const { graph: rawGraph, stepMap, minMetricValue, maxMetricValue, totalPendingRequests, overallAvgWaitHours, bottleneckStep, mapping } =
     analytics;
+
+  // Hydrate saved drag-and-drop coordinates & active rule from backend payload
+  useEffect(() => {
+    if (bpmnAnalytics?.saved_layout?.node_positions) {
+      setCustomPositions(bpmnAnalytics.saved_layout.node_positions);
+      setLayoutDirty(false);
+    } else {
+      setCustomPositions({});
+      setLayoutDirty(false);
+    }
+    if (bpmnAnalytics?.active_rule) {
+      setRuleName(bpmnAnalytics.active_rule.name || "فرمول سفارشی گلوگاه");
+      setRuleThreshold(Number(bpmnAnalytics.active_rule.threshold_score || 60));
+      const w = bpmnAnalytics.active_rule.formula_json?.weights;
+      if (w && typeof w === "object") {
+        setRuleWeights((prev) => ({ ...prev, ...w }));
+      }
+    }
+  }, [bpmnAnalytics?.saved_layout, bpmnAnalytics?.active_rule, bpmnAnalytics?.active_process]);
+
+  const graph = useMemo(() => {
+    if (!customPositions || Object.keys(customPositions).length === 0) return rawGraph;
+    return {
+      ...rawGraph,
+      nodes: rawGraph.nodes.map((n) => {
+        const p = customPositions[n.id] || customPositions[n.stepKey];
+        return p ? { ...n, x: p.x, y: p.y } : n;
+      }),
+    };
+  }, [rawGraph, customPositions]);
+
+  const handleSaveLayout = async (reset: boolean = false) => {
+    if (!datasetId) return;
+    setSavingLayout(true);
+    try {
+      await apiFetch("/process-intelligence/bpmn-layout", {
+        method: "PUT",
+        body: JSON.stringify({
+          dataset_id: datasetId,
+          widget_id: widgetId || null,
+          process_name: bpmnAnalytics?.active_process || null,
+          node_positions: reset ? {} : customPositions,
+          zoom,
+          reset,
+        }),
+      });
+      if (reset) setCustomPositions({});
+      setLayoutDirty(false);
+      showToast(reset ? (isFa ? "چیدمان به حالت خودکار بازنشانی شد" : "Layout reset") : (isFa ? "چیدمان BPMN ذخیره شد" : "BPMN layout saved"));
+    } catch (err: any) {
+      showToast(err.message || "Error saving layout");
+    } finally {
+      setSavingLayout(false);
+    }
+  };
+
+  const handleSaveBottleneckRule = async () => {
+    if (!datasetId) return;
+    setSavingRule(true);
+    try {
+      await apiFetch(`/process-intelligence/datasets/${datasetId}/bottleneck-rules`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: ruleName,
+          process_name: bpmnAnalytics?.active_process || null,
+          weights: ruleWeights,
+          threshold_score: ruleThreshold,
+          severity: "high",
+          is_active: true,
+        }),
+      });
+      showToast(isFa ? "فرمول تشخیص گلوگاه ذخیره شد و در تحلیل بعدی اعمال می‌شود" : "Bottleneck formula saved");
+      setShowFormulaPanel(false);
+      if (onProcessSelect && bpmnAnalytics?.active_process) {
+        onProcessSelect(bpmnAnalytics.active_process);
+      } else if (onProcessSelect) {
+        onProcessSelect("__ALL__");
+      }
+    } catch (err: any) {
+      showToast(err.message || "Error saving rule");
+    } finally {
+      setSavingRule(false);
+    }
+  };
+
+  const handleExportDrillExcel = async () => {
+    if (!widgetId || !activeStepMetrics) return;
+    setExportingDrill(true);
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const tok = getStoredToken();
+      if (tok) headers["Authorization"] = `Bearer ${tok}`;
+      const csrf = getCsrfCookie();
+      if (csrf) headers["X-CSRF-Token"] = csrf;
+      const cleanOverrides: Record<string, string> = {};
+      for (const [k, v] of Object.entries(localFieldOverrides)) {
+        if (v) cleanOverrides[k] = v;
+      }
+      const res = await fetch(`/api/v1/dashboards/widgets/${widgetId}/bpmn-drill/export`, {
+        method: "POST",
+        credentials: "include",
+        headers,
+        body: JSON.stringify({
+          step_name: activeStepMetrics.stepKey,
+          process_name: bpmnAnalytics?.active_process || null,
+          assignee_name: selectedAssignee,
+          pending_only: !showAllStatusesInDrill && (activeStepMetrics.pendingCount ?? 0) > 0,
+          search: drillSearch.trim() || null,
+          limit: 500,
+          offset: 0,
+          active_filters: activeFilters,
+          cross_filters: crossFilters,
+          field_overrides: Object.keys(cleanOverrides).length > 0 ? cleanOverrides : null,
+        }),
+      });
+      if (!res.ok) throw new Error(`Export failed (${res.status})`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `bpmn_cartable_${activeStepMetrics.stepKey}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast(isFa ? "فایل اکسل کارتابل دانلود شد" : "Excel exported");
+    } catch (err: any) {
+      showToast(err.message || "Export failed");
+    } finally {
+      setExportingDrill(false);
+    }
+  };
 
   const availableCols = useMemo(
     () => (bpmnAnalytics?.available_columns?.length ? bpmnAnalytics.available_columns : columns || []),
@@ -466,6 +640,17 @@ export default function BpmnProcessViewer({
           </div>
 
           <div className="flex items-center gap-1.5">
+            {widgetId && !publicShareToken && (
+              <button
+                type="button"
+                disabled={exportingDrill}
+                onClick={handleExportDrillExcel}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md border text-[11px] font-semibold text-emerald-500 border-emerald-500/40 hover:bg-emerald-500/10 disabled:opacity-50"
+              >
+                <Download className="w-3 h-3" />
+                {exportingDrill ? "..." : isFa ? "خروجی اکسل" : "Excel"}
+              </button>
+            )}
             {availableCols.length > 0 && (
               <button
                 type="button"
@@ -507,18 +692,28 @@ export default function BpmnProcessViewer({
           </div>
           <div className="p-2 rounded-lg border" style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}>
             <div className="text-[10px]" style={{ color: activeThemeTokens.muted_text }}>
-              {isFa ? "میانگین زمان انتظار" : "Avg Wait Time"}
+              {isFa ? "میانگین / میانه انتظار" : "Avg / Median Wait"}
             </div>
             <div className="text-sm font-bold mt-0.5 text-amber-500">
               {effSummary.avgWaitHours} {isFa ? "ساعت" : "hrs"}
+              {serverDrill?.step_summary?.median_wait_hours !== undefined && (
+                <span className="text-[10px] opacity-70 ms-1">
+                  ({isFa ? "میانه:" : "Med:"} {serverDrill.step_summary.median_wait_hours})
+                </span>
+              )}
             </div>
           </div>
           <div className="p-2 rounded-lg border" style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}>
             <div className="text-[10px]" style={{ color: activeThemeTokens.muted_text }}>
-              {isFa ? "بیشترین زمان انتظار" : "Max Wait Time"}
+              {isFa ? "بیشترین / P95 انتظار" : "Max / P95 Wait"}
             </div>
             <div className="text-sm font-bold mt-0.5 text-red-500">
               {effSummary.maxWaitHours} {isFa ? "ساعت" : "hrs"}
+              {serverDrill?.step_summary?.p95_wait_hours !== undefined && (
+                <span className="text-[10px] opacity-70 ms-1">
+                  (P95: {serverDrill.step_summary.p95_wait_hours})
+                </span>
+              )}
             </div>
           </div>
           <div className="p-2 rounded-lg border" style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}>
@@ -527,10 +722,44 @@ export default function BpmnProcessViewer({
             </div>
             <div className="text-sm font-bold mt-0.5">
               {effSummary.overdueCount.toLocaleString(isFa ? "fa-IR" : "en-US")}{" "}
-              <span className="text-[10px] opacity-65">(SLA: {effSummary.slaHours}h)</span>
+              <span className="text-[10px] opacity-65">
+                (SLA: {effSummary.slaHours}h{serverDrill?.step_summary?.sla_breach_pct !== undefined ? ` · ${serverDrill.step_summary.sla_breach_pct}%` : ""})
+              </span>
             </div>
           </div>
         </div>
+
+        {/* Step Timeline Strip */}
+        {serverDrill?.timeline && serverDrill.timeline.length > 0 && (
+          <div className="p-2 rounded-lg border shrink-0 space-y-1" style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}>
+            <div className="text-[10px] font-bold flex items-center justify-between" style={{ color: activeThemeTokens.muted_text }}>
+              <span>{isFa ? "خط زمانی و روند ماهانه ورود درخواست به این گام" : "Step Timeline"}</span>
+              <span>{serverDrill.timeline.length} {isFa ? "دوره" : "periods"}</span>
+            </div>
+            <div className="flex items-end gap-1.5 h-12 overflow-x-auto pb-0.5">
+              {(() => {
+                const maxCnt = Math.max(...serverDrill.timeline!.map((t) => t.total_count || 1), 1);
+                return serverDrill.timeline!.map((pt) => {
+                  const pct = Math.max(12, Math.round((pt.total_count / maxCnt) * 100));
+                  return (
+                    <div key={pt.period} className="flex flex-col items-center min-w-[44px] flex-1" title={`${pt.period}: ${pt.total_count} درخواست، میانگین ${pt.avg_wait_hours}h`}>
+                      <div className="w-full h-8 flex items-end justify-center">
+                        <div
+                          className="w-5 rounded-t"
+                          style={{
+                            height: `${pct}%`,
+                            backgroundColor: pt.overdue_count > 0 ? "#f97316" : activeThemeTokens.primary,
+                          }}
+                        />
+                      </div>
+                      <span className="text-[9px] font-mono opacity-75 truncate">{pt.period.slice(2)}</span>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        )}
 
         {/* Assignees Breakdown + Detailed Pending Requests Table */}
         <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 gap-2.5 overflow-hidden">
@@ -914,6 +1143,60 @@ export default function BpmnProcessViewer({
             </select>
           )}
 
+          {datasetId && !publicShareToken && (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowFormulaPanel((s) => !s)}
+                className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-semibold transition ${
+                  showFormulaPanel ? "bg-violet-500/15 border-violet-500/50 text-violet-500" : ""
+                }`}
+                style={showFormulaPanel ? undefined : { borderColor: activeThemeTokens.border }}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                {isFa ? "فرمول گلوگاه" : "Bottleneck Rule"}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setDragMode((d) => !d)}
+                className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-semibold transition ${
+                  dragMode ? "bg-emerald-500/15 border-emerald-500/50 text-emerald-500" : ""
+                }`}
+                style={dragMode ? undefined : { borderColor: activeThemeTokens.border }}
+                title={isFa ? "جابه‌جایی و چیدمان دستی گام‌ها روی نمودار" : "Drag & drop BPMN steps"}
+              >
+                <Move className="w-3.5 h-3.5" />
+                {isFa ? (dragMode ? "چیدمان فعال" : "جابه‌جایی گام") : "Drag Nodes"}
+              </button>
+
+              {layoutDirty && (
+                <button
+                  type="button"
+                  disabled={savingLayout}
+                  onClick={() => handleSaveLayout(false)}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-600 text-white text-[11px] font-semibold hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  <Save className="w-3 h-3" />
+                  {isFa ? "ذخیره چیدمان" : "Save Layout"}
+                </button>
+              )}
+
+              {Object.keys(customPositions).length > 0 && (
+                <button
+                  type="button"
+                  disabled={savingLayout}
+                  onClick={() => handleSaveLayout(true)}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-semibold hover:bg-red-500/10"
+                  style={{ borderColor: activeThemeTokens.border }}
+                  title={isFa ? "بازنشانی به چیدمان خودکار" : "Reset auto layout"}
+                >
+                  <RotateCcw className="w-3 h-3" />
+                </button>
+              )}
+            </>
+          )}
+
           <div className="flex items-center border rounded-md overflow-hidden" style={{ borderColor: activeThemeTokens.border }}>
             <button type="button" onClick={() => setZoom((z) => Math.max(0.65, Math.round((z - 0.15) * 100) / 100))} className="p-1 hover:bg-blue-500/10" title="Zoom Out">
               <ZoomOut className="w-3.5 h-3.5" />
@@ -929,6 +1212,83 @@ export default function BpmnProcessViewer({
       </div>
 
       {renderFieldMapperPanel()}
+
+      {showFormulaPanel && datasetId && (
+        <div
+          className="p-3 rounded-lg border space-y-2.5 shrink-0 text-[11px]"
+          style={{ borderColor: activeThemeTokens.border, backgroundColor: activeThemeTokens.surface }}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-bold text-violet-500">
+              {isFa ? "تنظیم فرمول و آستانه تشخیص گلوگاه فرآیندی" : "Custom Bottleneck Formula Builder"}
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              <input
+                value={ruleName}
+                onChange={(e) => setRuleName(e.target.value)}
+                placeholder={isFa ? "نام قاعده" : "Rule Name"}
+                className="px-2 py-1 rounded border bg-transparent text-[11px]"
+                style={{ borderColor: activeThemeTokens.border }}
+              />
+              <label className="flex items-center gap-1">
+                <span>{isFa ? "آستانه امتیاز:" : "Threshold:"}</span>
+                <input
+                  type="number"
+                  min={10}
+                  max={95}
+                  value={ruleThreshold}
+                  onChange={(e) => setRuleThreshold(Number(e.target.value) || 60)}
+                  className="w-16 px-1.5 py-1 rounded border bg-transparent text-[11px]"
+                  style={{ borderColor: activeThemeTokens.border }}
+                />
+              </label>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-6 gap-2">
+            {[
+              { k: "avg_wait", label: isFa ? "میانگین انتظار" : "Avg Wait" },
+              { k: "max_wait", label: isFa ? "حداکثر انتظار" : "Max Wait" },
+              { k: "pending_count", label: isFa ? "مانده کارتابل" : "Pending" },
+              { k: "overdue_ratio", label: isFa ? "نرخ نقض SLA" : "SLA Breach" },
+              { k: "rework_rate", label: isFa ? "نرخ دوباره‌کاری" : "Rework" },
+              { k: "volume_share", label: isFa ? "سهم حجم" : "Volume" },
+            ].map((item) => (
+              <label key={item.k} className="space-y-1">
+                <span className="block text-[10px]" style={{ color: activeThemeTokens.muted_text }}>
+                  {item.label} ({Math.round((ruleWeights[item.k] ?? 0) * 100)}%)
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={ruleWeights[item.k] ?? 0}
+                  onChange={(e) => setRuleWeights((prev) => ({ ...prev, [item.k]: Number(e.target.value) }))}
+                  className="w-full"
+                />
+              </label>
+            ))}
+          </div>
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setShowFormulaPanel(false)}
+              className="px-2.5 py-1 rounded border text-[11px]"
+              style={{ borderColor: activeThemeTokens.border }}
+            >
+              {isFa ? "انصراف" : "Cancel"}
+            </button>
+            <button
+              type="button"
+              disabled={savingRule}
+              onClick={handleSaveBottleneckRule}
+              className="px-3 py-1 rounded bg-violet-600 text-white font-semibold hover:bg-violet-700 disabled:opacity-50"
+            >
+              {savingRule ? "..." : isFa ? "ذخیره و محاسبه مجدد گلوگاه" : "Save & Recalculate"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Interactive BPMN Canvas */}
       <div
@@ -946,9 +1306,39 @@ export default function BpmnProcessViewer({
           style={{ width: `${Math.round(bounds.width * zoom)}px`, height: `${Math.max(260, Math.round(bounds.height * zoom))}px` }}
         >
           <svg
+            ref={svgRef}
             viewBox={`${bounds.minX} ${bounds.minY} ${bounds.width} ${bounds.height}`}
             className="w-full h-full select-none"
             style={{ fontFamily: "Vazirmatn, Inter, sans-serif" }}
+            onPointerMove={(e) => {
+              const d = dragStateRef.current;
+              if (!d || !svgRef.current) return;
+              const rect = svgRef.current.getBoundingClientRect();
+              const scaleX = rect.width > 0 ? bounds.width / rect.width : 1;
+              const scaleY = rect.height > 0 ? bounds.height / rect.height : 1;
+              const dx = (e.clientX - d.startClientX) * scaleX;
+              const dy = (e.clientY - d.startClientY) * scaleY;
+              if (Math.hypot(e.clientX - d.startClientX, e.clientY - d.startClientY) >= 5) {
+                d.moved = true;
+                suppressClickRef.current = true;
+              }
+              if (d.moved) {
+                setCustomPositions((prev) => ({
+                  ...prev,
+                  [d.nodeId]: { x: Math.round(d.origX + dx), y: Math.round(d.origY + dy) },
+                }));
+                setLayoutDirty(true);
+              }
+            }}
+            onPointerUp={() => {
+              dragStateRef.current = null;
+              setTimeout(() => {
+                suppressClickRef.current = false;
+              }, 30);
+            }}
+            onPointerLeave={() => {
+              dragStateRef.current = null;
+            }}
           >
             <defs>
               <filter id="bpmnHeatGlow" x="-40%" y="-40%" width="180%" height="180%">
@@ -1129,7 +1519,20 @@ export default function BpmnProcessViewer({
               return (
                 <g
                   key={node.id}
+                  onPointerDown={(e) => {
+                    if (!dragMode) return;
+                    e.stopPropagation();
+                    dragStateRef.current = {
+                      nodeId: node.id,
+                      startClientX: e.clientX,
+                      startClientY: e.clientY,
+                      origX: node.x,
+                      origY: node.y,
+                      moved: false,
+                    };
+                  }}
                   onClick={() => {
+                    if (suppressClickRef.current) return;
                     if (st) {
                       setSelectedStepKey(st.stepKey);
                       setDrillOffset(0);
@@ -1137,7 +1540,7 @@ export default function BpmnProcessViewer({
                   }}
                   onMouseEnter={() => setHoveredStepId(node.id)}
                   onMouseLeave={() => setHoveredStepId((cur) => (cur === node.id ? null : cur))}
-                  className="cursor-pointer"
+                  className={dragMode ? "cursor-grab active:cursor-grabbing" : "cursor-pointer"}
                 >
                   <rect
                     x={node.x}
@@ -1207,41 +1610,47 @@ export default function BpmnProcessViewer({
           </svg>
         </div>
 
-        {/* Hover Floating Tooltip */}
+        {/* Rich 11-Metric Hover Floating Tooltip */}
         {hoveredStepMetrics && (
           <div
             dir={isFa ? "rtl" : "ltr"}
-            className="absolute top-2 end-2 z-10 p-2.5 rounded-lg border shadow-lg text-[11px] max-w-[245px] pointer-events-none"
+            className="absolute top-2 end-2 z-10 p-3 rounded-xl border shadow-xl text-[11px] w-[275px] pointer-events-none"
             style={{
               backgroundColor: activeThemeTokens.card_bg,
               borderColor: activeThemeTokens.border,
               color: activeThemeTokens.text,
             }}
           >
-            <div className="font-bold mb-1">{hoveredStepMetrics.stepLabel}</div>
-            <div className="space-y-0.5 text-[10px]">
-              <div>
-                {isFa ? "درخواست در گام (کارتابل):" : "Pending in step:"}{" "}
-                <b>{hoveredStepMetrics.pendingCount.toLocaleString(isFa ? "fa-IR" : "en-US")}</b>{" "}
-                {isFa
-                  ? `(کل عبوری: ${hoveredStepMetrics.totalCount.toLocaleString("fa-IR")})`
-                  : `(Total: ${hoveredStepMetrics.totalCount})`}
-              </div>
-              <div>
-                {isFa ? "میانگین زمان انتظار:" : "Avg wait time:"}{" "}
-                <b>{hoveredStepMetrics.avgWaitHours} {isFa ? "ساعت" : "hrs"}</b>
-              </div>
-              <div>
-                {isFa ? "بیشترین زمان انتظار:" : "Max wait time:"}{" "}
-                <b>{hoveredStepMetrics.maxWaitHours} {isFa ? "ساعت" : "hrs"}</b>
-              </div>
-              <div>
-                {isFa ? "افراد درگیر در کارتابل:" : "Assignees:"}{" "}
-                <b>{hoveredStepMetrics.assignees.length}</b>
+            <div className="flex items-center justify-between gap-2 mb-1.5 pb-1 border-b" style={{ borderColor: activeThemeTokens.border }}>
+              <span className="font-bold truncate">{hoveredStepMetrics.stepLabel}</span>
+              {hoveredStepMetrics.isBottleneck && (
+                <span className="px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 text-[9px] font-bold shrink-0">
+                  {isFa ? "گلوگاه" : "Bottleneck"}
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px]">
+              <div>{isFa ? "۱. کل درخواست‌ها:" : "1. Total:"} <b>{hoveredStepMetrics.totalCount.toLocaleString(isFa ? "fa-IR" : "en-US")}</b></div>
+              <div>{isFa ? "۲. مانده کارتابل:" : "2. Pending:"} <b>{hoveredStepMetrics.pendingCount.toLocaleString(isFa ? "fa-IR" : "en-US")}</b></div>
+              <div>{isFa ? "۳. تکمیل‌شده:" : "3. Completed:"} <b>{hoveredStepMetrics.completedCount.toLocaleString(isFa ? "fa-IR" : "en-US")}</b></div>
+              <div>{isFa ? "۴. میانگین انتظار:" : "4. Avg Wait:"} <b>{hoveredStepMetrics.avgWaitHours} س</b></div>
+              <div>{isFa ? "۵. حداقل انتظار:" : "5. Min Wait:"} <b>{hoveredStepMetrics.minWaitHours} س</b></div>
+              <div>{isFa ? "۶. حداکثر انتظار:" : "6. Max Wait:"} <b>{hoveredStepMetrics.maxWaitHours} س</b></div>
+              <div>{isFa ? "۷. سقف SLA:" : "7. SLA Limit:"} <b>{hoveredStepMetrics.slaHours} س</b></div>
+              <div>{isFa ? "۸. نقض SLA:" : "8. SLA Breach:"} <b className={hoveredStepMetrics.overdueCount > 0 ? "text-red-500" : ""}>{hoveredStepMetrics.overdueCount} ({hoveredStepMetrics.slaBreachPct}%)</b></div>
+              <div>{isFa ? "۹. دوباره‌کاری:" : "9. Rework:"} <b>{hoveredStepMetrics.reworkCount} ({hoveredStepMetrics.reworkRate}%)</b></div>
+              <div>{isFa ? "۱۰. افراد کارتابل:" : "10. Assignees:"} <b>{hoveredStepMetrics.assigneeCount}</b></div>
+              <div className="col-span-2 pt-0.5 flex items-center justify-between">
+                <span>{isFa ? "۱۱. امتیاز گلوگاه:" : "11. Bottleneck Score:"}</span>
+                <b className={hoveredStepMetrics.isBottleneck ? "text-red-500" : "text-amber-500"}>
+                  {hoveredStepMetrics.bottleneckScore} / 100
+                </b>
               </div>
             </div>
             <div className="mt-1.5 pt-1 border-t text-[10px] font-semibold text-blue-500" style={{ borderColor: activeThemeTokens.border }}>
-              {isFa ? "برای دریل‌داون کارتابل و اسامی افراد کلیک کنید" : "Click step to drill into assignee cartable"}
+              {dragMode
+                ? (isFa ? "در حالت جابه‌جایی هستید؛ گام را بکشید" : "Drag to reposition node")
+                : (isFa ? "برای دریل‌داون کارتابل، Timeline و اکسل کلیک کنید" : "Click step for cartable, timeline & Excel")}
             </div>
           </div>
         )}

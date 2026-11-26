@@ -7,6 +7,7 @@ import {
   evaluateDemoStandardAndBusinessKpis,
   formatKpiVal,
 } from "@/lib/vercelDemoKpi";
+import { APP_VERSION, PREVIOUS_VERSION, RELEASE_NOTES, SCHEMA_VERSION } from "@/lib/version";
 
 const demoData = rawDemoData as any;
 
@@ -1878,9 +1879,11 @@ function handleAssistantDemo(body: any, username: string | null) {
     ].some((k) => normLow.includes(k));
     const hasDash = ["داشبورد", "dashboard", "صفحه گزارش"].some((k) => normLow.includes(k));
     const hasWidget = ["ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget", "bpmn", "گلوگاه", "گردش کار"].some((k) => normLow.includes(k));
+    const isQa = ["چقدر", "کدام", "چند ", "میانگین", "مجموع", "جمع ", "بیشترین", "کمترین", "چرا", "؟", "?"].some((k) => normLow.includes(k));
 
     if (body?.widget_id || isEditKw) effMode = "edit";
     else if (hasDash && !hasWidget) effMode = "create_dashboard";
+    else if (isQa && !hasWidget) effMode = "qa";
     else if (hasWidget || ["از روی منبع", "بر اساس", "به تفکیک"].some((k) => normLow.includes(k))) effMode = "add_widget";
   }
 
@@ -1894,6 +1897,7 @@ function handleAssistantDemo(body: any, username: string | null) {
           key: "mode",
           question: "یکی از کارهای زیر را انتخاب کنید:",
           options: [
+            { value: "qa", label: "پرسش و تحلیل مستقیم از داده‌ها (Q&A)", hint: "پاسخ محاسبه‌شده با منبع واقعی" },
             { value: "create_dashboard", label: "ساخت یک داشبورد کامل جدید", hint: "با چند نمودار و کارت خلاصه آماده" },
             { value: "add_widget", label: "افزودن یک نمودار یا عدد آماری جدید", hint: "به داشبورد فعلی یا دلخواه" },
             { value: "edit", label: "ویرایش داشبورد یا نمودارهای موجود", hint: "تغییر رنگ/ظاهر، نام، نوع نمودار یا حذف" },
@@ -1904,6 +1908,24 @@ function handleAssistantDemo(body: any, username: string | null) {
     };
   }
 
+  if (effMode === "qa") {
+    const wRes: any = handleTextToWidgetDemo(body, username);
+    if (wRes.status === "needs_clarification") return wRes;
+    const rows = wRes.preview_data?.rows || [];
+    const cols = wRes.preview_data?.columns || [];
+    return {
+      status: "qa_answered",
+      action: "qa",
+      message_fa: rows.length
+        ? `پاسخ محاسبه‌شده از داده‌ها (${rows.length} نتیجه): ${cols.slice(0, 2).map((c: string) => `${c}: ${rows[0][c]}`).join(" · ")}`
+        : "داده‌ای یافت نشد.",
+      generated_sql: wRes.generated_sql || "-- Preview Demo SQL",
+      recommended_chart_type: wRes.widget_spec?.chart_type || "bar",
+      source_datasets: ["Demo Dataset"],
+      confidence: 0.9,
+      preview_data: wRes.preview_data,
+    };
+  }
   if (effMode === "create_dashboard") return handleCreateDashboardDemo(body);
   if (effMode === "edit") return handleEditDashboardOrWidgetDemo(body, username);
   return { action: "add_widget", ...handleTextToWidgetDemo(body, username) };
@@ -2274,6 +2296,12 @@ export async function handleVercelDemoApi(
   if (method === "GET" && segments[0] === "dashboards" && segments[2] === "versions") {
     return { status: 200, body: [{ id: "v1", version_number: 1, label: "Baseline Seeded Snapshot", created_at: "2026-11-16T08:30:00Z" }] };
   }
+  if (method === "GET" && segments[0] === "dashboards" && segments[2] === "named-layouts") {
+    return { status: 200, body: [] };
+  }
+  if (method === "GET" && path === "/actions") {
+    return { status: 200, body: [] };
+  }
   if (method === "GET" && segments[0] === "dashboards" && segments[2] === "comments") {
     return { status: 200, body: [{ id: "c1", widget_id: null, author_name: "System Administrator", content: "Q4 executive KPIs synced with warehouse.", created_at: "2026-11-16T09:00:00Z" }] };
   }
@@ -2283,6 +2311,24 @@ export async function handleVercelDemoApi(
   }
 
   // Datasets & Semantic Layer
+  if (method === "GET" && path === "/about") {
+    return {
+      status: 200,
+      body: {
+        name: "Enterprise BI Platform",
+        version: APP_VERSION,
+        previous_version: PREVIOUS_VERSION,
+        schema_version: SCHEMA_VERSION,
+        releases: RELEASE_NOTES,
+      },
+    };
+  }
+  if (method === "GET" && path === "/jobs") {
+    return { status: 200, body: [] };
+  }
+  if (method === "GET" && segments[0] === "jobs" && segments[1]) {
+    return { status: 200, body: { id: segments[1], status: "completed", progress_pct: 100, stage_label: "تکمیل‌شده" } };
+  }
   if (method === "GET" && path === "/datasets") {
     return { status: 200, body: demoData.datasets || [] };
   }
@@ -2297,6 +2343,21 @@ export async function handleVercelDemoApi(
   }
   if (method === "GET" && segments[0] === "datasets" && segments[2] === "lineage") {
     return { status: 200, body: demoData.dataset_lineage?.[segments[1]] || { nodes: [], edges: [] } };
+  }
+  if (method === "GET" && segments[0] === "datasets" && segments[2] === "analytics-diagnostics") {
+    return {
+      status: 200,
+      body: {
+        dataset_id: segments[1],
+        duplicate_rows: 0,
+        incomplete_columns: [],
+        outliers: [],
+        correlations: [],
+        period_comparison: null,
+        trend_anomalies: [],
+        row_accounting: { input_rows: 100, processed_rows: 100, valid_rows: 100, invalid_rows: 0 },
+      },
+    };
   }
   if (method === "GET" && segments[0] === "datasets" && segments[2] === "preview") {
     const limit = Number(searchParams.get("limit") || 30);
@@ -2346,11 +2407,19 @@ export async function handleVercelDemoApi(
         status: 200,
         body: {
           sheets: parsed.sheets,
+          sheet_summaries: (parsed.sheets || []).map((s: string) => ({ sheet_name: s, estimated_rows: parsed.total_rows })),
           selected_sheet: parsed.selected_sheet,
           total_rows: parsed.total_rows,
           duplicate_count: parsed.duplicate_count,
           columns: parsed.columns,
           preview_rows: parsed.preview_rows,
+          row_accounting: {
+            input_rows: parsed.total_rows,
+            processed_rows: parsed.total_rows,
+            valid_rows: parsed.total_rows,
+            invalid_rows: 0,
+            warnings: [],
+          },
         },
       };
     }
@@ -2379,6 +2448,12 @@ export async function handleVercelDemoApi(
         created_at: new Date().toISOString(),
       },
     };
+  }
+  if (method === "GET" && path === "/data-sources/composite-datasets") {
+    return { status: 200, body: [] };
+  }
+  if (method === "POST" && path === "/data-sources/composite-datasets") {
+    return { status: 200, body: { composite_id: `comp_${Date.now()}`, total_rows: 0, status: "completed" } };
   }
   if (method === "GET" && path === "/data-sources") {
     return { status: 200, body: demoData.data_sources || [] };
@@ -2435,6 +2510,19 @@ export async function handleVercelDemoApi(
   // RBAC & Security
   if (method === "GET" && path === "/rbac/users") {
     return { status: 200, body: demoData.rbac_users || [] };
+  }
+  if (method === "GET" && segments[0] === "rbac" && segments[1] === "users" && segments[3] === "effective-permissions") {
+    const u = (demoData.rbac_users || []).find((x: any) => x.id === segments[2]);
+    return {
+      status: 200,
+      body: {
+        user_id: segments[2],
+        username: u?.username || "demo",
+        roles: u?.roles || [],
+        effective_permissions: [{ resource_type: "*", resource_id: "*", action: "*", effect: "allow", source: "demo" }],
+        has_admin_wildcard: true,
+      },
+    };
   }
   if (method === "GET" && path === "/rbac/roles") {
     return { status: 200, body: demoData.rbac_roles || { roles: [], catalog: [] } };
@@ -2898,8 +2986,15 @@ export async function handleVercelDemoApi(
 
   // Process Intelligence (Vercel Preview Demo over real sample rows)
   if (segments[0] === "process-intelligence") {
+    if (segments[1] === "bpmn-layout") {
+      return { status: 200, body: { node_positions: body?.node_positions || {}, zoom: body?.zoom || 1 } };
+    }
     if (segments[1] === "datasets" && segments[2]) {
       const dsId = segments[2];
+      if (segments[3] === "bottleneck-rules") {
+        if (method === "GET") return { status: 200, body: { presets: [], rules: [] } };
+        return { status: 200, body: { id: "demo_rule", ...(body || {}) } };
+      }
       const tbl = getTableForDataset(dsId, extraDatasets);
       const cols = (tbl.columns || []).map((c) => ({ field_name: c, display_name: c, type: "string" }));
       const bpmnInf = inferBpmnFieldMapping(tbl.columns || []);
@@ -3120,7 +3215,17 @@ export async function handleVercelDemoApi(
       };
     }
     if (segments[1] === "events") return { status: 200, body: { total: 0, can_view_raw: false, events: [] } };
-    if (segments[1] === "unparsed" || segments[1] === "collectors" || segments[1] === "alerts" || segments[1] === "incidents") {
+    if (segments[1] === "classification-rules") {
+      return { status: 200, body: { categories: [], rules: [] } };
+    }
+    if (
+      segments[1] === "unparsed" ||
+      segments[1] === "collectors" ||
+      segments[1] === "alerts" ||
+      segments[1] === "incidents" ||
+      segments[1] === "vulnerabilities" ||
+      segments[1] === "exposures"
+    ) {
       return { status: 200, body: [] };
     }
   }

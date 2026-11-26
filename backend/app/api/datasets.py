@@ -11,7 +11,7 @@ from app.core.permissions import permission_resolver
 from app.core.rls_cls import build_data_security_context
 from app.core.tenant import get_dataset_for_org
 from app.database import get_db
-from app.engines.data_engine import DataProfiler
+from app.engines.data_engine import DataDiagnosticsEngine, DataProfiler
 from app.engines.descriptive_builder import _estimate_join_explosion
 from app.engines.filter_engine import get_cascading_filter_options
 from app.engines.query_engine import execute_dataset_sql
@@ -100,6 +100,7 @@ def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(
             "columns_count": len(visible_fields),
             "last_refreshed_at": d.last_refreshed_at,
             "freshness_status": d.freshness_status,
+            "profile_json": d.profile_json or {},
             "is_uploaded_excel": bool(d.warehouse_table and d.warehouse_table.startswith("wh_file_")),
             "fields": [
                 {
@@ -377,6 +378,31 @@ def add_calculated_field(
     db.add(f)
     db.commit()
     return {"id": f.id, "field_name": f.field_name}
+
+
+@router.get("/{dataset_id}/analytics-diagnostics")
+def analytics_diagnostics_get(
+    dataset_id: str,
+    date_column: Optional[str] = None,
+    metric_column: Optional[str] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
+    sec_ctx = build_data_security_context(db, user, ds.id)
+    res = DataDiagnosticsEngine.analyze(
+        ds.warehouse_table,
+        sec_ctx=sec_ctx,
+        date_column=date_column,
+        metric_column=metric_column,
+    )
+    return {
+        "dataset_id": ds.id,
+        "dataset_name": ds.name,
+        "row_accounting": (ds.profile_json or {}).get("row_accounting"),
+        **res,
+    }
 
 
 @router.get("/{dataset_id}/lineage")

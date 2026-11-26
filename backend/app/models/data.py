@@ -227,3 +227,29 @@ class DataLineage(Base, TimestampMixin):
     target_type: Mapped[str] = mapped_column(String(48), nullable=False)
     target_id: Mapped[str] = mapped_column(String(64), nullable=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class CompositeDataset(Base, TimestampMixin):
+    """Shared Data Source Layer: multi-table/view query & join definition materialized as a Dataset."""
+    __tablename__ = "composite_datasets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    data_source_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("data_sources.id", ondelete="CASCADE"), nullable=False
+    )
+    dataset_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(180), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    definition_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    refresh_schedule: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
+    last_refreshed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )

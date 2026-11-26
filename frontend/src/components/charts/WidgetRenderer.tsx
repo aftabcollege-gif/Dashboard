@@ -18,6 +18,7 @@ interface Props {
   onPointClick?: (field: string, value: any) => void;
   chartInstanceRef?: React.MutableRefObject<echarts.ECharts | null>;
   widgetId?: string;
+  datasetId?: string;
   publicShareToken?: string;
   activeFilters?: any[];
   crossFilters?: any[];
@@ -55,6 +56,7 @@ export default function WidgetRenderer(props: Props) {
         visualSpec={props.visualSpec}
         onPointClick={props.onPointClick}
         widgetId={props.widgetId}
+        datasetId={props.datasetId}
         publicShareToken={props.publicShareToken}
         activeFilters={props.activeFilters}
         crossFilters={props.crossFilters}

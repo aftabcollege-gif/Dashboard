@@ -36,6 +36,11 @@ export default function DataSourcesPage() {
   const [fileObj, setFileObj] = useState<File | null>(null);
   const [datasetName, setDatasetName] = useState("");
   const [sheetName, setSheetName] = useState("");
+  const [selectedSheets, setSelectedSheets] = useState<string[]>([]);
+  const [mergeSheets, setMergeSheets] = useState(false);
+  const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
+  const [asyncImport, setAsyncImport] = useState(true);
+  const [activeJob, setActiveJob] = useState<any>(null);
   const [hasHeader, setHasHeader] = useState(true);
   const [nullStrategy, setNullStrategy] = useState("keep");
   const [deduplicate, setDeduplicate] = useState(false);
@@ -47,10 +52,22 @@ export default function DataSourcesPage() {
   const [typeOverrides, setTypeOverrides] = useState<Record<string, string>>({});
   const [dragging, setDragging] = useState(false);
 
+  // Shared Composite Dataset Builder
+  const [compositeList, setCompositeList] = useState<any[]>([]);
+  const [compName, setCompName] = useState("");
+  const [compBaseTable, setCompBaseTable] = useState("");
+  const [compJoinTable, setCompJoinTable] = useState("");
+  const [compJoinType, setCompJoinType] = useState("LEFT");
+  const [compLeftCol, setCompLeftCol] = useState("");
+  const [compRightCol, setCompRightCol] = useState("");
+  const [compSchedule, setCompSchedule] = useState("manual");
+  const [compBusy, setCompBusy] = useState(false);
+
   const load = () => {
     apiFetch("/data-sources").then(setSources).catch(() => {});
     apiFetch("/datasets").then(setDatasets).catch(() => {});
     apiFetch("/data-sources/supported-types").then(setSupported).catch(() => {});
+    apiFetch("/data-sources/composite-datasets").then(setCompositeList).catch(() => {});
   };
 
   useEffect(() => {
@@ -98,10 +115,54 @@ export default function DataSourcesPage() {
 
   const handleInspectSchema = async (id: string) => {
     try {
-      const res = await apiFetch(`/data-sources/${id}/schema`);
+      const res: any = await apiFetch(`/data-sources/${id}/schema`);
       setSelectedSchema(res);
+      if (res?.tables?.[0]?.table_name) {
+        setCompBaseTable(res.tables[0].table_name);
+      }
     } catch (err: any) {
       showToast(err.message);
+    }
+  };
+
+  const handleCreateComposite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedSchema || !compName || !compBaseTable) return;
+    setCompBusy(true);
+    try {
+      const joins =
+        compJoinTable && compLeftCol && compRightCol
+          ? [
+              {
+                table: compJoinTable,
+                join_type: compJoinType,
+                left_table: compBaseTable,
+                left_col: compLeftCol,
+                right_col: compRightCol,
+              },
+            ]
+          : [];
+      const res: any = await apiFetch("/data-sources/composite-datasets", {
+        method: "POST",
+        body: JSON.stringify({
+          data_source_id: selectedSchema.source_id,
+          name: compName,
+          base_table: compBaseTable,
+          joins,
+          refresh_schedule: compSchedule,
+        }),
+      });
+      setCompName("");
+      showToast(
+        locale === "fa"
+          ? `دیتاست ترکیبی با ${res.total_rows || 0} ردیف ساخته شد`
+          : `Composite dataset created (${res.total_rows || 0} rows)`
+      );
+      load();
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setCompBusy(false);
     }
   };
 
@@ -133,13 +194,46 @@ export default function DataSourcesPage() {
 
     setPreviewing(true);
     try {
-      const res = await apiFetch("/data-sources/files/preview", { method: "POST", body: fd });
+      const res: any = await apiFetch("/data-sources/files/preview", { method: "POST", body: fd });
       setPreviewData(res);
-      if (res.sheets?.length && !chosenSheet) setSheetName(res.sheets[0]);
+      if (res.sheets?.length && !chosenSheet) {
+        setSheetName(res.sheets[0]);
+        setSelectedSheets([res.sheets[0]]);
+      }
+      if (Array.isArray(res.columns)) {
+        setSelectedColumns(res.columns.map((c: any) => c.field_name));
+      }
     } catch (err: any) {
       showToast(err.message);
     } finally {
       setPreviewing(false);
+    }
+  };
+
+  const pollBackgroundJob = async (jobId: string) => {
+    for (let i = 0; i < 240; i++) {
+      await new Promise((r) => setTimeout(r, 700));
+      const j: any = await apiFetch(`/jobs/${jobId}`);
+      setActiveJob(j);
+      if (j.status === "completed") {
+        setLastImported(j.result);
+        setPreviewData(null);
+        setPreviewColPage(0);
+        setFileObj(null);
+        setColRenames({});
+        setTypeOverrides({});
+        showToast(
+          locale === "fa"
+            ? `ورود داده‌ها با ${j.result?.row_count || 0} ردیف تکمیل شد!`
+            : `Imported ${j.result?.row_count || 0} rows!`
+        );
+        load();
+        return;
+      }
+      if (j.status === "failed") {
+        showToast(j.error_message || "Background import failed");
+        return;
+      }
     }
   };
 
@@ -149,22 +243,31 @@ export default function DataSourcesPage() {
     fd.append("file", fileObj);
     fd.append("dataset_name", datasetName);
     if (sheetName) fd.append("sheet_name", sheetName);
+    fd.append("sheet_names_json", JSON.stringify(selectedSheets));
+    fd.append("merge_sheets", String(mergeSheets));
     fd.append("has_header", String(hasHeader));
     fd.append("null_strategy", nullStrategy);
     fd.append("deduplicate", String(deduplicate));
     fd.append("column_renames_json", JSON.stringify(colRenames));
     fd.append("type_overrides_json", JSON.stringify(typeOverrides));
+    fd.append("selected_columns_json", JSON.stringify(selectedColumns));
+    fd.append("async_mode", String(asyncImport));
     setImporting(true);
     try {
-      const res = await apiFetch("/data-sources/files/import", { method: "POST", body: fd });
-      showToast(`Imported ${res.row_count} rows into '${res.name || res.warehouse_table}'!`);
-      setLastImported(res);
-      setPreviewData(null);
-      setPreviewColPage(0);
-      setFileObj(null);
-      setColRenames({});
-      setTypeOverrides({});
-      load();
+      const res: any = await apiFetch("/data-sources/files/import", { method: "POST", body: fd });
+      if (res.job_id) {
+        setActiveJob({ id: res.job_id, status: res.status, progress_pct: 5, stage_label: "شروع پردازش..." });
+        await pollBackgroundJob(res.job_id);
+      } else {
+        showToast(`Imported ${res.row_count} rows into '${res.name || res.warehouse_table}'!`);
+        setLastImported(res);
+        setPreviewData(null);
+        setPreviewColPage(0);
+        setFileObj(null);
+        setColRenames({});
+        setTypeOverrides({});
+        load();
+      }
     } catch (err: any) {
       showToast(err.message);
     } finally {
@@ -226,6 +329,25 @@ export default function DataSourcesPage() {
               </p>
             )}
           </div>
+
+          {activeJob && (
+            <div className="p-3.5 rounded-xl border space-y-2 text-xs" style={{ borderColor: "var(--bi-border)", background: "rgba(37,99,235,0.06)" }}>
+              <div className="flex items-center justify-between font-bold">
+                <span>{activeJob.title || (locale === "fa" ? "پردازش ناهمزمان فایل" : "Async Job")}</span>
+                <span className="font-mono text-blue-500">{Math.round(activeJob.progress_pct || 0)}%</span>
+              </div>
+              <div className="w-full h-2 rounded-full bg-slate-500/20 overflow-hidden">
+                <div
+                  className="h-full transition-all duration-300"
+                  style={{ width: `${Math.max(4, Math.min(100, activeJob.progress_pct || 0))}%`, background: activeJob.status === "failed" ? "#ef4444" : "var(--bi-primary)" }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[11px] opacity-80">
+                <span>{activeJob.stage_label}</span>
+                {activeJob.processed_items > 0 && <span>{Number(activeJob.processed_items).toLocaleString()} ردیف پردازش شد</span>}
+              </div>
+            </div>
+          )}
 
           {lastImported && (
             <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-3.5 flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -318,7 +440,58 @@ export default function DataSourcesPage() {
             const visibleCols = (previewData.columns || []).slice(startCol, startCol + PREVIEW_COL_PAGE_SIZE);
             return (
               <div className="space-y-3 pt-2 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
-                <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
+                {/* Row Accounting & Quality Warnings */}
+                {previewData.row_accounting && (
+                  <div className="p-2.5 rounded-lg border flex flex-wrap items-center justify-between gap-2 text-[11px]" style={{ borderColor: "var(--bi-border)", background: "rgba(16,185,129,0.06)" }}>
+                    <div className="flex flex-wrap gap-3">
+                      <span>{locale === "fa" ? "ردیف ورودی:" : "Input:"} <b>{(previewData.row_accounting.input_rows || 0).toLocaleString()}</b></span>
+                      <span>{locale === "fa" ? "ردیف معتبر:" : "Valid:"} <b className="text-emerald-500">{(previewData.row_accounting.valid_rows || 0).toLocaleString()}</b></span>
+                      <span>{locale === "fa" ? "نامعتبر/حذف‌شده:" : "Invalid:"} <b className="text-amber-500">{(previewData.row_accounting.invalid_rows || 0).toLocaleString()}</b></span>
+                      <span>{locale === "fa" ? "ستون انتخابی:" : "Selected Cols:"} <b>{selectedColumns.length} / {totalCols}</b></span>
+                    </div>
+                    {(previewData.row_accounting.warnings || []).length > 0 && (
+                      <div className="text-amber-500 font-semibold">{previewData.row_accounting.warnings.join(" · ")}</div>
+                    )}
+                  </div>
+                )}
+
+                {/* Multi-Sheet Selection Bar */}
+                {previewData.sheets?.length > 1 && (
+                  <div className="p-2.5 rounded-lg border space-y-2" style={{ borderColor: "var(--bi-border)" }}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold">
+                        {locale === "fa" ? `انتخاب شیت‌های اکسل (${previewData.sheets.length} شیت):` : `Select Sheets (${previewData.sheets.length}):`}
+                      </span>
+                      <label className="flex items-center gap-1.5 cursor-pointer font-semibold text-blue-500">
+                        <input type="checkbox" checked={mergeSheets} onChange={(e) => setMergeSheets(e.target.checked)} />
+                        {locale === "fa" ? "ادغام شیت‌های انتخابی در یک مجموعه داده واحد" : "Merge selected sheets into one Dataset"}
+                      </label>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {previewData.sheets.map((s: string) => {
+                        const checked = selectedSheets.includes(s);
+                        const sum = (previewData.sheet_summaries || []).find((x: any) => x.sheet_name === s);
+                        return (
+                          <label key={s} className="flex items-center gap-1.5 px-2.5 py-1 rounded border cursor-pointer" style={{ borderColor: checked ? "var(--bi-primary)" : "var(--bi-border)" }}>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) =>
+                                setSelectedSheets((prev) =>
+                                  e.target.checked ? [...prev, s] : prev.filter((x) => x !== s)
+                                )
+                              }
+                            />
+                            <span>{s}</span>
+                            {sum && <span className="opacity-65 text-[10px]">({sum.estimated_rows.toLocaleString()} ردیف)</span>}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-2 items-center">
                   <input
                     value={datasetName}
                     onChange={(e) => setDatasetName(e.target.value)}
@@ -333,22 +506,22 @@ export default function DataSourcesPage() {
                       className="px-2.5 py-1.5 rounded border bg-transparent"
                       style={{ borderColor: "var(--bi-border)" }}
                     >
-                      {previewData.sheets.map((s: string) => <option key={s} value={s}>Sheet: {s}</option>)}
+                      {previewData.sheets.map((s: string) => <option key={s} value={s}>پیش‌نمایش: {s}</option>)}
                     </select>
                   )}
                   <select value={nullStrategy} onChange={(e) => setNullStrategy(e.target.value)} className="px-2.5 py-1.5 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
-                    <option value="keep">Nulls: Keep</option>
-                    <option value="drop_rows">Nulls: Drop Rows</option>
-                    <option value="fill_zero">Nulls: Fill Zero/Unknown</option>
-                    <option value="fill_mean">Nulls: Fill Mean</option>
+                    <option value="keep">مقادیر خالی: حفظ</option>
+                    <option value="drop_rows">مقادیر خالی: حذف سطر</option>
+                    <option value="fill_zero">پرکردن با صفر/نامشخص</option>
+                    <option value="fill_mean">پرکردن با میانگین</option>
                   </select>
                   <label className="flex items-center gap-1.5 px-2">
-                    <input type="checkbox" checked={hasHeader} onChange={(e) => setHasHeader(e.target.checked)} />
-                    <span>Auto Header</span>
+                    <input type="checkbox" checked={deduplicate} onChange={(e) => setDeduplicate(e.target.checked)} />
+                    <span>حذف تکراری ({previewData.duplicate_count})</span>
                   </label>
                   <label className="flex items-center gap-1.5 px-2">
-                    <input type="checkbox" checked={deduplicate} onChange={(e) => setDeduplicate(e.target.checked)} />
-                    <span>Dedup ({previewData.duplicate_count})</span>
+                    <input type="checkbox" checked={asyncImport} onChange={(e) => setAsyncImport(e.target.checked)} />
+                    <span>پردازش پس‌زمینه (%)</span>
                   </label>
                   <button
                     type="button"
@@ -358,7 +531,7 @@ export default function DataSourcesPage() {
                   >
                     {importing
                       ? locale === "fa" ? "در حال ورود داده‌ها..." : "Importing..."
-                      : `Import (${previewData.row_count_estimated ? "~" : ""}${(previewData.total_rows || 0).toLocaleString()} rows · ${totalCols.toLocaleString()} cols)`}
+                      : `${locale === "fa" ? "ورود" : "Import"} (${previewData.row_count_estimated ? "~" : ""}${(previewData.total_rows || 0).toLocaleString()} ردیف)`}
                   </button>
                 </div>
 
@@ -397,6 +570,20 @@ export default function DataSourcesPage() {
                         {visibleCols.map((c: any) => (
                           <th key={c.field_name} className="px-2.5 py-2 text-start font-semibold whitespace-nowrap align-top">
                             <div className="space-y-1">
+                              <label className="flex items-center gap-1 text-[10px] cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedColumns.includes(c.field_name)}
+                                  onChange={(e) =>
+                                    setSelectedColumns((prev) =>
+                                      e.target.checked
+                                        ? [...prev, c.field_name]
+                                        : prev.filter((x) => x !== c.field_name)
+                                    )
+                                  }
+                                />
+                                <span>{locale === "fa" ? "انتخاب ستون" : "Include"}</span>
+                              </label>
                               <input
                                 value={colRenames[c.field_name] ?? c.field_name}
                                 onChange={(e) => setColRenames({ ...colRenames, [c.field_name]: e.target.value })}
@@ -544,7 +731,137 @@ export default function DataSourcesPage() {
                     </table>
                   </div>
                 )}
+
+                {/* Shared Composite Multi-Table Dataset Builder */}
+                <form onSubmit={handleCreateComposite} className="p-3 rounded-xl border space-y-2.5 mt-3" style={{ borderColor: "var(--bi-border)", background: "rgba(16,185,129,0.04)" }}>
+                  <div className="font-bold text-xs text-emerald-500">
+                    {locale === "fa"
+                      ? "ساخت مجموعه داده ترکیبی مشترک (Composite Dataset + Join چندجدولی برای استفاده در BPMN و داشبوردها)"
+                      : "Build Shared Multi-Table Joined Dataset"}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <input
+                      value={compName}
+                      onChange={(e) => setCompName(e.target.value)}
+                      placeholder={locale === "fa" ? "نام مجموعه داده جدید" : "Composite Dataset Name"}
+                      className="px-2.5 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                      required
+                    />
+                    <select
+                      value={compBaseTable}
+                      onChange={(e) => setCompBaseTable(e.target.value)}
+                      className="px-2.5 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      {(selectedSchema.tables || []).map((tb: any) => (
+                        <option key={tb.table_name} value={tb.table_name}>جدول اصلی: {tb.table_name}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={compSchedule}
+                      onChange={(e) => setCompSchedule(e.target.value)}
+                      className="px-2.5 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      <option value="manual">{locale === "fa" ? "به‌روزرسانی دستی" : "Manual Refresh"}</option>
+                      <option value="hourly">{locale === "fa" ? "به‌روزرسانی ساعتی" : "Hourly"}</option>
+                      <option value="daily">{locale === "fa" ? "به‌روزرسانی روزانه" : "Daily"}</option>
+                      <option value="weekly">{locale === "fa" ? "به‌روزرسانی هفتگی" : "Weekly"}</option>
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <select
+                      value={compJoinTable}
+                      onChange={(e) => setCompJoinTable(e.target.value)}
+                      className="px-2 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      <option value="">{locale === "fa" ? "بدون Join (تک‌جدول)" : "No Join (Single Table)"}</option>
+                      {(selectedSchema.tables || []).filter((tb: any) => tb.table_name !== compBaseTable).map((tb: any) => (
+                        <option key={tb.table_name} value={tb.table_name}>Join با: {tb.table_name}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={compJoinType}
+                      onChange={(e) => setCompJoinType(e.target.value)}
+                      className="px-2 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      <option value="LEFT">LEFT JOIN</option>
+                      <option value="INNER">INNER JOIN</option>
+                      <option value="RIGHT">RIGHT JOIN</option>
+                    </select>
+                    <input
+                      value={compLeftCol}
+                      onChange={(e) => setCompLeftCol(e.target.value)}
+                      placeholder={locale === "fa" ? "کلید جدول اصلی" : "Left Key Col"}
+                      className="px-2 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    />
+                    <input
+                      value={compRightCol}
+                      onChange={(e) => setCompRightCol(e.target.value)}
+                      placeholder={locale === "fa" ? "کلید جدول دوم" : "Right Key Col"}
+                      className="px-2 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={compBusy}
+                    className="px-4 py-1.5 rounded text-white font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    {compBusy ? "..." : locale === "fa" ? "ایجاد و بارگذاری در انبار مشترک" : "Build & Materialize Dataset"}
+                  </button>
+                </form>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* Composite Datasets Registry */}
+        {compositeList.length > 0 && (
+          <div className="bi-card p-5 space-y-3 text-xs">
+            <h2 className="text-sm font-bold">
+              {locale === "fa" ? `دیتاست‌های ترکیبی مشترک (${compositeList.length})` : `Shared Composite Datasets (${compositeList.length})`}
+            </h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {compositeList.map((c) => (
+                <div key={c.id} className="p-3 rounded-lg border flex items-center justify-between gap-2" style={{ borderColor: "var(--bi-border)" }}>
+                  <div className="min-w-0">
+                    <div className="font-bold truncate">{c.name}</div>
+                    <div className="text-[11px] opacity-75">
+                      {c.refresh_schedule} · {c.last_status} {c.last_refreshed_at ? `· ${new Date(c.last_refreshed_at).toLocaleString(locale === "fa" ? "fa-IR" : "en-US")}` : ""}
+                    </div>
+                    {c.last_error && <div className="text-[10px] text-red-500 truncate">{c.last_error}</div>}
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        apiFetch(`/data-sources/composite-datasets/${c.id}/refresh`, { method: "POST" })
+                          .then((res: any) => {
+                            showToast(`Refreshed (${res.total_rows || 0} rows)`);
+                            load();
+                          })
+                          .catch((e) => showToast(e.message))
+                      }
+                      className="px-2.5 py-1 rounded border hover:bg-blue-500/10"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      {locale === "fa" ? "به‌روزرسانی" : "Refresh"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => apiFetch(`/data-sources/composite-datasets/${c.id}`, { method: "DELETE" }).then(load)}
+                      className="p-1 text-red-500"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}

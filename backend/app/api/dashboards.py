@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
+import io
 import secrets
 import time
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -33,6 +35,7 @@ from app.core.tenant import (
 from app.database import get_db
 from app.engines.bpmn_analytics import execute_bpmn_step_drill, execute_bpmn_widget_sql
 from app.engines.drill_engine import resolve_drill_state
+from app.engines.export_engine import export_to_excel_bytes
 from app.engines.query_engine import build_visual_query_sql, execute_dataset_sql
 from app.engines.warehouse import warehouse
 from app.models.dashboard import (
@@ -44,6 +47,7 @@ from app.models.dashboard import (
     DashboardState,
     DashboardTheme,
     DashboardVersion,
+    NamedDashboardLayout,
     Widget,
     WidgetConfig,
     WidgetDrillRule,
@@ -937,6 +941,7 @@ def get_public_dashboard(embed_token: str, request: Request, db: Session = Depen
                         [],
                         [],
                         public_mode=True,
+                        widget_id=w.id,
                     )
                 else:
                     sec_bundle: dict[str, Any] = {}
@@ -1103,6 +1108,7 @@ def execute_public_dashboard_batch(
                         public_mode=True,
                         process_name_override=(body.bpmn_process_map or {}).get(w.id),
                         field_overrides=(body.bpmn_field_overrides_map or {}).get(w.id),
+                        widget_id=w.id,
                     )
                 else:
                     sec_bundle: dict[str, Any] = {}
@@ -1994,6 +2000,7 @@ def _execute_single_widget(
                     enforce_join_rbac=True,
                     process_name_override=bpmn_process_name,
                     field_overrides=bpmn_field_overrides,
+                    widget_id=w.id,
                 )
             else:
                 raw_res = warehouse.execute_query(sql, params)
@@ -2300,6 +2307,105 @@ def get_widget_bpmn_step_drill(
         details={"step_name": body.step_name, "process_name": body.process_name, "items": drill_res.get("total_items", 0)},
     )
     return drill_res
+
+
+@router.post("/widgets/{widget_id}/bpmn-drill/export")
+def export_widget_bpmn_step_drill(
+    widget_id: str,
+    body: BpmnDrillRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "widget_data", ip=ip, user_id=user.id, org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_WIDGET_PER_MIN, user_limit=settings.RATE_LIMIT_WIDGET_PER_MIN,
+    )
+    w, _ = get_widget_for_org(db, widget_id, user.organization_id)
+    parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
+    enforce_permission(db, user, "widget", w.id, "export", parent_chain=parent_chain, ip_address=ip)
+    wq = db.query(WidgetQuery).filter(WidgetQuery.widget_id == w.id).first()
+    wcfg = db.query(WidgetConfig).filter(WidgetConfig.widget_id == w.id).first()
+    target_ds_id = wq.dataset_id if wq and wq.dataset_id else w.dataset_id
+    ds = db.query(Dataset).filter(Dataset.id == target_ds_id, Dataset.organization_id == user.organization_id).first() if target_ds_id else None
+    if not ds:
+        raise HTTPException(status_code=400, detail="Widget has no underlying dataset for BPMN export")
+    enforce_permission(db, user, "dataset", ds.id, "view", ip_address=ip)
+
+    sec_ctx = build_data_security_context(db, user, ds.id)
+    visual_spec = dict(wq.visual_spec_json) if wq and isinstance(wq.visual_spec_json, dict) else {}
+    drill_res = execute_bpmn_step_drill(
+        db,
+        ds,
+        visual_spec,
+        wcfg.visualization_json if wcfg else {},
+        list(body.active_filters or []),
+        sec_ctx.rls_where_clauses,
+        sec_ctx.rls_params,
+        step_name=body.step_name,
+        process_name=body.process_name,
+        assignee_name=body.assignee_name,
+        pending_only=body.pending_only,
+        search=body.search,
+        limit=500,
+        offset=0,
+        field_overrides=body.field_overrides,
+        user=user,
+        enforce_join_rbac=True,
+    )
+
+    def _safe_cell(val: Any) -> Any:
+        if isinstance(val, str) and val and val[0] in ("=", "+", "-", "@", "\t", "\r"):
+            return f"'{val}"
+        return val
+
+    step_sum = drill_res.get("step_summary") or {}
+    summary_rows = [{k: _safe_cell(v) for k, v in step_sum.items()}]
+    assignee_rows = [
+        {k: _safe_cell(v) for k, v in a.items()} for a in (drill_res.get("assignees") or [])
+    ]
+    item_rows = [
+        {
+            "requestId": _safe_cell(it.get("requestId")),
+            "requestTitle": _safe_cell(it.get("requestTitle")),
+            "assigneeName": _safe_cell(it.get("assigneeName")),
+            "assigneeRole": _safe_cell(it.get("assigneeRole")),
+            "department": _safe_cell(it.get("department")),
+            "waitHours": it.get("waitHours"),
+            "slaHours": it.get("slaHours"),
+            "status": _safe_cell(it.get("status")),
+            "enteredAt": _safe_cell(it.get("enteredAt")),
+        }
+        for it in (drill_res.get("items") or [])
+    ]
+
+    xlsx_bytes = export_to_excel_bytes(
+        f"BPMN Cartable - {body.step_name}",
+        [
+            {"name": "Step_Summary", "columns": list(step_sum.keys()), "rows": summary_rows},
+            {
+                "name": "Assignees",
+                "columns": ["assigneeName", "assigneeRole", "pendingCount", "totalCount", "avgWaitHours", "maxWaitHours", "overdueCount"],
+                "rows": assignee_rows,
+            },
+            {
+                "name": "Requests",
+                "columns": ["requestId", "requestTitle", "assigneeName", "assigneeRole", "department", "waitHours", "slaHours", "status", "enteredAt"],
+                "rows": item_rows,
+            },
+        ],
+    )
+    record_audit(
+        db, user.organization_id, "bpmn_drill_exported", "widget", resource_id=w.id,
+        user_id=user.id, username=user.username, ip_address=ip,
+        details={"step_name": body.step_name, "exported_items": len(item_rows)},
+    )
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="bpmn_cartable_drill.xlsx"'},
+    )
 
 
 @router.post("/public/{embed_token}/widgets/{widget_id}/bpmn-drill")
@@ -2734,3 +2840,158 @@ def clone_from_template(dashboard_id: str, user: User = Depends(get_current_user
             db.add(WidgetQuery(widget_id=nw.id, dataset_id=wq.dataset_id, query_mode=wq.query_mode, sql_text=wq.sql_text, visual_spec_json=wq.visual_spec_json))
     db.commit()
     return {"id": nd.id, "title": nd.title}
+
+
+class NamedLayoutCreateBody(BaseModel):
+    name: str
+    is_default: bool = False
+    layout_json: Optional[dict[str, Any]] = None
+
+
+@router.get("/{dashboard_id}/named-layouts")
+def list_named_layouts(
+    dashboard_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "view")
+    rows = (
+        db.query(NamedDashboardLayout)
+        .filter(NamedDashboardLayout.dashboard_id == dash.id)
+        .order_by(NamedDashboardLayout.is_default.desc(), NamedDashboardLayout.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "is_default": r.is_default,
+            "layout_json": r.layout_json,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/{dashboard_id}/named-layouts")
+def save_named_layout(
+    dashboard_id: str,
+    body: NamedLayoutCreateBody,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
+    clean_name = body.name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Layout name is required")
+
+    layout_payload = body.layout_json
+    if not layout_payload:
+        pages_snap: dict[str, Any] = {}
+        pages = db.query(DashboardPage).filter(DashboardPage.dashboard_id == dash.id).all()
+        widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
+        for p in pages:
+            dl = db.query(DashboardLayout).filter(DashboardLayout.page_id == p.id).first()
+            p_widgets = [w for w in widgets if w.page_id == p.id]
+            pages_snap[p.id] = {
+                "columns_count": dl.columns_count if dl else 12,
+                "items": [
+                    {"i": w.id, "x": w.layout_x, "y": w.layout_y, "w": w.layout_w, "h": w.layout_h}
+                    for w in p_widgets
+                ],
+            }
+        layout_payload = {"pages": pages_snap}
+
+    if body.is_default:
+        db.query(NamedDashboardLayout).filter(NamedDashboardLayout.dashboard_id == dash.id).update(
+            {"is_default": False}
+        )
+
+    existing = (
+        db.query(NamedDashboardLayout)
+        .filter(NamedDashboardLayout.dashboard_id == dash.id, NamedDashboardLayout.name == clean_name)
+        .first()
+    )
+    if existing:
+        existing.layout_json = layout_payload
+        existing.is_default = body.is_default
+        row = existing
+    else:
+        row = NamedDashboardLayout(
+            dashboard_id=dash.id,
+            name=clean_name,
+            is_default=body.is_default,
+            layout_json=layout_payload,
+            created_by=user.id,
+        )
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {
+        "id": row.id,
+        "name": row.name,
+        "is_default": row.is_default,
+        "layout_json": row.layout_json,
+    }
+
+
+@router.post("/{dashboard_id}/named-layouts/{layout_id}/apply")
+def apply_named_layout(
+    dashboard_id: str,
+    layout_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
+    row = (
+        db.query(NamedDashboardLayout)
+        .filter(NamedDashboardLayout.id == layout_id, NamedDashboardLayout.dashboard_id == dash.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Named layout not found")
+
+    pages_snap = (row.layout_json or {}).get("pages") or {}
+    widgets_by_id = {w.id: w for w in db.query(Widget).filter(Widget.dashboard_id == dash.id).all()}
+    for page_id, pdata in pages_snap.items():
+        dl = db.query(DashboardLayout).filter(DashboardLayout.page_id == page_id).first()
+        items = pdata.get("items") or []
+        if dl:
+            dl.columns_count = int(pdata.get("columns_count") or dl.columns_count)
+            dl.layout_json = items
+        for it in items:
+            w = widgets_by_id.get(str(it.get("i") or ""))
+            if w and w.page_id == page_id:
+                w.layout_x = int(it.get("x") or 0)
+                w.layout_y = int(it.get("y") or 0)
+                w.layout_w = max(2, int(it.get("w") or 6))
+                w.layout_h = max(2, int(it.get("h") or 5))
+    db.commit()
+    return {"status": "applied", "layout_id": row.id, "name": row.name}
+
+
+@router.delete("/{dashboard_id}/named-layouts/{layout_id}")
+def delete_named_layout(
+    dashboard_id: str,
+    layout_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "edit", ip_address=get_client_ip(request))
+    row = (
+        db.query(NamedDashboardLayout)
+        .filter(NamedDashboardLayout.id == layout_id, NamedDashboardLayout.dashboard_id == dash.id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Named layout not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted"}

@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import inspect as sa_inspect, text
 from app.api import (
+    actions,
     ai,
     auth,
     correlation,
@@ -23,6 +24,7 @@ from app.api import (
     descriptive_builder,
     etl,
     exports,
+    jobs,
     monitoring,
     process_intelligence,
     queries,
@@ -36,6 +38,15 @@ from app.database import Base, db_session_scope, engine
 from app.engines.scheduler import start_scheduler, stop_scheduler
 from app.engines.warehouse import warehouse
 from app.seed.bootstrap import seed_database
+from app.version import (
+    API_VERSION,
+    APP_NAME,
+    APP_VERSION,
+    PREVIOUS_VERSION,
+    RELEASE_DATE,
+    RELEASE_NOTES,
+    SCHEMA_HEAD_TARGET,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +99,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.APP_NAME,
-    version="1.0.0",
+    version=APP_VERSION,
     description="Enterprise BI & Dynamic Dashboard Builder Platform (Data Engine, RBAC, Active Directory, Automated ETL, Analytical Warehouse & Smart Cache)",
     docs_url=None if settings.ENVIRONMENT == "production" else "/docs",
     redoc_url=None if settings.ENVIRONMENT == "production" else "/redoc",
@@ -153,7 +164,7 @@ async def security_headers_middleware(request: Request, call_next):
 
     if any(
         path.startswith(f"{settings.API_PREFIX}/{seg}")
-        for seg in ("auth", "rbac", "queries", "data-sources", "monitoring", "descriptive-builder", "process-intelligence", "security-intel", "correlation")
+        for seg in ("auth", "rbac", "queries", "data-sources", "monitoring", "descriptive-builder", "process-intelligence", "security-intel", "correlation", "jobs", "actions")
     ):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
         response.headers["Pragma"] = "no-cache"
@@ -179,8 +190,22 @@ def api_health_check():
             conn.execute(text("SELECT 1"))
         warehouse.check_readiness()
     except Exception:
-        return JSONResponse(status_code=503, content={"status": "unhealthy", "api_version": "1.0.0"})
-    return {"status": "healthy", "api_version": "1.0.0"}
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "api_version": API_VERSION})
+    return {"status": "healthy", "api_version": API_VERSION, "app_version": APP_VERSION}
+
+
+@app.get(f"{settings.API_PREFIX}/about")
+def api_about():
+    return {
+        "app_name": APP_NAME,
+        "version": APP_VERSION,
+        "previous_version": PREVIOUS_VERSION,
+        "api_version": API_VERSION,
+        "release_date": RELEASE_DATE,
+        "schema_target": SCHEMA_HEAD_TARGET,
+        "environment": settings.ENVIRONMENT,
+        "release_notes": RELEASE_NOTES,
+    }
 
 
 @app.post("/_internal/shutdown", include_in_schema=False)
@@ -209,3 +234,5 @@ app.include_router(monitoring.router, prefix=settings.API_PREFIX)
 app.include_router(process_intelligence.router, prefix=settings.API_PREFIX)
 app.include_router(security_intelligence.router, prefix=settings.API_PREFIX)
 app.include_router(correlation.router, prefix=settings.API_PREFIX)
+app.include_router(jobs.router, prefix=settings.API_PREFIX)
+app.include_router(actions.router, prefix=settings.API_PREFIX)

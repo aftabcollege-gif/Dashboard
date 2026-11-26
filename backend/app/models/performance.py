@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import String, Boolean, Integer, BigInteger, Float, Text, DateTime, ForeignKey
+from sqlalchemy import String, Boolean, Integer, BigInteger, Float, Text, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 from app.models.common import TimestampMixin, gen_uuid, utcnow
@@ -83,3 +83,27 @@ class WidgetPerformanceLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False, index=True
     )
+
+
+class BackgroundJob(Base, TimestampMixin):
+    """Tracked async background jobs with real stage and row-level progress percentage."""
+    __tablename__ = "background_jobs"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    title: Mapped[str] = mapped_column(String(220), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="queued", nullable=False)
+    progress_pct: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    processed_items: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    total_items: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    stage_label: Mapped[str] = mapped_column(String(160), default="queued", nullable=False)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

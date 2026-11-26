@@ -22,11 +22,19 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
 
 from app.core.permissions import permission_resolver
+from app.core.rls_cls import build_data_security_context, build_security_projection_and_where
+from app.engines.security_classifier import (
+    CATEGORY_LABEL_MAP,
+    classify_security_text,
+    load_custom_security_rules,
+)
 from app.engines.warehouse import warehouse
+from app.models.data import Dataset
 from app.models.identity import User
 from app.models.intelligence import (
     SecurityAlert,
     SecurityAlertRule,
+    SecurityClassificationRule,
     SecurityCollector,
     SecurityEvent,
     SecurityIncident,
@@ -218,6 +226,7 @@ def _safe_int(val: Any) -> Optional[int]:
 def parse_single_security_record(
     raw_item: str | dict[str, Any],
     default_tz: str = "UTC",
+    custom_rules: Optional[list[SecurityClassificationRule]] = None,
 ) -> dict[str, Any]:
     """
     Parse either a JSON object/line or a Syslog/KV text line into the canonical normalized security event dict.
@@ -299,6 +308,27 @@ def parse_single_security_record(
     ])
     dedup_hash = hashlib.sha256(dedup_basis.encode("utf-8")).hexdigest()
 
+    # Bilingual NLP/Regex 15-category & status extraction
+    nlp_text = " ".join([
+        raw_result,
+        str(obj.get("message") or obj.get("msg") or obj.get("description") or obj.get("status_text") or ""),
+        threat_name,
+        rule_name,
+        product,
+        raw_msg[:600],
+    ])
+    cls_res = classify_security_text(
+        nlp_text,
+        action=action,
+        threat_name=threat_name,
+        rule_name=rule_name,
+        event_type=event_type,
+        custom_rules=custom_rules,
+    )
+    eff_severity = cls_res["severity_override"] or severity
+    sw_name = str(obj.get("software_name") or obj.get("software") or cls_res["software_name"] or product or "").strip()[:115]
+    sw_ver = str(obj.get("software_version") or obj.get("version") or cls_res["software_version"] or "").strip()[:60]
+
     return {
         "dedup_hash": dedup_hash,
         "event_time": event_dt,
@@ -307,7 +337,7 @@ def parse_single_security_record(
         "product": product,
         "device": device,
         "event_type": event_type or "security_event",
-        "severity": severity,
+        "severity": eff_severity,
         "action": action,
         "result": raw_result or action,
         "src_ip": src_ip,
@@ -324,6 +354,11 @@ def parse_single_security_record(
         "policy_name": policy_name,
         "raw_message": raw_msg,
         "extra_json": extra,
+        "threat_category": cls_res["threat_category"],
+        "threat_status": cls_res["threat_status"],
+        "extraction_reason": cls_res["extraction_reason"],
+        "software_name": sw_name,
+        "software_version": sw_ver,
     }
 
 
@@ -360,6 +395,10 @@ def _sync_security_warehouse(db: Session, org_id: str) -> None:
             "username": r.username,
             "hostname": r.hostname,
             "threat_name": r.threat_name,
+            "threat_category": r.threat_category,
+            "threat_status": r.threat_status,
+            "software_name": r.software_name,
+            "software_version": r.software_version,
             "file_hash": r.file_hash,
             "rule_name": r.rule_name,
             "policy_name": r.policy_name,
@@ -387,6 +426,7 @@ def ingest_security_batch(
 
     now_utc = datetime.now(timezone.utc)
     batch = items[:max_items]
+    custom_rules = load_custom_security_rules(db, org_id)
     existing_hashes = {
         h[0]
         for h in db.query(SecurityEvent.dedup_hash)
@@ -401,7 +441,9 @@ def ingest_security_batch(
 
     for line_no, raw_item in enumerate(batch, start=1):
         try:
-            norm = parse_single_security_record(raw_item, default_tz=collector.default_timezone or "UTC")
+            norm = parse_single_security_record(
+                raw_item, default_tz=collector.default_timezone or "UTC", custom_rules=custom_rules
+            )
             if norm["dedup_hash"] in existing_hashes:
                 deduplicated += 1
                 continue
@@ -499,9 +541,29 @@ def get_security_overview(db: Session, org_id: str, hours: int = 168) -> dict[st
     action_counts = Counter(ev.action for ev in events)
     sev_counts = Counter(ev.severity for ev in events)
     vendor_counts = Counter(ev.vendor or "Unknown" for ev in events)
+    cat_counts = Counter((ev.threat_category or "other_security_event") for ev in events)
+    status_counts = Counter((ev.threat_status or "requires_review") for ev in events)
     top_hosts = Counter(ev.hostname for ev in events if ev.hostname).most_common(10)
     top_users = Counter(ev.username for ev in events if ev.username).most_common(10)
     top_src_ips = Counter(ev.src_ip for ev in events if ev.src_ip).most_common(10)
+
+    all_incidents = (
+        db.query(SecurityIncident)
+        .filter(SecurityIncident.organization_id == org_id)
+        .all()
+    )
+    mtta_vals = [float(i.mtta_minutes) for i in all_incidents if i.mtta_minutes is not None]
+    mttr_vals = [float(i.mttr_minutes) for i in all_incidents if i.mttr_minutes is not None]
+    tier2_alerts = (
+        db.query(SecurityAlert)
+        .filter(SecurityAlert.organization_id == org_id, SecurityAlert.tier >= 2)
+        .count()
+    )
+    fp_alerts = (
+        db.query(SecurityAlert)
+        .filter(SecurityAlert.organization_id == org_id, SecurityAlert.false_positive == True)
+        .count()
+    )
 
     # Hourly timeline bucketed by action
     timeline_buckets: dict[str, dict[str, Any]] = {}
@@ -539,6 +601,18 @@ def get_security_overview(db: Session, org_id: str, hours: int = 168) -> dict[st
         },
         "severity_breakdown": dict(sev_counts),
         "vendor_breakdown": dict(vendor_counts),
+        "threat_category_breakdown": [
+            {"key": k, "label_fa": CATEGORY_LABEL_MAP.get(k, k), "count": c}
+            for k, c in cat_counts.most_common()
+        ],
+        "threat_status_breakdown": dict(status_counts),
+        "soc_metrics": {
+            "avg_mtta_minutes": round(statistics.mean(mtta_vals), 1) if mtta_vals else None,
+            "avg_mttr_minutes": round(statistics.mean(mttr_vals), 1) if mttr_vals else None,
+            "tier2_alerts_count": tier2_alerts,
+            "false_positive_alerts_count": fp_alerts,
+            "total_incidents_count": len(all_incidents),
+        },
         "top_hosts": [{"hostname": k, "count": v} for k, v in top_hosts],
         "top_users": [{"username": k, "count": v} for k, v in top_users],
         "top_src_ips": [{"src_ip": k, "count": v} for k, v in top_src_ips],
@@ -560,6 +634,8 @@ def query_security_events_page(
     username: Optional[str] = None,
     hostname: Optional[str] = None,
     src_ip: Optional[str] = None,
+    threat_category: Optional[str] = None,
+    threat_status: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -575,6 +651,10 @@ def query_security_events_page(
         q = q.filter(SecurityEvent.hostname == hostname)
     if src_ip:
         q = q.filter(SecurityEvent.src_ip == src_ip)
+    if threat_category:
+        q = q.filter(SecurityEvent.threat_category == threat_category)
+    if threat_status:
+        q = q.filter(SecurityEvent.threat_status == threat_status)
     total = q.count()
     rows = q.order_by(SecurityEvent.event_time.desc()).offset(offset).limit(limit).all()
 
@@ -601,6 +681,12 @@ def query_security_events_page(
             "username": r.username,
             "hostname": r.hostname,
             "threat_name": r.threat_name,
+            "threat_category": r.threat_category or "other_security_event",
+            "threat_category_fa": CATEGORY_LABEL_MAP.get(r.threat_category or "other_security_event", r.threat_category or ""),
+            "threat_status": r.threat_status or "requires_review",
+            "extraction_reason": r.extraction_reason or "",
+            "software_name": r.software_name or "",
+            "software_version": r.software_version or "",
             "file_path": r.file_path,
             "file_hash": r.file_hash,
             "rule_name": r.rule_name,
@@ -663,39 +749,74 @@ def evaluate_security_alerts(
     w_start = latest_events[0].event_time
     w_end = latest_events[-1].event_time
 
+    open_existing = (
+        db.query(SecurityAlert)
+        .filter(
+            SecurityAlert.organization_id == org_id,
+            SecurityAlert.status.in_(["open", "acknowledged"]),
+        )
+        .all()
+    )
+
+    def _dedup_or_create(title: str, sev: str, obs: float, mean_v: float, std_v: float, delta: float, sample_c: int, ev_json: dict[str, Any], lim: str) -> None:
+        mkey_cur = ev_json.get("metric")
+        bkey_cur = ev_json.get("bucket")
+        for ex in open_existing:
+            ex_ev = ex.evidence_json or {}
+            if ex_ev.get("metric") == mkey_cur and ex_ev.get("bucket") == bkey_cur:
+                ex.duplicate_count = int(ex.duplicate_count or 1) + 1
+                ex.observed_value = obs
+                ex.delta_value = delta
+                ex.sample_count = sample_c
+                ex.evidence_json = ev_json
+                return
+        al = SecurityAlert(
+            organization_id=org_id,
+            title=title,
+            severity=sev,
+            observed_value=obs,
+            baseline_value=mean_v,
+            baseline_stddev=std_v,
+            delta_value=delta,
+            sample_count=sample_c,
+            window_start=w_start,
+            window_end=w_end,
+            evidence_json=ev_json,
+            limitations_fa=lim,
+            status="open",
+            tier=1,
+            duplicate_count=1,
+        )
+        db.add(al)
+        db.flush()
+        open_existing.append(al)
+        created_alerts.append({
+            "id": al.id, "title": al.title, "severity": al.severity,
+            "observed_value": obs, "baseline_value": mean_v, "baseline_stddev": std_v,
+            "delta_value": delta, "sample_count": al.sample_count, "limitations_fa": al.limitations_fa,
+        })
+
     for mkey, series in metric_series.items():
         obs = float(series[-1])
         hist = [float(x) for x in series[:-1]]
         if not hist:
-            # Single-window fallback: threshold check only
             if obs >= min_spike_count:
-                al = SecurityAlert(
-                    organization_id=org_id,
-                    title=f"{metric_titles[mkey]} (آستانه اولیه)",
-                    severity="high" if mkey == "high_critical_count" else "medium",
-                    observed_value=obs,
-                    baseline_value=0.0,
-                    baseline_stddev=0.0,
-                    delta_value=obs,
-                    sample_count=len(latest_events),
-                    window_start=w_start,
-                    window_end=w_end,
-                    evidence_json={
+                _dedup_or_create(
+                    f"{metric_titles[mkey]} (آستانه اولیه)",
+                    "high" if mkey == "high_critical_count" else "medium",
+                    obs,
+                    0.0,
+                    0.0,
+                    obs,
+                    len(latest_events),
+                    {
                         "metric": mkey,
                         "bucket": latest_key,
                         "top_hosts": Counter(e.hostname for e in latest_events if e.hostname).most_common(5),
                         "top_users": Counter(e.username for e in latest_events if e.username).most_common(5),
                     },
-                    limitations_fa="سابقه تاریخی کافی (حداقل ۲ پنجره زمانی) وجود ندارد؛ ارزیابی فقط بر اساس آستانه پایه انجام شد.",
-                    status="open",
+                    "سابقه تاریخی کافی (حداقل ۲ پنجره زمانی) وجود ندارد؛ ارزیابی فقط بر اساس آستانه پایه انجام شد.",
                 )
-                db.add(al)
-                db.flush()
-                created_alerts.append({
-                    "id": al.id, "title": al.title, "severity": al.severity,
-                    "observed_value": obs, "baseline_value": 0.0, "delta_value": obs,
-                    "sample_count": al.sample_count, "limitations_fa": al.limitations_fa,
-                })
             continue
 
         mean_val = statistics.mean(hist)
@@ -706,18 +827,15 @@ def evaluate_security_alerts(
             (std_val > 0 and z >= zscore_threshold) or (std_val == 0 and obs > max(mean_val * 2.5, float(min_spike_count)))
         )
         if triggered:
-            al = SecurityAlert(
-                organization_id=org_id,
-                title=metric_titles[mkey],
-                severity="critical" if z >= 4.0 else ("high" if z >= 2.5 else "medium"),
-                observed_value=obs,
-                baseline_value=round(mean_val, 2),
-                baseline_stddev=round(std_val, 2),
-                delta_value=delta,
-                sample_count=len(events),
-                window_start=w_start,
-                window_end=w_end,
-                evidence_json={
+            _dedup_or_create(
+                metric_titles[mkey],
+                "critical" if z >= 4.0 else ("high" if z >= 2.5 else "medium"),
+                obs,
+                round(mean_val, 2),
+                round(std_val, 2),
+                delta,
+                len(events),
+                {
                     "metric": mkey,
                     "bucket": latest_key,
                     "zscore": round(z, 2),
@@ -726,19 +844,217 @@ def evaluate_security_alerts(
                     "top_users": Counter(e.username for e in latest_events if e.username).most_common(5),
                     "top_src_ips": Counter(e.src_ip for e in latest_events if e.src_ip).most_common(5),
                 },
-                limitations_fa=(
-                    f"مبنای مقایسه میانگین {len(hist)} بازه قبلی است؛ تغییرات برنامه‌ریزی‌شده (مانند اسکن امنیتی یا به‌روزرسانی) ممکن است باعث افزایش موقت شود."
-                ),
-                status="open",
+                f"مبنای مقایسه میانگین {len(hist)} بازه قبلی است؛ تغییرات برنامه‌ریزی‌شده (مانند اسکن امنیتی یا به‌روزرسانی) ممکن است باعث افزایش موقت شود.",
             )
-            db.add(al)
-            db.flush()
-            created_alerts.append({
-                "id": al.id, "title": al.title, "severity": al.severity,
-                "observed_value": obs, "baseline_value": round(mean_val, 2),
-                "baseline_stddev": round(std_val, 2), "delta_value": delta,
-                "sample_count": al.sample_count, "limitations_fa": al.limitations_fa,
-            })
 
     db.commit()
     return created_alerts
+
+
+def triage_security_alert(
+    db: Session,
+    alert: SecurityAlert,
+    user: User,
+    *,
+    action: str,
+    note: str = "",
+    false_positive_reason: str = "",
+    create_incident_on_escalate: bool = True,
+) -> dict[str, Any]:
+    now_utc = datetime.now(timezone.utc)
+    notes = list(alert.notes_json or [])
+    if note.strip():
+        notes.append({"by": user.username, "at": now_utc.isoformat(), "note": note.strip()})
+
+    escalated_incident_id: Optional[str] = None
+    if action == "acknowledge":
+        alert.status = "acknowledged"
+        alert.acknowledged_by = user.id
+        alert.assigned_to = alert.assigned_to or user.id
+    elif action == "false_positive":
+        alert.status = "closed"
+        alert.false_positive = True
+        alert.false_positive_reason = false_positive_reason.strip() or note.strip() or "مثبت کاذب تاییدشده توسط تحلیلگر Tier 1"
+        alert.acknowledged_by = user.id
+    elif action == "escalate_tier2":
+        alert.tier = 2
+        alert.status = "escalated"
+        alert.escalated_at = now_utc
+        alert.assigned_to = alert.assigned_to or user.id
+        if create_incident_on_escalate:
+            ev = alert.evidence_json or {}
+            hosts = [h[0] if isinstance(h, (list, tuple)) else str(h) for h in (ev.get("top_hosts") or [])]
+            users = [u[0] if isinstance(u, (list, tuple)) else str(u) for u in (ev.get("top_users") or [])]
+            ips = [x[0] if isinstance(x, (list, tuple)) else str(x) for x in (ev.get("top_src_ips") or [])]
+            inc = SecurityIncident(
+                organization_id=alert.organization_id,
+                title=f"رخداد Tier 2: {alert.title}",
+                description=f"ارتقا از هشدار {alert.id} — {note or alert.limitations_fa}",
+                severity=alert.severity,
+                status="triaging",
+                alert_ids_json=[alert.id],
+                recommended_action_fa="بررسی شواهد، جداسازی پیشنهادی دارایی و تایید انسانی قبل از هرگونه اقدام",
+                rollback_plan_fa="بازگردانی دستی تنظیمات قبلی پس از تایید تیم امنیت",
+                created_by=user.id,
+                assigned_to=user.id,
+                started_at=now_utc,
+                escalated_at=now_utc,
+                mtta_minutes=round(
+                    max(0.0, (now_utc - (alert.created_at.replace(tzinfo=timezone.utc) if alert.created_at.tzinfo is None else alert.created_at)).total_seconds() / 60.0),
+                    2,
+                ),
+                blast_radius_json={
+                    "affected_hosts": hosts,
+                    "affected_users": users,
+                    "source_ips": ips,
+                    "sample_events": alert.sample_count,
+                },
+                timeline_json=[
+                    {"at": now_utc.isoformat(), "actor": user.username, "event": "Escalated from Tier 1 Alert to Tier 2 Incident"}
+                ],
+            )
+            db.add(inc)
+            db.flush()
+            escalated_incident_id = inc.id
+    elif action == "resolve":
+        alert.status = "resolved"
+    elif action == "add_note":
+        pass
+    else:
+        raise ValueError(f"Unsupported triage action: {action}")
+
+    alert.notes_json = notes
+    db.commit()
+    db.refresh(alert)
+    return {
+        "id": alert.id,
+        "status": alert.status,
+        "tier": alert.tier,
+        "false_positive": alert.false_positive,
+        "false_positive_reason": alert.false_positive_reason,
+        "duplicate_count": alert.duplicate_count,
+        "escalated_incident_id": escalated_incident_id,
+        "notes": alert.notes_json,
+    }
+
+
+def update_incident_lifecycle(
+    db: Session,
+    inc: SecurityIncident,
+    user: User,
+    *,
+    status: Optional[str] = None,
+    hypothesis_notes_fa: Optional[str] = None,
+    final_report_fa: Optional[str] = None,
+    evidence_item: Optional[dict[str, Any]] = None,
+    resolution_note: Optional[str] = None,
+) -> dict[str, Any]:
+    now_utc = datetime.now(timezone.utc)
+    created_dt = inc.created_at.replace(tzinfo=timezone.utc) if inc.created_at and inc.created_at.tzinfo is None else (inc.created_at or now_utc)
+    tl = list(inc.timeline_json or [])
+
+    if inc.started_at is None:
+        inc.started_at = now_utc
+    if inc.mtta_minutes is None:
+        inc.mtta_minutes = round(max(0.0, (now_utc - created_dt).total_seconds() / 60.0), 2)
+
+    if status and status in ("open", "triaging", "investigating", "contained_proposal", "resolved", "closed"):
+        inc.status = status
+        tl.append({"at": now_utc.isoformat(), "actor": user.username, "event": f"وضعیت به {status} تغییر یافت"})
+        if status in ("resolved", "closed"):
+            inc.closed_at = now_utc
+            inc.mttr_minutes = round(max(0.0, (now_utc - created_dt).total_seconds() / 60.0), 2)
+
+    if hypothesis_notes_fa is not None:
+        inc.hypothesis_notes_fa = hypothesis_notes_fa
+    if final_report_fa is not None:
+        inc.final_report_fa = final_report_fa
+    if resolution_note is not None:
+        inc.resolution_note = resolution_note
+    if evidence_item:
+        evs = list(inc.evidence_json or [])
+        evs.append({**evidence_item, "added_by": user.username, "at": now_utc.isoformat()})
+        inc.evidence_json = evs
+        tl.append({"at": now_utc.isoformat(), "actor": user.username, "event": "شاهد جدید ثبت شد"})
+
+    inc.timeline_json = tl
+    db.commit()
+    db.refresh(inc)
+    return {
+        "id": inc.id,
+        "status": inc.status,
+        "mtta_minutes": inc.mtta_minutes,
+        "mttr_minutes": inc.mttr_minutes,
+        "blast_radius": inc.blast_radius_json,
+        "hypothesis_notes_fa": inc.hypothesis_notes_fa,
+        "final_report_fa": inc.final_report_fa,
+        "evidence": inc.evidence_json,
+        "timeline": inc.timeline_json,
+    }
+
+
+def classify_security_dataset(
+    db: Session,
+    ds: Dataset,
+    user: User,
+    *,
+    text_column: Optional[str] = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """Run bilingual NLP/Regex classifier & 15 threat categories across an uploaded Excel/Log dataset."""
+    sec_ctx = build_data_security_context(db, user, ds.id)
+    cols_meta = warehouse.describe_table(ds.warehouse_table)
+    sub_sql, params, vis_cols = build_security_projection_and_where(ds.warehouse_table, cols_meta, sec_ctx)
+    custom_rules = load_custom_security_rules(db, user.organization_id)
+
+    chosen_col = text_column if (text_column and text_column in vis_cols) else None
+    if not chosen_col:
+        for cand in vis_cols:
+            if any(k in cand.lower() for k in ("status", "message", "desc", "detail", "threat", "note", "وضعیت", "شرح", "پیام", "توضیح")):
+                chosen_col = cand
+                break
+        if not chosen_col and vis_cols:
+            chosen_col = vis_cols[0]
+
+    safe_lim = max(1, min(int(limit), 5000))
+    res = warehouse.execute_query(
+        f"SELECT * FROM ({sub_sql}) AS _sec_ds LIMIT {safe_lim}",
+        params,
+        limit=safe_lim,
+    )
+    rows = res["rows"]
+    cat_counter: Counter[str] = Counter()
+    status_counter: Counter[str] = Counter()
+    samples: list[dict[str, Any]] = []
+
+    for idx, r in enumerate(rows):
+        combined_text = str(r.get(chosen_col) or "") if chosen_col else ""
+        if not combined_text.strip():
+            combined_text = " ".join(str(v) for v in r.values() if v is not None)
+        out = classify_security_text(combined_text, custom_rules=custom_rules)
+        cat_counter[out["threat_category"]] += 1
+        status_counter[out["threat_status"]] += 1
+        if len(samples) < 25:
+            samples.append(
+                {
+                    "row_index": idx + 1,
+                    "source_text": combined_text[:180],
+                    "threat_category": out["threat_category"],
+                    "threat_category_fa": out["threat_category_fa"],
+                    "threat_status": out["threat_status"],
+                    "extraction_reason": out["extraction_reason"],
+                    "cve_mentioned": out["cve_mentioned"],
+                }
+            )
+
+    return {
+        "dataset_id": ds.id,
+        "text_column": chosen_col,
+        "rows_evaluated": len(rows),
+        "category_breakdown": [
+            {"key": k, "label_fa": CATEGORY_LABEL_MAP.get(k, k), "count": c}
+            for k, c in cat_counter.most_common()
+        ],
+        "status_breakdown": dict(status_counter),
+        "samples": samples,
+    }

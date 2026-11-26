@@ -13,6 +13,8 @@ export default function DatasetsPage() {
   const [selected, setSelected] = useState<any>(null);
   const [preview, setPreview] = useState<any>(null);
   const [profile, setProfile] = useState<any>(null);
+  const [diagnostics, setDiagnostics] = useState<any>(null);
+  const [diagLoading, setDiagLoading] = useState(false);
   const [lineage, setLineage] = useState<any>(null);
   const [metrics, setMetrics] = useState<any[]>([]);
   const [relationships, setRelationships] = useState<any[]>([]);
@@ -59,6 +61,20 @@ export default function DatasetsPage() {
     setPreview(pv);
     setProfile(pf);
     setLineage(lin);
+    setDiagnostics(null);
+  };
+
+  const handleRunDiagnostics = async () => {
+    if (!selected) return;
+    setDiagLoading(true);
+    try {
+      const res = await apiFetch(`/datasets/${selected.id}/analytics-diagnostics`);
+      setDiagnostics(res);
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setDiagLoading(false);
+    }
   };
 
   const handleBuildDashboard = () => {
@@ -174,6 +190,16 @@ export default function DatasetsPage() {
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
+                      onClick={handleRunDiagnostics}
+                      disabled={diagLoading}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-semibold hover:bg-blue-500/10"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      <BarChart2 className="w-3.5 h-3.5 text-blue-500" />
+                      {diagLoading ? "..." : locale === "fa" ? "تحلیل آماری و ناهنجاری‌ها" : "SQL Diagnostics & Outliers"}
+                    </button>
+                    <button
+                      type="button"
                       onClick={handleBuildDashboard}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-white text-xs font-semibold bg-violet-600 hover:bg-violet-700"
                     >
@@ -192,6 +218,64 @@ export default function DatasetsPage() {
                       initialDatasetId={selected.id}
                       onClose={() => setShowSmartStudio(false)}
                     />
+                  </div>
+                )}
+                {diagnostics && (
+                  <div className="p-3.5 rounded-xl border space-y-3 text-xs" style={{ borderColor: "var(--bi-border)", background: "rgba(59,130,246,0.04)" }}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold text-blue-500">
+                        {locale === "fa"
+                          ? "نتایج تحلیل آماری مبتنی بر SQL (بدون حدس)"
+                          : "SQL-First Statistical Diagnostics"}
+                      </span>
+                      <span className="text-[11px] opacity-80">
+                        {locale === "fa" ? "ردیف تکراری:" : "Duplicate Rows:"}{" "}
+                        <b>{diagnostics.duplicate_rows ?? 0}</b>
+                      </span>
+                    </div>
+                    {diagnostics.row_accounting && (
+                      <div className="text-[11px] flex flex-wrap gap-3 opacity-85">
+                        <span>ورودی: <b>{diagnostics.row_accounting.input_rows}</b></span>
+                        <span>معتبر: <b className="text-emerald-500">{diagnostics.row_accounting.valid_rows}</b></span>
+                        <span>نامعتبر/ردشده: <b className="text-amber-500">{diagnostics.row_accounting.invalid_rows}</b></span>
+                      </div>
+                    )}
+                    {Array.isArray(diagnostics.outliers) && diagnostics.outliers.length > 0 && (
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                        {diagnostics.outliers.map((o: any) => (
+                          <div key={o.column} className="p-2 rounded border" style={{ borderColor: "var(--bi-border)" }}>
+                            <div className="font-bold">{o.column} — {o.outlier_count} ناهنجاری IQR</div>
+                            <div className="text-[11px] opacity-75">
+                              Q1: {o.q1} | Q3: {o.q3} | کران پایین: {o.lower_fence} | کران بالا: {o.upper_fence}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {Array.isArray(diagnostics.correlations) && diagnostics.correlations.length > 0 && (
+                      <div>
+                        <div className="font-bold mb-1">{locale === "fa" ? "ماتریس همبستگی قوی (Pearson):" : "Correlations:"}</div>
+                        <div className="flex flex-wrap gap-2">
+                          {diagnostics.correlations.map((c: any, idx: number) => (
+                            <span key={idx} className="px-2 py-1 rounded border font-mono text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
+                              {c.column_a} ↔ {c.column_b}: <b>{c.pearson_r}</b> ({c.strength})
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {diagnostics.period_comparison && (
+                      <div className="p-2 rounded border text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
+                        مقایسه دوره‌ای ({diagnostics.period_comparison.metric_column}): دوره اخیر{" "}
+                        <b>{diagnostics.period_comparison.current_period}</b> ({diagnostics.period_comparison.current_value}) در برابر{" "}
+                        <b>{diagnostics.period_comparison.previous_period}</b> ({diagnostics.period_comparison.previous_value}) —{" "}
+                        {diagnostics.period_comparison.delta_pct !== null && (
+                          <b className={diagnostics.period_comparison.delta_pct >= 0 ? "text-emerald-500" : "text-red-500"}>
+                            {diagnostics.period_comparison.delta_pct}%
+                          </b>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
                 {preview ? (() => {

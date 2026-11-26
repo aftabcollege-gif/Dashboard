@@ -1,14 +1,22 @@
 "use client";
 
-import React, { useState } from "react";
-import { Check, Download, Palette, Plus, Shield } from "lucide-react";
+import React, { useEffect, useState } from "react";
+import { Check, Download, Info, Palette, Plus, Shield } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
 import { apiDownload, apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
+import { APP_VERSION, PREVIOUS_VERSION, RELEASE_DATE, RELEASE_NOTES } from "@/lib/version";
 
 export default function SettingsPage() {
   const { user, locale, themes, activeThemeTokens, applyThemeTokens, refreshThemes, showToast } = useBi();
   const isFa = locale === "fa";
+  const [aboutMeta, setAboutMeta] = useState<any>(null);
+
+  useEffect(() => {
+    apiFetch("/about")
+      .then((res) => setAboutMeta(res))
+      .catch(() => {});
+  }, []);
 
   // Custom Theme Builder
   const [tName, setTName] = useState("");
@@ -171,6 +179,72 @@ export default function SettingsPage() {
             )}
           </div>
         </div>
+
+        {/* About & Release Notes (Versioning Continuity) */}
+        <section id="about" className="bi-card p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-3" style={{ borderColor: "var(--bi-border)" }}>
+            <div>
+              <h2 className="text-sm font-bold flex items-center gap-2">
+                <Info className="w-4 h-4 text-blue-500" />
+                {isFa ? "درباره سامانه و یادداشت انتشار (Release Notes)" : "About Platform & Release Notes"}
+              </h2>
+              <p className="text-[11px] mt-0.5" style={{ color: "var(--bi-muted)" }}>
+                {isFa
+                  ? "نسخه‌گذاری استاندارد Semantic Versioning با حفظ کامل داده‌ها و سازگاری افزایشی از نسخه ۱.۱.۰"
+                  : "Semantic Versioning with backward-compatible incremental upgrades from v1.1.0"}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+              <span className="px-2.5 py-1 rounded-full bg-blue-500/15 text-blue-500 font-mono font-bold">
+                v{aboutMeta?.version || APP_VERSION}
+              </span>
+              <span className="px-2.5 py-1 rounded-full border font-mono" style={{ borderColor: "var(--bi-border)" }}>
+                {isFa ? `نسخه قبلی: v${aboutMeta?.previous_version || PREVIOUS_VERSION}` : `Prev: v${PREVIOUS_VERSION}`}
+              </span>
+              <span className="px-2.5 py-1 rounded-full border" style={{ borderColor: "var(--bi-border)" }}>
+                {aboutMeta?.release_date || RELEASE_DATE}
+              </span>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            {RELEASE_NOTES.map((rel) => (
+              <div
+                key={rel.version}
+                className="p-3.5 rounded-xl border space-y-2 text-xs"
+                style={{ borderColor: "var(--bi-border)", background: "rgba(100,116,139,0.04)" }}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="font-bold flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-500 font-mono">v{rel.version}</span>
+                    <span>{isFa ? rel.titleFa : rel.titleEn}</span>
+                  </div>
+                  <span className="text-[11px]" style={{ color: "var(--bi-muted)" }}>{rel.date}</span>
+                </div>
+                <ul className="list-disc ps-5 space-y-1 text-[11px]">
+                  {rel.highlightsFa.map((item, idx) => (
+                    <li key={idx}>{item}</li>
+                  ))}
+                </ul>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1 text-[10px]" style={{ color: "var(--bi-muted)" }}>
+                  <div>
+                    <strong>{isFa ? "مهاجرت پایگاه‌داده:" : "DB Migration:"}</strong> {rel.migrations.join(", ")}
+                  </div>
+                  <div>
+                    <strong>{isFa ? "تغییرات ناسازگار (Breaking):" : "Breaking Changes:"}</strong>{" "}
+                    {rel.breakingChanges.length === 0 ? (isFa ? "ندارد (سازگاری کامل با گذشته)" : "None") : rel.breakingChanges.join(", ")}
+                  </div>
+                  <div>
+                    <strong>{isFa ? "راهنمای ارتقا:" : "Upgrade:"}</strong> {rel.upgradeNotesFa}
+                  </div>
+                  <div>
+                    <strong>{isFa ? "راهنمای بازگشت (Rollback):" : "Rollback:"}</strong> {rel.rollbackNotesFa}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
       </div>
     </AppShell>
   );

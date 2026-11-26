@@ -101,9 +101,18 @@ export interface BpmnStepMetrics {
   completedCount: number;
   totalCount: number;
   avgWaitHours: number;
+  minWaitHours: number;
   maxWaitHours: number;
   slaHours: number;
   overdueCount: number;
+  slaBreachPct: number;
+  reworkCount: number;
+  reworkRate: number;
+  assigneeCount: number;
+  bottleneckScore: number;
+  flowSharePct: number;
+  matchedRule?: string | null;
+  severity?: string;
   heatRatio: number; // 0..1 normalized across steps
   isBottleneck: boolean;
   items: BpmnCartableItem[];
@@ -832,9 +841,19 @@ export function computeBpmnAnalytics(
     let completedCount: number;
     let totalCount: number;
     let avgWaitHours: number;
+    let minWaitHours: number;
     let maxWaitHours: number;
     let slaHours: number;
     let overdueCount: number;
+    let slaBreachPct: number;
+    let reworkCount: number;
+    let reworkRate: number;
+    let assigneeCount: number;
+    let bottleneckScore: number;
+    let flowSharePct: number;
+    let srvIsBottleneck: boolean | undefined;
+    let matchedRule: string | null | undefined;
+    let severity: string | undefined;
     let assignees: BpmnAssigneeSummary[];
 
     if (useServerStats && srvStep) {
@@ -842,9 +861,19 @@ export function computeBpmnAnalytics(
       completedCount = srvStep.completed_count;
       totalCount = srvStep.total_count;
       avgWaitHours = srvStep.avg_wait_hours;
+      minWaitHours = srvStep.min_wait_hours ?? 0;
       maxWaitHours = srvStep.max_wait_hours;
       slaHours = srvStep.sla_hours || 24;
       overdueCount = srvStep.overdue_count;
+      slaBreachPct = srvStep.sla_breach_pct ?? (totalCount > 0 ? Math.round((overdueCount / totalCount) * 1000) / 10 : 0);
+      reworkCount = srvStep.rework_count ?? 0;
+      reworkRate = srvStep.rework_rate ?? 0;
+      assigneeCount = srvStep.assignee_count ?? srvAssignees.length;
+      bottleneckScore = srvStep.bottleneck_score ?? 0;
+      flowSharePct = srvStep.flow_share_pct ?? 0;
+      srvIsBottleneck = srvStep.is_bottleneck;
+      matchedRule = srvStep.matched_rule;
+      severity = srvStep.severity;
 
       if (srvAssignees.length > 0) {
         assignees = srvAssignees.map((sa) => ({
@@ -882,6 +911,10 @@ export function computeBpmnAnalytics(
         statPool.length > 0
           ? Math.round((statPool.reduce((acc, it) => acc + it.waitHours, 0) / statPool.length) * 10) / 10
           : 0;
+      minWaitHours =
+        statPool.length > 0
+          ? Math.round(Math.min(...statPool.map((it) => it.waitHours)) * 10) / 10
+          : 0;
       maxWaitHours =
         statPool.length > 0
           ? Math.round(Math.max(...statPool.map((it) => it.waitHours)) * 10) / 10
@@ -891,6 +924,14 @@ export function computeBpmnAnalytics(
           ? Math.round(statPool.reduce((acc, it) => acc + it.slaHours, 0) / statPool.length)
           : 24;
       overdueCount = pendingItems.filter((it) => it.isOverdue).length;
+      slaBreachPct = totalCount > 0 ? Math.round((overdueCount / totalCount) * 1000) / 10 : 0;
+      reworkCount = srvStep?.rework_count ?? 0;
+      reworkRate = srvStep?.rework_rate ?? 0;
+      bottleneckScore = srvStep?.bottleneck_score ?? 0;
+      flowSharePct = srvStep?.flow_share_pct ?? 0;
+      srvIsBottleneck = srvStep?.is_bottleneck;
+      matchedRule = srvStep?.matched_rule;
+      severity = srvStep?.severity;
 
       // Also fall back to server assignees if present and local mapping yielded only "کارتابل عمومی"
       const byAssignee = new Map<string, BpmnCartableItem[]>();
@@ -930,6 +971,7 @@ export function computeBpmnAnalytics(
           })
           .sort((a, b) => b.pendingCount - a.pendingCount || b.avgWaitHours - a.avgWaitHours);
       }
+      assigneeCount = srvStep?.assignee_count ?? assignees.length;
     }
 
     const mVal =
@@ -947,11 +989,20 @@ export function computeBpmnAnalytics(
       completedCount,
       totalCount,
       avgWaitHours,
+      minWaitHours,
       maxWaitHours,
       slaHours,
       overdueCount,
+      slaBreachPct,
+      reworkCount,
+      reworkRate,
+      assigneeCount,
+      bottleneckScore,
+      flowSharePct,
+      matchedRule,
+      severity,
       heatRatio: 0,
-      isBottleneck: false,
+      isBottleneck: Boolean(srvIsBottleneck),
       items: matchedItems,
       pendingItems,
       assignees,
@@ -979,7 +1030,9 @@ export function computeBpmnAnalytics(
         : m.avgWaitHours;
     const span = Math.max(1e-6, maxMetricValue - minMetricValue);
     m.heatRatio = m.totalCount === 0 ? 0 : maxMetricValue === minMetricValue ? (rawVal > 0 ? 0.5 : 0) : (rawVal - minMetricValue) / span;
-    m.isBottleneck = m.pendingCount > 0 && (m.heatRatio >= 0.72 || m.avgWaitHours > m.slaHours * 1.15);
+    if (!m.isBottleneck) {
+      m.isBottleneck = m.pendingCount > 0 && (m.heatRatio >= 0.72 || m.avgWaitHours > m.slaHours * 1.15);
+    }
 
     totalPendingRequests += m.pendingCount;
     const w = m.pendingCount > 0 ? m.pendingCount : m.totalCount;

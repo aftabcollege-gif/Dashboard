@@ -38,10 +38,19 @@ export interface BpmnServerStepSummary {
   pending_count: number;
   completed_count: number;
   avg_wait_hours: number;
+  min_wait_hours?: number;
   max_wait_hours: number;
   sla_hours: number;
   overdue_count: number;
+  sla_breach_pct?: number;
+  rework_count?: number;
+  rework_rate?: number;
   assignee_count: number;
+  bottleneck_score?: number;
+  flow_share_pct?: number;
+  is_bottleneck?: boolean;
+  matched_rule?: string | null;
+  severity?: string;
 }
 
 export interface BpmnServerTransition {
@@ -72,6 +81,20 @@ export interface BpmnAnalyticsPayload {
   step_summary: BpmnServerStepSummary[];
   transitions: BpmnServerTransition[];
   assignees_by_step: Record<string, BpmnServerAssignee[]>;
+  saved_layout?: {
+    id: string;
+    node_positions: Record<string, { x: number; y: number }>;
+    zoom: number;
+    pan_x: number;
+    pan_y: number;
+  } | null;
+  active_rule?: {
+    id: string;
+    name: string;
+    formula_json: Record<string, any>;
+    threshold_score: number;
+    severity: string;
+  } | null;
 }
 
 export interface WidgetDataResult {

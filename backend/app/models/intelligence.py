@@ -142,6 +142,11 @@ class SecurityEvent(Base, TimestampMixin):
     policy_name: Mapped[str] = mapped_column(String(180), default="", nullable=False)
     raw_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
     extra_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    threat_category: Mapped[str] = mapped_column(String(96), default="", nullable=False)
+    threat_status: Mapped[str] = mapped_column(String(48), default="", nullable=False)
+    extraction_reason: Mapped[str] = mapped_column(String(220), default="", nullable=False)
+    software_name: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    software_version: Mapped[str] = mapped_column(String(64), default="", nullable=False)
 
 
 class SecurityUnparsedEvent(Base, TimestampMixin):
@@ -216,6 +221,15 @@ class SecurityAlert(Base, TimestampMixin):
     acknowledged_by: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    tier: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    false_positive: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    false_positive_reason: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    assigned_to: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    notes_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SecurityIncident(Base, TimestampMixin):
@@ -241,6 +255,148 @@ class SecurityIncident(Base, TimestampMixin):
     approval_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
     rollback_plan_fa: Mapped[str] = mapped_column(Text, default="", nullable=False)
     resolution_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    assigned_to: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    mtta_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    mttr_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    timeline_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    blast_radius_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    hypothesis_notes_fa: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    evidence_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    final_report_fa: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+
+class BpmnBottleneckRule(Base, TimestampMixin):
+    """Configurable AST-validated bottleneck detection formula & warning/critical thresholds."""
+    __tablename__ = "bpmn_bottleneck_rules"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("datasets.id", ondelete="CASCADE"), nullable=True
+    )
+    process_name: Mapped[str] = mapped_column(String(180), default="*", nullable=False)
+    step_name: Mapped[str] = mapped_column(String(180), default="*", nullable=False)
+    name: Mapped[str] = mapped_column(String(180), nullable=False)
+    formula_expression: Mapped[str] = mapped_column(Text, nullable=False)
+    warning_threshold: Mapped[float] = mapped_column(Float, default=40.0, nullable=False)
+    critical_threshold: Mapped[float] = mapped_column(Float, default=70.0, nullable=False)
+    metric_weights_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class BpmnLayoutConfig(Base, TimestampMixin):
+    """Persisted visual layout, node order & editable display config for BPMN and Process Intelligence."""
+    __tablename__ = "bpmn_layout_configs"
+    __table_args__ = (UniqueConstraint("organization_id", "scope_key", name="uq_bpmn_layout_org_scope"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    scope_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    node_positions_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    manual_order_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    display_config_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    updated_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class SecurityClassificationRule(Base, TimestampMixin):
+    """Admin-configurable Persian/English free-text status NLP/regex & custom threat category rules."""
+    __tablename__ = "security_classification_rules"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    rule_kind: Mapped[str] = mapped_column(String(32), default="status_map", nullable=False)
+    name: Mapped[str] = mapped_column(String(180), nullable=False)
+    pattern: Mapped[str] = mapped_column(Text, nullable=False)
+    target_value: Mapped[str] = mapped_column(String(96), nullable=False)
+    severity_override: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class SecurityVulnerability(Base, TimestampMixin):
+    """Synced NVD / local CVE & CVSS vulnerability catalog."""
+    __tablename__ = "security_vulnerabilities"
+    __table_args__ = (UniqueConstraint("cve_id", name="uq_sec_vuln_cve_id"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    cve_id: Mapped[str] = mapped_column(String(48), nullable=False)
+    software_product: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    affected_version_pattern: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    cvss_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    severity: Mapped[str] = mapped_column(String(24), default="medium", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    source: Mapped[str] = mapped_column(String(64), default="local_catalog", nullable=False)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    references_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+
+
+class SecurityAssetExposure(Base, TimestampMixin):
+    """Asset & software version exposure matching CVEs or explicitly flagging needs_review."""
+    __tablename__ = "security_asset_exposures"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "asset_name", "cve_id", name="uq_sec_asset_cve"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    asset_name: Mapped[str] = mapped_column(String(180), nullable=False)
+    software_name: Mapped[str] = mapped_column(String(160), default="unknown", nullable=False)
+    software_version: Mapped[str] = mapped_column(String(64), default="unknown", nullable=False)
+    cve_id: Mapped[str] = mapped_column(String(48), default="NEEDS_REVIEW", nullable=False)
+    cvss_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    risk_level: Mapped[str] = mapped_column(String(24), default="needs_review", nullable=False)
+    remediation_status: Mapped[str] = mapped_column(String(32), default="open", nullable=False)
+    notes: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    related_event_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ActionItem(Base, TimestampMixin):
+    """Unified Action Management across Process, Security, and Executive KPI recommendations."""
+    __tablename__ = "action_items"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    domain: Mapped[str] = mapped_column(String(32), default="process", nullable=False)
+    source_ref: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    title: Mapped[str] = mapped_column(String(220), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    priority: Mapped[str] = mapped_column(String(24), default="medium", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="open", nullable=False)
+    assignee_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    assignee_name: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    due_date: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    evidence_before_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    evidence_after_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    impact_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_by: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

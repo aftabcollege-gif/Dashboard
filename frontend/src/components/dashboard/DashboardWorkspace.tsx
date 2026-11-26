@@ -152,8 +152,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [nlqResult, setNlqResult] = useState<any>(null);
   const [aiInsights, setAiInsights] = useState<any>(null);
 
-  // Versions & Comments State
+  // Versions, Named Layouts & Comments State
   const [versionsList, setVersionsList] = useState<any[]>([]);
+  const [namedLayouts, setNamedLayouts] = useState<any[]>([]);
   const [commentsList, setCommentsList] = useState<any[]>([]);
   const [newComment, setNewComment] = useState("");
 
@@ -162,7 +163,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const loadDashboard = useCallback(async () => {
     try {
       const localCreated = getDemoCreatedDashboards().find((x) => x.id === dashboardId) || null;
-      const [d, dsList, savedState, dashList] = await Promise.all([
+      const [d, dsList, savedState, dashList, namedLayoutList] = await Promise.all([
         localCreated
           ? Promise.resolve(localCreated)
           : apiFetch<DashboardDetail>(`/dashboards/${dashboardId}`).catch((e) => {
@@ -173,7 +174,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         apiFetch<DatasetInfo[]>("/datasets").catch(() => []),
         apiFetch<any>(`/dashboards/${dashboardId}/state`).catch(() => null),
         apiFetch<any[]>("/dashboards").catch(() => []),
+        apiFetch<any[]>(`/dashboards/${dashboardId}/named-layouts`).catch(() => []),
       ]);
+      setNamedLayouts(namedLayoutList || []);
       const mergedList = authStatus?.environment === "vercel-preview-demo" ? mergeDemoDashboardList(dashList || []) : (dashList || []);
       setAllDashboards(mergedList);
       const resolvedDash =
@@ -1234,6 +1237,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               visualSpec={w.query.visual_spec}
               onPointClick={(field, val) => handleWidgetPointClick(w, field, val)}
               widgetId={w.id}
+              datasetId={w.dataset_id || undefined}
               activeFilters={compiledActiveFilters}
               crossFilters={crossFilters}
               bpmnAnalytics={wd?.bpmn_analytics}
@@ -1375,6 +1379,58 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               <button onClick={saveLayoutToServer} className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1" style={{ borderColor: "var(--bi-primary)", color: "var(--bi-primary)" }}>
                 <Save className="w-3.5 h-3.5" /> {t("saveLayout")}
               </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const nm = prompt(locale === "fa" ? "نام چیدمان جدید:" : "Named layout title:");
+                  if (!nm?.trim()) return;
+                  try {
+                    await saveLayoutToServer();
+                    await apiFetch(`/dashboards/${dash.id}/named-layouts`, {
+                      method: "POST",
+                      body: JSON.stringify({ name: nm.trim() }),
+                    });
+                    const updated = await apiFetch<any[]>(`/dashboards/${dash.id}/named-layouts`).catch(() => []);
+                    setNamedLayouts(updated);
+                    showToast(locale === "fa" ? `چیدمان «${nm}» ذخیره شد` : "Named layout saved");
+                  } catch (err: any) {
+                    showToast(err.message);
+                  }
+                }}
+                className="px-2 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1"
+                style={{ borderColor: "var(--bi-border)" }}
+                title={locale === "fa" ? "ذخیره با نام برای جابه‌جایی سریع بین چیدمان‌ها" : "Save named layout preset"}
+              >
+                <Plus className="w-3 h-3" /> {locale === "fa" ? "چیدمان جدید" : "Named Layout"}
+              </button>
+              {namedLayouts.length > 0 && (
+                <select
+                  aria-label={locale === "fa" ? "اعمال چیدمان ذخیره‌شده" : "Apply Named Layout"}
+                  defaultValue=""
+                  onChange={async (e) => {
+                    const lid = e.target.value;
+                    if (!lid) return;
+                    try {
+                      await apiFetch(`/dashboards/${dash.id}/named-layouts/${lid}/apply`, { method: "POST" });
+                      showToast(locale === "fa" ? "چیدمان اعمال شد" : "Layout applied");
+                      await loadDashboard();
+                    } catch (err: any) {
+                      showToast(err.message);
+                    } finally {
+                      e.target.value = "";
+                    }
+                  }}
+                  className="px-2 py-1.5 rounded-lg border text-xs max-w-[140px]"
+                  style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+                >
+                  <option value="">{locale === "fa" ? "چیدمان‌ها..." : "Layouts..."}</option>
+                  {namedLayouts.map((nl) => (
+                    <option key={nl.id} value={nl.id}>
+                      {nl.name}
+                    </option>
+                  ))}
+                </select>
+              )}
               <select
                 value={currentPage?.layout_settings?.columns_count || 12}
                 onChange={(e) => {

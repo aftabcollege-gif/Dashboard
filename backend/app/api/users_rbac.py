@@ -52,6 +52,7 @@ class UserCreate(BaseModel):
     role_ids: list[str] = []
     group_ids: list[str] = []
     expires_at: Optional[datetime] = None
+    reason: Optional[str] = None
 
 
 class UserUpdate(BaseModel):
@@ -67,6 +68,7 @@ class UserUpdate(BaseModel):
     reset_password: Optional[str] = None
     role_ids: Optional[list[str]] = None
     group_ids: Optional[list[str]] = None
+    reason: Optional[str] = None
 
 
 class RoleCreate(BaseModel):
@@ -74,6 +76,7 @@ class RoleCreate(BaseModel):
     slug: str
     description: str = ""
     permission_ids: list[str] = []
+    reason: Optional[str] = None
 
 
 class GroupCreate(BaseModel):
@@ -81,6 +84,7 @@ class GroupCreate(BaseModel):
     description: str = ""
     role_ids: list[str] = []
     member_user_ids: list[str] = []
+    reason: Optional[str] = None
 
 
 class MatrixPermissionSet(BaseModel):
@@ -92,6 +96,7 @@ class MatrixPermissionSet(BaseModel):
     effect: str = "allow"  # allow | deny | remove
     inherit_to_children: bool = False
     cascade_types: list[str] = []
+    reason: Optional[str] = None
 
 
 class MatrixBulkCopy(BaseModel):
@@ -99,6 +104,7 @@ class MatrixBulkCopy(BaseModel):
     from_subject_id: str
     to_subject_type: str
     to_subject_id: str
+    reason: Optional[str] = None
 
 
 class AccessPolicyCreate(BaseModel):
@@ -110,6 +116,7 @@ class AccessPolicyCreate(BaseModel):
     rule_json: dict[str, Any]
     priority: int = 100
     is_active: bool = True
+    reason: Optional[str] = None
 
 
 class DirectoryCreate(BaseModel):
@@ -211,6 +218,77 @@ def _invalidate_org_caches(db: Session, org_id: str) -> None:
     cache_manager.invalidate_org(org_id)
 
 
+def _active_super_admin_ids(db: Session, org_id: str) -> set[str]:
+    rows = (
+        db.query(User.id)
+        .join(UserRole, UserRole.user_id == User.id)
+        .join(Role, Role.id == UserRole.role_id)
+        .filter(
+            User.organization_id == org_id,
+            User.is_active == True,
+            User.is_locked == False,
+            Role.is_super_admin == True,
+        )
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
+def _active_admin_capable_ids(db: Session, org_id: str) -> set[str]:
+    active_users = (
+        db.query(User)
+        .filter(User.organization_id == org_id, User.is_active == True, User.is_locked == False)
+        .all()
+    )
+    capable: set[str] = set()
+    for candidate in active_users:
+        if (
+            permission_resolver.resolve(db, candidate, "admin", "*", "edit").allowed
+            and permission_resolver.resolve(db, candidate, "admin", "*", "view").allowed
+        ):
+            capable.add(candidate.id)
+    return capable
+
+
+def _guard_last_active_admin_mutation(
+    db: Session,
+    org_id: str,
+    target: User,
+    *,
+    new_is_active: Optional[bool] = None,
+    new_is_locked: Optional[bool] = None,
+    new_role_ids: Optional[list[str]] = None,
+    deleting: bool = False,
+) -> None:
+    super_ids = _active_super_admin_ids(db, org_id)
+    admin_ids = _active_admin_capable_ids(db, org_id)
+
+    will_be_inactive = deleting or (new_is_active is False) or (new_is_locked is True)
+    losing_super = False
+    if target.id in super_ids and new_role_ids is not None:
+        super_role_ids = {
+            r.id for r in db.query(Role).filter(Role.organization_id == org_id, Role.is_super_admin == True).all()
+        }
+        if not (set(new_role_ids) & super_role_ids):
+            losing_super = True
+
+    if target.id in super_ids and (will_be_inactive or losing_super):
+        remaining_supers = super_ids - {target.id}
+        if not remaining_supers:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot deactivate, lock, delete, or remove super_admin role from the last active super_admin in the organization.",
+            )
+
+    if target.id in admin_ids and will_be_inactive:
+        remaining_admins = admin_ids - {target.id}
+        if not remaining_admins:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot deactivate, lock, or delete the last active administrator in the organization.",
+            )
+
+
 # ---------------- USERS ----------------
 @router.get("/users")
 def list_users(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -242,6 +320,7 @@ def list_users(user: User = Depends(get_current_user), db: Session = Depends(get
             "roles": [r.name for r in role_objs],
             "role_slugs": [r.slug for r in role_objs],
             "group_ids": g_ids,
+            "created_at": u.created_at,
         })
     return out
 
@@ -287,7 +366,8 @@ def create_user(
     record_audit(
         db, user.organization_id, "user_created", "user", resource_id=u.id,
         user_id=user.id, username=user.username, ip_address=get_client_ip(request),
-        after_state={"username": u.username, "roles": [r.id for r in valid_roles]}
+        after_state={"username": u.username, "roles": [r.name for r in valid_roles], "groups": [g.name for g in valid_groups]},
+        details={"reason": body.reason} if body.reason else {},
     )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
@@ -309,10 +389,39 @@ def update_user(
     if target.id == user.id and body.is_active is False:
         raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
 
+    _guard_last_active_admin_mutation(
+        db,
+        user.organization_id,
+        target,
+        new_is_active=body.is_active,
+        new_is_locked=body.is_locked,
+        new_role_ids=body.role_ids,
+    )
+
     valid_roles = _validate_org_roles(db, user, body.role_ids) if body.role_ids is not None else None
     valid_groups = _validate_org_groups(db, user, body.group_ids) if body.group_ids is not None else None
 
-    before = {"is_active": target.is_active, "is_locked": target.is_locked, "email": target.email}
+    old_role_names = [
+        r.name
+        for r in db.query(Role)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .filter(UserRole.user_id == target.id)
+        .all()
+    ]
+    old_group_names = [
+        g.name
+        for g in db.query(Group)
+        .join(GroupMember, GroupMember.group_id == Group.id)
+        .filter(GroupMember.user_id == target.id)
+        .all()
+    ]
+    before = {
+        "is_active": target.is_active,
+        "is_locked": target.is_locked,
+        "email": target.email,
+        "roles": old_role_names,
+        "groups": old_group_names,
+    }
     if body.email is not None:
         target.email = body.email
     if body.is_active is not None:
@@ -353,10 +462,20 @@ def update_user(
             db.add(GroupMember(group_id=g.id, user_id=target.id))
 
     target.permission_version += 1
+    new_role_names = [r.name for r in valid_roles] if valid_roles is not None else before["roles"]
+    new_group_names = [g.name for g in valid_groups] if valid_groups is not None else before["groups"]
     record_audit(
         db, user.organization_id, "user_updated", "user", resource_id=target.id,
         user_id=user.id, username=user.username, ip_address=get_client_ip(request),
-        before_state=before, after_state={"is_active": target.is_active, "is_locked": target.is_locked}
+        before_state=before,
+        after_state={
+            "is_active": target.is_active,
+            "is_locked": target.is_locked,
+            "email": target.email,
+            "roles": new_role_names,
+            "groups": new_group_names,
+        },
+        details={"reason": body.reason, "password_reset": bool(body.reset_password)},
     )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
@@ -373,11 +492,14 @@ def delete_user(
     target = get_user_for_org(db, target_user_id, user.organization_id)
     if _actor_is_super_admin(db, target) and not _actor_is_super_admin(db, user):
         raise HTTPException(status_code=403, detail="Only a super_admin can delete a super_admin user")
+    _guard_last_active_admin_mutation(db, user.organization_id, target, deleting=True)
+    before = {"username": target.username, "email": target.email, "is_active": target.is_active}
     _revoke_user_sessions(db, target.id)
     db.delete(target)
     record_audit(
         db, user.organization_id, "user_deleted", "user", resource_id=target_user_id,
-        user_id=user.id, username=user.username, ip_address=get_client_ip(request)
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        before_state=before,
     )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
@@ -401,8 +523,10 @@ def list_roles(user: User = Depends(get_current_user), db: Session = Depends(get
 
 
 @router.post("/roles")
-def create_role(body: RoleCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "admin", "*", "add")
+def create_role(
+    body: RoleCreate, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    enforce_permission(db, user, "admin", "*", "add", ip_address=get_client_ip(request))
     if body.slug.strip().lower() == "super_admin":
         raise HTTPException(status_code=403, detail="Cannot create a super_admin role")
     if db.query(Role).filter(Role.organization_id == user.organization_id, Role.slug == body.slug).first():
@@ -411,35 +535,64 @@ def create_role(body: RoleCreate, user: User = Depends(get_current_user), db: Se
     r = Role(organization_id=user.organization_id, name=body.name, slug=body.slug, description=body.description)
     db.add(r)
     db.flush()
+    valid_pids: list[str] = []
     for pid in body.permission_ids:
         if db.query(Permission).filter(Permission.id == pid).first():
             db.add(RolePermission(role_id=r.id, permission_id=pid, effect="allow"))
+            valid_pids.append(pid)
+    record_audit(
+        db, user.organization_id, "role_created", "role", resource_id=r.id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        after_state={"name": r.name, "slug": r.slug, "permission_count": len(valid_pids)},
+        details={"reason": body.reason} if body.reason else {},
+    )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"id": r.id, "name": r.name}
 
 
 @router.put("/roles/{role_id}")
-def update_role(role_id: str, body: RoleCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "admin", "*", "edit")
+def update_role(
+    role_id: str, body: RoleCreate, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    enforce_permission(db, user, "admin", "*", "edit", ip_address=get_client_ip(request))
     r = get_role_for_org(db, role_id, user.organization_id)
     if r.is_super_admin and not _actor_is_super_admin(db, user):
         raise HTTPException(status_code=403, detail="Only a super_admin can edit a super_admin role")
+    if r.is_super_admin:
+        # Super admin role cannot be stripped of super admin status or admin permissions
+        raise HTTPException(status_code=400, detail="System super_admin role permissions are immutable")
     _assert_can_grant_public_override(db, user, permission_ids=body.permission_ids)
+    old_pids = [
+        rp.permission_id
+        for rp in db.query(RolePermission).filter(RolePermission.role_id == r.id, RolePermission.effect == "allow").all()
+    ]
+    before = {"name": r.name, "description": r.description, "permission_count": len(old_pids)}
     r.name = body.name
     r.description = body.description
     db.query(RolePermission).filter(RolePermission.role_id == r.id).delete()
+    new_pids: list[str] = []
     for pid in body.permission_ids:
         if db.query(Permission).filter(Permission.id == pid).first():
             db.add(RolePermission(role_id=r.id, permission_id=pid, effect="allow"))
+            new_pids.append(pid)
+    record_audit(
+        db, user.organization_id, "role_updated", "role", resource_id=r.id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        before_state=before,
+        after_state={"name": r.name, "description": r.description, "permission_count": len(new_pids)},
+        details={"reason": body.reason, "added": len(set(new_pids) - set(old_pids)), "removed": len(set(old_pids) - set(new_pids))},
+    )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"status": "updated"}
 
 
 @router.post("/roles/{role_id}/clone")
-def clone_role(role_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "admin", "*", "add")
+def clone_role(
+    role_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    enforce_permission(db, user, "admin", "*", "add", ip_address=get_client_ip(request))
     src = get_role_for_org(db, role_id, user.organization_id)
     if src.is_super_admin and not _actor_is_super_admin(db, user):
         raise HTTPException(status_code=403, detail="Only a super_admin can clone a super_admin role")
@@ -454,8 +607,36 @@ def clone_role(role_id: str, user: User = Depends(get_current_user), db: Session
     db.flush()
     for rp in db.query(RolePermission).filter(RolePermission.role_id == src.id).all():
         db.add(RolePermission(role_id=nr.id, permission_id=rp.permission_id, effect=rp.effect))
+    record_audit(
+        db, user.organization_id, "role_cloned", "role", resource_id=nr.id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        after_state={"source_role_id": src.id, "name": nr.name},
+    )
     db.commit()
     return {"id": nr.id, "name": nr.name}
+
+
+@router.delete("/roles/{role_id}")
+def delete_role(
+    role_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    enforce_permission(db, user, "admin", "*", "delete", ip_address=get_client_ip(request))
+    r = get_role_for_org(db, role_id, user.organization_id)
+    if r.is_system or r.is_super_admin:
+        raise HTTPException(status_code=400, detail="System built-in roles cannot be deleted")
+    assigned_count = db.query(UserRole).filter(UserRole.role_id == r.id).count()
+    if assigned_count > 0:
+        raise HTTPException(status_code=400, detail="Role is still assigned to users; unassign users before deleting")
+    before = {"name": r.name, "slug": r.slug}
+    db.delete(r)
+    record_audit(
+        db, user.organization_id, "role_deleted", "role", resource_id=role_id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        before_state=before,
+    )
+    _invalidate_org_caches(db, user.organization_id)
+    db.commit()
+    return {"status": "deleted"}
 
 
 @router.get("/groups")
@@ -471,8 +652,10 @@ def list_groups(user: User = Depends(get_current_user), db: Session = Depends(ge
 
 
 @router.post("/groups")
-def create_group(body: GroupCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "admin", "*", "add")
+def create_group(
+    body: GroupCreate, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    enforce_permission(db, user, "admin", "*", "add", ip_address=get_client_ip(request))
     valid_roles = _validate_org_roles(db, user, body.role_ids)
     valid_users = [get_user_for_org(db, uid, user.organization_id) for uid in body.member_user_ids]
     g = Group(organization_id=user.organization_id, name=body.name, description=body.description, source="local")
@@ -482,17 +665,26 @@ def create_group(body: GroupCreate, user: User = Depends(get_current_user), db: 
         db.add(GroupRole(group_id=g.id, role_id=r.id))
     for u in valid_users:
         db.add(GroupMember(group_id=g.id, user_id=u.id))
+    record_audit(
+        db, user.organization_id, "group_created", "group", resource_id=g.id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        after_state={"name": g.name, "roles": [r.name for r in valid_roles], "members": len(valid_users)},
+        details={"reason": body.reason} if body.reason else {},
+    )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"id": g.id, "name": g.name}
 
 
 @router.put("/groups/{group_id}")
-def update_group(group_id: str, body: GroupCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "admin", "*", "edit")
+def update_group(
+    group_id: str, body: GroupCreate, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    enforce_permission(db, user, "admin", "*", "edit", ip_address=get_client_ip(request))
     g = get_group_for_org(db, group_id, user.organization_id)
     valid_roles = _validate_org_roles(db, user, body.role_ids)
     valid_users = [get_user_for_org(db, uid, user.organization_id) for uid in body.member_user_ids]
+    before = {"name": g.name, "description": g.description}
     g.name = body.name
     g.description = body.description
     db.query(GroupRole).filter(GroupRole.group_id == g.id).delete()
@@ -501,6 +693,13 @@ def update_group(group_id: str, body: GroupCreate, user: User = Depends(get_curr
         db.add(GroupRole(group_id=g.id, role_id=r.id))
     for u in valid_users:
         db.add(GroupMember(group_id=g.id, user_id=u.id))
+    record_audit(
+        db, user.organization_id, "group_updated", "group", resource_id=g.id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        before_state=before,
+        after_state={"name": g.name, "roles": [r.name for r in valid_roles], "members": len(valid_users)},
+        details={"reason": body.reason} if body.reason else {},
+    )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"status": "updated"}
@@ -568,6 +767,17 @@ def set_matrix_permission(
 ):
     enforce_permission(db, user, "admin", "*", "edit", ip_address=get_client_ip(request))
     _validate_matrix_subject(db, user, body.subject_type, body.subject_id)
+    if (
+        body.effect == "deny"
+        and body.resource_type in ("admin", "*")
+        and body.action in ("edit", "view", "*")
+    ):
+        active_admins = _active_admin_capable_ids(db, user.organization_id)
+        if body.subject_type == "user" and body.subject_id in active_admins and len(active_admins) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot deny admin access for the last active administrator in the organization.",
+            )
     _assert_can_grant_public_override(
         db,
         user,
@@ -628,7 +838,7 @@ def set_matrix_permission(
         db, user.organization_id, "permission_changed", body.resource_type,
         resource_id=body.resource_id, user_id=user.id, username=user.username,
         ip_address=get_client_ip(request), before_state=before, after_state=after,
-        details={"subject": f"{body.subject_type}:{body.subject_id}", "action": body.action}
+        details={"subject": f"{body.subject_type}:{body.subject_id}", "action": body.action, **({"reason": body.reason} if body.reason else {})}
     )
     db.commit()
     return {"status": "saved"}
@@ -720,9 +930,9 @@ def list_access_policies(user: User = Depends(get_current_user), db: Session = D
 
 @router.post("/policies")
 def create_access_policy(
-    body: AccessPolicyCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+    body: AccessPolicyCreate, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "admin", "*", "add")
+    enforce_permission(db, user, "admin", "*", "add", ip_address=get_client_ip(request))
     if body.dataset_id:
         get_dataset_for_org(db, body.dataset_id, user.organization_id)
     if body.target_type != "all" and body.target_id:
@@ -739,14 +949,23 @@ def create_access_policy(
         is_active=body.is_active,
     )
     db.add(pol)
+    db.flush()
+    record_audit(
+        db, user.organization_id, "policy_created", "access_policy", resource_id=pol.id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        after_state={"name": pol.name, "policy_type": pol.policy_type, "target": f"{pol.target_type}:{pol.target_id or '*'}"},
+        details={"reason": body.reason} if body.reason else {},
+    )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"id": pol.id, "name": pol.name}
 
 
 @router.delete("/policies/{policy_id}")
-def delete_access_policy(policy_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "admin", "*", "delete")
+def delete_access_policy(
+    policy_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    enforce_permission(db, user, "admin", "*", "delete", ip_address=get_client_ip(request))
     pol = (
         db.query(AccessPolicy)
         .filter(AccessPolicy.id == policy_id, AccessPolicy.organization_id == user.organization_id)
@@ -754,7 +973,13 @@ def delete_access_policy(policy_id: str, user: User = Depends(get_current_user),
     )
     if not pol:
         raise HTTPException(status_code=404, detail="Policy not found")
+    before = {"name": pol.name, "policy_type": pol.policy_type}
     db.delete(pol)
+    record_audit(
+        db, user.organization_id, "policy_deleted", "access_policy", resource_id=policy_id,
+        user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        before_state=before,
+    )
     _invalidate_org_caches(db, user.organization_id)
     db.commit()
     return {"status": "deleted"}

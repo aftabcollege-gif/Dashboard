@@ -5,9 +5,11 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import enforce_permission, get_client_ip, get_current_user
 from app.core.audit import record_audit
+from app.core.cache import cache_manager
 from app.core.permissions import permission_resolver
 from app.core.tenant import get_dataset_for_org
 from app.database import get_db
+from app.engines.bottleneck_rules import PRESET_TEMPLATES, build_formula_expression_text
 from app.engines.process_intelligence import (
     analyze_process_intelligence,
     discover_dataset_processes,
@@ -17,7 +19,7 @@ from app.engines.process_intelligence import (
     save_event_log_mapping,
 )
 from app.models.identity import User
-from app.models.intelligence import ProcessCorrectiveAction
+from app.models.intelligence import BpmnBottleneckRule, BpmnLayoutConfig, ProcessCorrectiveAction
 
 router = APIRouter(prefix="/process-intelligence", tags=["Process Intelligence & BPMN"])
 
@@ -270,3 +272,242 @@ def reevaluate_corrective_action(
     ds = get_dataset_for_org(db, act.dataset_id, user.organization_id)
     enforce_permission(db, user, "process_intel", "*", "manage_actions", ip_address=get_client_ip(request))
     return evaluate_corrective_action(db, ds, user, act)
+
+
+class BottleneckRuleCreate(BaseModel):
+    name: str
+    process_name: Optional[str] = None
+    weights: dict[str, float] = Field(default_factory=dict)
+    min_wait_hours: float = 0.0
+    threshold_score: float = 60.0
+    critical_threshold: float = 75.0
+    severity: str = "high"
+    is_active: bool = True
+
+
+class BpmnLayoutSave(BaseModel):
+    dataset_id: str
+    widget_id: Optional[str] = None
+    process_name: Optional[str] = None
+    node_positions: dict[str, dict[str, float]] = Field(default_factory=dict)
+    zoom: float = 1.0
+    pan_x: float = 0.0
+    pan_y: float = 0.0
+    reset: bool = False
+
+
+def _bpmn_scope_key(dataset_id: str, widget_id: Optional[str], process_name: Optional[str]) -> str:
+    return f"ds:{dataset_id}|w:{widget_id or '*'}|p:{process_name or '*'}"
+
+
+@router.get("/datasets/{dataset_id}/bottleneck-rules")
+def list_bottleneck_rules(
+    dataset_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
+    enforce_permission(db, user, "process_intel", "*", "view")
+    rows = (
+        db.query(BpmnBottleneckRule)
+        .filter(
+            BpmnBottleneckRule.organization_id == user.organization_id,
+            (BpmnBottleneckRule.dataset_id == ds.id) | (BpmnBottleneckRule.dataset_id == None),
+        )
+        .order_by(BpmnBottleneckRule.updated_at.desc())
+        .all()
+    )
+    return {
+        "presets": PRESET_TEMPLATES,
+        "rules": [
+            {
+                "id": r.id,
+                "dataset_id": r.dataset_id,
+                "process_name": None if r.process_name == "*" else r.process_name,
+                "name": r.name,
+                "formula_json": r.metric_weights_json,
+                "formula_expression": r.formula_expression,
+                "threshold_score": r.warning_threshold,
+                "critical_threshold": r.critical_threshold,
+                "severity": "critical" if r.critical_threshold <= 55 else "high",
+                "is_active": r.is_active,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/datasets/{dataset_id}/bottleneck-rules")
+def save_bottleneck_rule(
+    dataset_id: str,
+    body: BottleneckRuleCreate,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view", ip_address=get_client_ip(request))
+    enforce_permission(db, user, "process_intel", "*", "manage_actions", ip_address=get_client_ip(request))
+
+    eff_proc = body.process_name or "*"
+    if body.is_active:
+        db.query(BpmnBottleneckRule).filter(
+            BpmnBottleneckRule.organization_id == user.organization_id,
+            BpmnBottleneckRule.dataset_id == ds.id,
+            BpmnBottleneckRule.process_name == eff_proc,
+        ).update({"is_active": False})
+
+    clean_weights = {k: max(0.0, float(v)) for k, v in (body.weights or {}).items()}
+    warn_thr = max(1.0, min(100.0, float(body.threshold_score)))
+    crit_thr = max(warn_thr, min(100.0, float(body.critical_threshold)))
+    if body.severity == "critical":
+        crit_thr = warn_thr
+
+    rule = BpmnBottleneckRule(
+        organization_id=user.organization_id,
+        dataset_id=ds.id,
+        process_name=eff_proc,
+        step_name="*",
+        name=body.name.strip() or "فرمول سفارشی گلوگاه",
+        formula_expression=build_formula_expression_text(clean_weights),
+        warning_threshold=warn_thr,
+        critical_threshold=crit_thr,
+        metric_weights_json={
+            "weights": clean_weights,
+            "min_wait_hours": max(0.0, float(body.min_wait_hours)),
+        },
+        is_active=body.is_active,
+        created_by=user.id,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    cache_manager.invalidate_dataset(ds.id)
+    record_audit(
+        db, user.organization_id, "bpmn_bottleneck_rule_saved", "process_intel",
+        resource_id=rule.id, user_id=user.id, username=user.username, ip_address=get_client_ip(request),
+        details={"dataset_id": ds.id, "name": rule.name, "threshold": rule.warning_threshold},
+    )
+    return {
+        "id": rule.id,
+        "dataset_id": rule.dataset_id,
+        "process_name": None if rule.process_name == "*" else rule.process_name,
+        "name": rule.name,
+        "formula_json": rule.metric_weights_json,
+        "threshold_score": rule.warning_threshold,
+        "critical_threshold": rule.critical_threshold,
+        "severity": body.severity,
+        "is_active": rule.is_active,
+    }
+
+
+@router.delete("/datasets/{dataset_id}/bottleneck-rules/{rule_id}")
+def delete_bottleneck_rule(
+    dataset_id: str,
+    rule_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "process_intel", "*", "manage_actions", ip_address=get_client_ip(request))
+    rule = (
+        db.query(BpmnBottleneckRule)
+        .filter(
+            BpmnBottleneckRule.id == rule_id,
+            BpmnBottleneckRule.organization_id == user.organization_id,
+            BpmnBottleneckRule.dataset_id == ds.id,
+        )
+        .first()
+    )
+    if not rule:
+        raise HTTPException(status_code=404, detail="Bottleneck rule not found")
+    db.delete(rule)
+    db.commit()
+    cache_manager.invalidate_dataset(ds.id)
+    return {"status": "deleted"}
+
+
+@router.get("/bpmn-layout")
+def get_bpmn_layout(
+    dataset_id: str,
+    widget_id: Optional[str] = None,
+    process_name: Optional[str] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
+    skey = _bpmn_scope_key(ds.id, widget_id, process_name)
+    row = (
+        db.query(BpmnLayoutConfig)
+        .filter(
+            BpmnLayoutConfig.organization_id == user.organization_id,
+            BpmnLayoutConfig.scope_key == skey,
+        )
+        .first()
+    )
+    if not row:
+        return {"node_positions": {}, "zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0}
+    disp = row.display_config_json or {}
+    return {
+        "id": row.id,
+        "node_positions": row.node_positions_json or {},
+        "zoom": disp.get("zoom", 1.0),
+        "pan_x": disp.get("pan_x", 0.0),
+        "pan_y": disp.get("pan_y", 0.0),
+    }
+
+
+@router.put("/bpmn-layout")
+def save_bpmn_layout(
+    body: BpmnLayoutSave,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view", ip_address=get_client_ip(request))
+    skey = _bpmn_scope_key(ds.id, body.widget_id, body.process_name)
+    row = (
+        db.query(BpmnLayoutConfig)
+        .filter(
+            BpmnLayoutConfig.organization_id == user.organization_id,
+            BpmnLayoutConfig.scope_key == skey,
+        )
+        .first()
+    )
+    if body.reset:
+        if row:
+            db.delete(row)
+            db.commit()
+        cache_manager.invalidate_dataset(ds.id)
+        return {"status": "reset", "node_positions": {}}
+
+    if not row:
+        row = BpmnLayoutConfig(
+            organization_id=user.organization_id,
+            scope_key=skey,
+            updated_by=user.id,
+        )
+        db.add(row)
+    row.node_positions_json = body.node_positions
+    row.display_config_json = {
+        "zoom": max(0.4, min(2.5, float(body.zoom or 1.0))),
+        "pan_x": float(body.pan_x or 0.0),
+        "pan_y": float(body.pan_y or 0.0),
+    }
+    row.updated_by = user.id
+    db.commit()
+    db.refresh(row)
+    cache_manager.invalidate_dataset(ds.id)
+    disp = row.display_config_json or {}
+    return {
+        "id": row.id,
+        "node_positions": row.node_positions_json,
+        "zoom": disp.get("zoom", 1.0),
+        "pan_x": disp.get("pan_x", 0.0),
+        "pan_y": disp.get("pan_y", 0.0),
+    }

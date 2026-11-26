@@ -27,6 +27,7 @@ import {
 import { apiFetch, setStoredToken } from "@/lib/api";
 import { isDemoPreviewMode } from "@/lib/demoStore";
 import { useBi } from "@/lib/context";
+import { APP_VERSION } from "@/lib/version";
 
 function InitialSetupScreen() {
   const { t, locale, setLocale, refreshUser, authStatus, showToast } = useBi();
@@ -577,6 +578,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               <LogOut className="w-3.5 h-3.5" />
             </button>
           </div>
+          <Link
+            href="/settings#about"
+            className="flex items-center justify-between px-2 py-1 rounded text-[10px] opacity-75 hover:opacity-100 transition"
+            style={{ color: "var(--bi-muted)" }}
+            title={locale === "fa" ? "درباره سامانه و یادداشت انتشار" : "About & Release Notes"}
+          >
+            <span>{locale === "fa" ? "نسخه سامانه" : "Platform Version"}</span>
+            <span className="font-mono font-bold">v{APP_VERSION}</span>
+          </Link>
         </div>
       </aside>
 

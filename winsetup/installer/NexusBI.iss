@@ -2,7 +2,7 @@
 ; Produces a single offline setup.exe requiring zero external user prerequisites.
 
 #define MyAppName "NexusBI Enterprise"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "NexusBI Contributors"
 #define MyAppURL "https://github.com/aftabcollege-gif/Dashboard"
 #define MyAppExeName "NexusBI.exe"

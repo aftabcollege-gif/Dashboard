@@ -23,6 +23,7 @@ from app.core.rls_cls import (
     build_data_security_context,
     build_security_projection_and_where,
 )
+from app.engines.bottleneck_rules import load_active_bottleneck_rule, score_steps_with_rule
 from app.engines.warehouse import warehouse
 from app.models.data import Dataset, DatasetField
 from app.models.identity import User
@@ -1105,6 +1106,29 @@ def analyze_process_intelligence(
                 "weights": {"duration": 0.30, "volume": 0.20, "rework": 0.20, "cycle_impact": 0.20, "capacity_load": 0.10},
             },
         })
+    active_rule = load_active_bottleneck_rule(
+        db, organization_id=ds.organization_id, dataset_id=ds.id, process_name=active_process
+    )
+    if active_rule and bottlenecks:
+        proxy_steps = [
+            {
+                "step_name": b["activity"],
+                "avg_wait_hours": b.get("avg_wait_hours") or 0.0,
+                "max_wait_hours": b.get("max_wait_hours") or 0.0,
+                "pending_count": b.get("case_count") or 0,
+                "total_count": b.get("event_count") or 0,
+                "overdue_count": 0,
+                "sla_breach_pct": b.get("sla_breach_pct") or 0.0,
+                "rework_rate": b.get("rework_rate_pct") or 0.0,
+            }
+            for b in bottlenecks
+        ]
+        score_steps_with_rule(proxy_steps, rule=active_rule)
+        for b, ps in zip(bottlenecks, proxy_steps):
+            b["composite_bottleneck_score"] = ps["bottleneck_score"]
+            b["is_bottleneck"] = ps["is_bottleneck"]
+            b["matched_rule"] = ps["matched_rule"]
+            b["severity"] = ps["severity"]
     bottlenecks.sort(key=lambda x: -x["composite_bottleneck_score"])
 
     # 3) Transitions across 100% of rows
