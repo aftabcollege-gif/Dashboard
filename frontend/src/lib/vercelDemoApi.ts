@@ -61,7 +61,8 @@ function resolveDemoUser(authHeader: string | null): { username: string; account
 function applyRlsAndFilters(
   rows: Row[],
   username: string | null,
-  filters: any[] = []
+  filters: any[] = [],
+  availableColumns?: string[]
 ): Row[] {
   let out = rows;
   const account = username ? demoData.demo_accounts?.[username] : null;
@@ -69,12 +70,19 @@ function applyRlsAndFilters(
   if (userRegion && userRegion !== "All") {
     out = out.filter((r) => !("region" in r) || r.region === userRegion);
   }
+  const colSet = availableColumns && availableColumns.length > 0 ? new Set(availableColumns) : null;
 
   for (const f of filters || []) {
     if (f?.is_active === false) continue;
     const field = f?.field_name;
     const val = f?.value;
     if (!field || val === undefined || val === null || val === "" || (Array.isArray(val) && val.length === 0)) {
+      continue;
+    }
+    if (colSet && !colSet.has(field)) {
+      continue;
+    }
+    if (!colSet && out.length > 0 && !out.some((r) => Object.prototype.hasOwnProperty.call(r, field))) {
       continue;
     }
     const op = String(f?.operator || "eq").toLowerCase();
@@ -121,7 +129,7 @@ function executeVisualSpec(
   extraDatasets: any[] = []
 ) {
   const { rows: allRows, columns: tableCols } = getTableForDataset(datasetId, extraDatasets);
-  const filtered = applyRlsAndFilters(allRows, username, filters);
+  const filtered = applyRlsAndFilters(allRows, username, filters, tableCols);
   const agg = String(spec?.aggregation || "SUM").toUpperCase();
   const limit = Number(spec?.limit || (rawMode ? 1000 : 200));
 
@@ -337,7 +345,7 @@ function executeDemoBpmnStepDrill(
   ];
   const tbl = getTableForDataset(widget.dataset_id, extraDatasets);
   const cols = tbl.columns || [];
-  let rows = applyRlsAndFilters(tbl.rows || [], username, combinedFilters);
+  let rows = applyRlsAndFilters(tbl.rows || [], username, combinedFilters, cols);
   const spec = widget.query?.visual_spec || {};
   const viz = widget.config?.visualization || {};
   const rawCfg = {
@@ -370,6 +378,7 @@ function executeDemoBpmnStepDrill(
         sla_hours: 48,
         overdue_count: 0,
       },
+      timeline: [],
       assignees: [],
       items: [],
       total_items: 0,
@@ -377,7 +386,9 @@ function executeDemoBpmnStepDrill(
       offset: Number(body?.offset || 0),
     };
   }
-  let items = body?.pending_only && stepStats.pendingItems.length > 0 ? stepStats.pendingItems : stepStats.items;
+  let items = [
+    ...(body?.pending_only && stepStats.pendingItems.length > 0 ? stepStats.pendingItems : stepStats.items),
+  ].sort((a, b) => b.waitHours - a.waitHours || String(a.requestId).localeCompare(String(b.requestId)));
   if (body?.assignee_name) {
     const aNorm = normalizeBpmnText(body.assignee_name);
     items = items.filter((it) => normalizeBpmnText(it.assigneeName) === aNorm);
@@ -392,8 +403,46 @@ function executeDemoBpmnStepDrill(
         normalizeBpmnText(it.department).includes(qNorm)
     );
   }
-  const limit = Math.max(1, Math.min(Number(body?.limit || 80), 200));
-  const offset = Math.max(0, Number(body?.offset || 0));
+  const limit = Math.max(1, Math.min(Number(body?.limit || 80), 500));
+  const rawOffset = Math.max(0, Number(body?.offset || 0));
+  const offset = items.length > 0 && rawOffset >= items.length
+    ? Math.max(0, Math.floor((items.length - 1) / limit) * limit)
+    : rawOffset;
+
+  const sortedWaits = stepStats.items.map((it) => it.waitHours).sort((a, b) => a - b);
+  const medianWait = sortedWaits.length
+    ? Math.round(sortedWaits[Math.floor(sortedWaits.length / 2)] * 10) / 10
+    : stepStats.avgWaitHours;
+  const p95Wait = sortedWaits.length
+    ? Math.round(sortedWaits[Math.min(sortedWaits.length - 1, Math.floor(sortedWaits.length * 0.95))] * 10) / 10
+    : stepStats.maxWaitHours;
+  const slaBreachPct = stepStats.totalCount > 0
+    ? Math.round((stepStats.overdueCount / stepStats.totalCount) * 1000) / 10
+    : 0;
+
+  const tlBuckets = new Map<string, { total: number; pending: number; waits: number[]; overdue: number }>();
+  for (const it of stepStats.items) {
+    if (!it.enteredAt) continue;
+    const period = String(it.enteredAt).slice(0, 7);
+    if (!/^\d{4}[-/]\d{2}$/.test(period)) continue;
+    if (!tlBuckets.has(period)) tlBuckets.set(period, { total: 0, pending: 0, waits: [], overdue: 0 });
+    const b = tlBuckets.get(period)!;
+    b.total += 1;
+    if (it.isPending) b.pending += 1;
+    b.waits.push(it.waitHours);
+    if (it.isOverdue) b.overdue += 1;
+  }
+  const timeline = Array.from(tlBuckets.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .slice(0, 60)
+    .map(([period, b]) => ({
+      period,
+      total_count: b.total,
+      pending_count: b.pending,
+      avg_wait_hours: b.waits.length ? Math.round((b.waits.reduce((x, y) => x + y, 0) / b.waits.length) * 10) / 10 : 0,
+      overdue_count: b.overdue,
+    }));
+
   return {
     step_name: stepStats.stepKey,
     process_name: body?.process_name || null,
@@ -405,10 +454,14 @@ function executeDemoBpmnStepDrill(
       pending_count: stepStats.pendingCount,
       completed_count: stepStats.completedCount,
       avg_wait_hours: stepStats.avgWaitHours,
+      median_wait_hours: medianWait,
+      p95_wait_hours: p95Wait,
       max_wait_hours: stepStats.maxWaitHours,
       sla_hours: stepStats.slaHours,
       overdue_count: stepStats.overdueCount,
+      sla_breach_pct: slaBreachPct,
     },
+    timeline,
     assignees: stepStats.assignees.map((a) => ({
       assigneeName: a.assigneeName,
       assigneeRole: a.assigneeRole,
@@ -423,6 +476,17 @@ function executeDemoBpmnStepDrill(
     limit,
     offset,
   };
+}
+
+function findWidgetInDemo(widgetId: string, body?: any): any | null {
+  const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards)
+    ? body.demo_context.custom_dashboards
+    : [];
+  for (const d of customDashes) {
+    const hit = (d?.widgets || []).find((x: any) => x.id === widgetId);
+    if (hit) return hit;
+  }
+  return findWidget(widgetId)?.widget || null;
 }
 
 function executeWidgetForDemo(
@@ -2019,7 +2083,12 @@ export async function handleVercelDemoApi(
               config: w.config,
               query: w.query,
               drill_rule: w.drill_rule,
-              data: { columns: res.columns, rows: res.rows, row_count: res.row_count },
+              data: {
+                columns: res.columns,
+                rows: res.rows,
+                row_count: res.row_count,
+                ...(res.bpmn_analytics ? { bpmn_analytics: res.bpmn_analytics } : {}),
+              },
             };
           }),
         },
@@ -2029,11 +2098,14 @@ export async function handleVercelDemoApi(
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "public" && segments[2] && segments[3] === "widgets" && segments[4] && segments[5] === "bpmn-drill") {
     const token = segments[2];
-    const detMatch = Object.values(demoData.dashboards_detail || {}).find(
-      (d: any) => d.is_public && d.embed_token === token
-    ) as any;
+    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
+    const detMatch =
+      (customDashes.find((d: any) => d?.is_public && d?.embed_token === token) as any) ||
+      (Object.values(demoData.dashboards_detail || {}).find(
+        (d: any) => d.is_public && d.embed_token === token
+      ) as any);
     if (!detMatch) return { status: 404, body: { detail: "Public dashboard not found" } };
-    const w = (detMatch.widgets || []).find((x: any) => x.id === segments[4]);
+    const w = (detMatch.widgets || []).find((x: any) => x.id === segments[4]) || findWidgetInDemo(segments[4], body);
     if (!w) return { status: 404, body: { detail: "Widget not found" } };
     return { status: 200, body: executeDemoBpmnStepDrill(w, null, body, getExtraDatasets(body)) };
   }
@@ -2156,15 +2228,7 @@ export async function handleVercelDemoApi(
     };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "data") {
-    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
-    let foundWidget: any = null;
-    for (const d of customDashes) {
-      const hit = (d?.widgets || []).find((x: any) => x.id === segments[2]);
-      if (hit) { foundWidget = hit; break; }
-    }
-    if (!foundWidget) {
-      foundWidget = findWidget(segments[2])?.widget || null;
-    }
+    const foundWidget = findWidgetInDemo(segments[2], body);
     if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
     return {
       status: 200,
@@ -2180,29 +2244,21 @@ export async function handleVercelDemoApi(
       ),
     };
   }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "bpmn-drill" && segments[4] === "export") {
+    const foundWidget = findWidgetInDemo(segments[2], body);
+    if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
+    const drillRes = executeDemoBpmnStepDrill(foundWidget, username, { ...(body || {}), limit: 500, offset: 0 }, extraDatasets);
+    const cols = ["requestId", "requestTitle", "assigneeName", "assigneeRole", "department", "waitHours", "slaHours", "status", "enteredAt"];
+    const csvText = "\ufeff" + toCsv(cols, drillRes.items || []);
+    return { status: 200, textBody: csvText, contentType: "text/csv; charset=utf-8" };
+  }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "bpmn-drill") {
-    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
-    let foundWidget: any = null;
-    for (const d of customDashes) {
-      const hit = (d?.widgets || []).find((x: any) => x.id === segments[2]);
-      if (hit) { foundWidget = hit; break; }
-    }
-    if (!foundWidget) {
-      foundWidget = findWidget(segments[2])?.widget || null;
-    }
+    const foundWidget = findWidgetInDemo(segments[2], body);
     if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
     return { status: 200, body: executeDemoBpmnStepDrill(foundWidget, username, body, extraDatasets) };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "drill-details") {
-    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
-    let foundWidget: any = null;
-    for (const d of customDashes) {
-      const hit = (d?.widgets || []).find((x: any) => x.id === segments[2]);
-      if (hit) { foundWidget = hit; break; }
-    }
-    if (!foundWidget) {
-      foundWidget = findWidget(segments[2])?.widget || null;
-    }
+    const foundWidget = findWidgetInDemo(segments[2], body);
     if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
     const dsId = foundWidget.dataset_id;
     const dsObj = getEffectiveDatasets(extraDatasets).find((d: any) => d.id === dsId);

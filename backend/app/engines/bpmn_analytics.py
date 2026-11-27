@@ -803,7 +803,16 @@ def execute_bpmn_step_drill(
     )
     total_items = _safe_int(cnt_items_res["rows"][0]["cnt"]) if cnt_items_res["rows"] else 0
 
-    order_sql = f"ORDER BY {wait_expr} DESC" if wait_col else ""
+    order_parts: list[str] = []
+    if wait_col:
+        order_parts.append(f"{wait_expr} DESC")
+    if req_col:
+        order_parts.append(f'CAST("{req_col}" AS VARCHAR) ASC')
+    if entered_col:
+        order_parts.append(f'CAST("{entered_col}" AS VARCHAR) ASC')
+    if step_col:
+        order_parts.append(f'CAST("{step_col}" AS VARCHAR) ASC')
+    order_sql = f"ORDER BY {', '.join(order_parts)}" if order_parts else ""
     raw_items_res = warehouse.execute_query(
         f"WITH {step_cte} SELECT * FROM _step_rows {item_where_sql} {order_sql} LIMIT {safe_limit} OFFSET {safe_offset}",
         item_params,

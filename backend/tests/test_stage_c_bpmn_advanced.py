@@ -155,3 +155,122 @@ def test_stage_c_bpmn_11_kpis_rules_layout_timeline_and_excel_export(client, adm
     client.delete(f"/api/v1/process-intelligence/datasets/{ds_id}/bottleneck-rules/{rule_id}", headers=admin_headers)
     client.delete(f"/api/v1/dashboards/{dash_id}", headers=admin_headers)
     client.delete(f"/api/v1/datasets/{ds_id}", headers=admin_headers)
+
+
+def test_stage_c_bpmn_drill_pagination_next_page(client, admin_headers):
+    """Regression test: BPMN drill-down multi-page pagination (limit=80, offset=0/80/160) & Page 2 cross-filter."""
+    rows = ["process_name,request_id,step_name,entered_at,wait_hours,sla_hours,assignee_name,status"]
+    for i in range(1, 186):
+        # Include tied wait_hours to verify deterministic tie-breaking across pages
+        wait_h = float((i % 15) + 10)
+        rows.append(
+            f"خرید تجهیزات,REQ-{i:04d},بررسی فنی,2026-03-{(i % 28) + 1:02d} 10:00:00,{wait_h},24,سارا محمدی,در انتظار اقدام"
+        )
+    csv_bytes = "\n".join(rows).encode("utf-8")
+
+    up = client.post(
+        "/api/v1/data-sources/files/import",
+        headers=admin_headers,
+        files={"file": ("bpmn_paginated.csv", csv_bytes, "text/csv")},
+        data={"dataset_name": "Stage_C_BPMN_Paginated"},
+    )
+    assert up.status_code == 200, up.text
+    ds_id = up.json()["dataset_id"]
+
+    dash_r = client.post("/api/v1/dashboards", headers=admin_headers, json={"title": "BPMN Pagination Dash"})
+    assert dash_r.status_code == 200, dash_r.text
+    dash_id = dash_r.json()["id"]
+    pages_r = client.get(f"/api/v1/dashboards/{dash_id}", headers=admin_headers)
+    page1_id = pages_r.json()["pages"][0]["id"]
+
+    p2_r = client.post(
+        f"/api/v1/dashboards/{dash_id}/pages",
+        headers=admin_headers,
+        json={"title": "جزئیات", "is_drill_through": True},
+    )
+    assert p2_r.status_code == 200, p2_r.text
+    page2_id = p2_r.json()["id"]
+
+    w_r = client.post(
+        f"/api/v1/dashboards/{dash_id}/widgets",
+        headers=admin_headers,
+        json={
+            "page_id": page1_id,
+            "title": "BPMN Paginated Widget",
+            "chart_type": "bpmn",
+            "dataset_id": ds_id,
+            "visual_spec": {
+                "aggregation": "RAW",
+                "bpmn_config": {
+                    "process_field": "process_name",
+                    "step_field": "step_name",
+                    "wait_field": "wait_hours",
+                    "sla_field": "sla_hours",
+                    "assignee_field": "assignee_name",
+                    "request_id_field": "request_id",
+                    "entered_at_field": "entered_at",
+                    "status_field": "status",
+                },
+            },
+        },
+    )
+    assert w_r.status_code == 200, w_r.text
+    widget_id = w_r.json()["id"]
+
+    w2_r = client.post(
+        f"/api/v1/dashboards/{dash_id}/widgets",
+        headers=admin_headers,
+        json={
+            "page_id": page2_id,
+            "title": "جزئیات رکوردهای گام",
+            "chart_type": "table",
+            "dataset_id": ds_id,
+            "visual_spec": {"aggregation": "RAW", "limit": 100},
+        },
+    )
+    assert w2_r.status_code == 200, w2_r.text
+    w2_id = w2_r.json()["id"]
+
+    # Page 1 (offset 0), Page 2 (offset 80), Page 3 (offset 160)
+    p1 = client.post(
+        f"/api/v1/dashboards/widgets/{widget_id}/bpmn-drill",
+        headers=admin_headers,
+        json={"step_name": "بررسی فنی", "process_name": "خرید تجهیزات", "pending_only": True, "limit": 80, "offset": 0},
+    )
+    p2 = client.post(
+        f"/api/v1/dashboards/widgets/{widget_id}/bpmn-drill",
+        headers=admin_headers,
+        json={"step_name": "بررسی فنی", "process_name": "خرید تجهیزات", "pending_only": True, "limit": 80, "offset": 80},
+    )
+    p3 = client.post(
+        f"/api/v1/dashboards/widgets/{widget_id}/bpmn-drill",
+        headers=admin_headers,
+        json={"step_name": "بررسی فنی", "process_name": "خرید تجهیزات", "pending_only": True, "limit": 80, "offset": 160},
+    )
+    assert p1.status_code == 200 and p2.status_code == 200 and p3.status_code == 200
+    j1, j2, j3 = p1.json(), p2.json(), p3.json()
+    assert j1["total_items"] == 185
+    assert j2["total_items"] == 185
+    assert j3["total_items"] == 185
+    assert len(j1["items"]) == 80
+    assert len(j2["items"]) == 80
+    assert len(j3["items"]) == 25
+    ids_all = [it["requestId"] for it in j1["items"] + j2["items"] + j3["items"]]
+    assert len(set(ids_all)) == 185, "Duplicate or missing items across paginated BPMN drill pages"
+
+    # Next dashboard page (execute-batch on page2) with BPMN cross-filter
+    batch_p2 = client.post(
+        f"/api/v1/dashboards/{dash_id}/execute-batch",
+        headers=admin_headers,
+        json={
+            "page_id": page2_id,
+            "cross_filters": [{"field_name": "step_name", "operator": "eq", "value": "بررسی فنی", "source_widget_id": widget_id}],
+        },
+    )
+    assert batch_p2.status_code == 200, batch_p2.text
+    assert w2_id in batch_p2.json()["widgets"]
+    assert batch_p2.json()["widgets"][w2_id]["row_count"] == 100
+
+    client.delete(f"/api/v1/dashboards/{dash_id}", headers=admin_headers)
+    client.delete(f"/api/v1/datasets/{ds_id}", headers=admin_headers)
+

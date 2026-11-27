@@ -26,6 +26,11 @@ import {
 } from "lucide-react";
 import { apiFetch, getCsrfCookie, getStoredToken } from "@/lib/api";
 import {
+  getDemoCreatedDashboards,
+  getDemoUploadedDatasets,
+  isDemoPreviewMode,
+} from "@/lib/demoStore";
+import {
   BpmnAssigneeSummary,
   BpmnCartableItem,
   BpmnNode,
@@ -259,6 +264,8 @@ export default function BpmnProcessViewer({
 
   const [serverDrill, setServerDrill] = useState<ServerDrillPayload | null>(null);
   const [drillLoading, setDrillLoading] = useState<boolean>(false);
+  const [drillError, setDrillError] = useState<string | null>(null);
+  const [drillRetryTick, setDrillRetryTick] = useState<number>(0);
 
   const analytics = useMemo(
     () => computeBpmnAnalytics(rows || [], columns || [], bpmnConfig, heatmapMetric, bpmnAnalytics),
@@ -365,32 +372,58 @@ export default function BpmnProcessViewer({
       for (const [k, v] of Object.entries(localFieldOverrides)) {
         if (v) cleanOverrides[k] = v;
       }
+      const payload: Record<string, any> = {
+        step_name: activeStepMetrics.stepKey,
+        process_name: bpmnAnalytics?.active_process || null,
+        assignee_name: selectedAssignee,
+        pending_only: !showAllStatusesInDrill && (activeStepMetrics.pendingCount ?? 0) > 0,
+        search: drillSearch.trim() || null,
+        limit: 500,
+        offset: 0,
+        active_filters: activeFilters,
+        cross_filters: crossFilters,
+        field_overrides: Object.keys(cleanOverrides).length > 0 ? cleanOverrides : null,
+      };
+      if (isDemoPreviewMode()) {
+        const uploaded = getDemoUploadedDatasets();
+        if (uploaded.length > 0) {
+          payload.demo_uploaded_datasets = uploaded.map((u) => ({
+            ...u,
+            is_uploaded_excel: true,
+            rows: (u.rows || []).slice(0, 5000),
+          }));
+        }
+        const customDashes = getDemoCreatedDashboards();
+        if (customDashes.length > 0) {
+          payload.demo_context = { custom_dashboards: customDashes };
+        }
+      }
       const res = await fetch(`/api/v1/dashboards/widgets/${widgetId}/bpmn-drill/export`, {
         method: "POST",
         credentials: "include",
         headers,
-        body: JSON.stringify({
-          step_name: activeStepMetrics.stepKey,
-          process_name: bpmnAnalytics?.active_process || null,
-          assignee_name: selectedAssignee,
-          pending_only: !showAllStatusesInDrill && (activeStepMetrics.pendingCount ?? 0) > 0,
-          search: drillSearch.trim() || null,
-          limit: 500,
-          offset: 0,
-          active_filters: activeFilters,
-          cross_filters: crossFilters,
-          field_overrides: Object.keys(cleanOverrides).length > 0 ? cleanOverrides : null,
-        }),
+        body: JSON.stringify(payload),
       });
-      if (!res.ok) throw new Error(`Export failed (${res.status})`);
+      if (!res.ok) {
+        let errDetail = `Export failed (${res.status})`;
+        try {
+          const j = await res.json();
+          if (j?.detail) errDetail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+        } catch {
+          // ignore parse error
+        }
+        throw new Error(errDetail);
+      }
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      const ext = ct.includes("text/csv") ? "csv" : "xlsx";
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `bpmn_cartable_${activeStepMetrics.stepKey}.xlsx`;
+      a.download = `bpmn_cartable_${activeStepMetrics.stepKey}.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
-      showToast(isFa ? "فایل اکسل کارتابل دانلود شد" : "Excel exported");
+      showToast(isFa ? "فایل کارتابل دانلود شد" : "Export downloaded");
     } catch (err: any) {
       showToast(err.message || "Export failed");
     } finally {
@@ -403,10 +436,15 @@ export default function BpmnProcessViewer({
     [bpmnAnalytics?.available_columns, columns]
   );
 
+  const filtersKey = useMemo(() => JSON.stringify(activeFilters || []), [activeFilters]);
+  const crossFiltersKey = useMemo(() => JSON.stringify(crossFilters || []), [crossFilters]);
+  const fieldOverridesKey = useMemo(() => JSON.stringify(localFieldOverrides || {}), [localFieldOverrides]);
+
   // Fetch live SQL cartable drill-down when widgetId is available
   useEffect(() => {
     if (!selectedStepKey || !widgetId) {
       setServerDrill(null);
+      setDrillError(null);
       return;
     }
     const stepMeta = stepMap[selectedStepKey];
@@ -417,9 +455,10 @@ export default function BpmnProcessViewer({
     }
     let cancelled = false;
     setDrillLoading(true);
+    setDrillError(null);
     const endpoint = publicShareToken
-      ? `/api/v1/dashboards/public/${publicShareToken}/widgets/${widgetId}/bpmn-drill`
-      : `/api/v1/dashboards/widgets/${widgetId}/bpmn-drill`;
+      ? `/dashboards/public/${publicShareToken}/widgets/${widgetId}/bpmn-drill`
+      : `/dashboards/widgets/${widgetId}/bpmn-drill`;
 
     apiFetch<ServerDrillPayload>(endpoint, {
       method: "POST",
@@ -437,10 +476,22 @@ export default function BpmnProcessViewer({
       }),
     })
       .then((res) => {
-        if (!cancelled) setServerDrill(res);
+        if (cancelled) return;
+        setServerDrill(res);
+        setDrillError(null);
+        if (res && res.total_items > 0 && drillOffset >= res.total_items) {
+          const safeLim = Math.max(1, res.limit || 80);
+          const lastValidOffset = Math.max(0, Math.floor((res.total_items - 1) / safeLim) * safeLim);
+          if (lastValidOffset !== drillOffset) setDrillOffset(lastValidOffset);
+        }
       })
-      .catch(() => {
-        if (!cancelled) setServerDrill(null);
+      .catch((err: any) => {
+        if (cancelled) return;
+        const errMsg =
+          err?.message ||
+          (isFa ? "خطا در بارگذاری جزئیات صفحه کارتابل" : "Failed to load cartable page");
+        setDrillError(errMsg);
+        if (drillOffset === 0) setServerDrill(null);
       })
       .finally(() => {
         if (!cancelled) setDrillLoading(false);
@@ -458,9 +509,10 @@ export default function BpmnProcessViewer({
     showAllStatusesInDrill,
     drillSearch,
     drillOffset,
-    activeFilters,
-    crossFilters,
-    localFieldOverrides,
+    filtersKey,
+    crossFiltersKey,
+    fieldOverridesKey,
+    drillRetryTick,
   ]);
 
   const bounds = useMemo(() => {
@@ -585,7 +637,10 @@ export default function BpmnProcessViewer({
       );
     });
 
-    const displayedItems = serverDrill ? serverDrill.items : localFilteredList;
+    const pageLimit = serverDrill?.limit || 80;
+    const displayedItems = serverDrill
+      ? serverDrill.items
+      : localFilteredList.slice(drillOffset, drillOffset + pageLimit);
     const totalDisplayedCount = serverDrill ? serverDrill.total_items : localFilteredList.length;
 
     const effSummary = {
@@ -617,6 +672,7 @@ export default function BpmnProcessViewer({
                 setDrillSearch("");
                 setDrillOffset(0);
                 setServerDrill(null);
+                setDrillError(null);
               }}
               className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-bold text-white"
               style={{ backgroundColor: activeThemeTokens.primary }}
@@ -948,18 +1004,31 @@ export default function BpmnProcessViewer({
               </table>
             </div>
 
-            {serverDrill && totalDisplayedCount > serverDrill.limit && (
+            {drillError && (
+              <div className="mt-2 px-2.5 py-1.5 rounded-md border border-red-500/40 bg-red-500/10 text-red-500 flex items-center justify-between gap-2 text-[10px]">
+                <span>{drillError}</span>
+                <button
+                  type="button"
+                  onClick={() => setDrillRetryTick((t) => t + 1)}
+                  className="px-2 py-0.5 rounded border border-red-500/40 font-semibold hover:bg-red-500/15 shrink-0"
+                >
+                  {isFa ? "تلاش مجدد" : "Retry"}
+                </button>
+              </div>
+            )}
+
+            {totalDisplayedCount > pageLimit && (
               <div className="flex items-center justify-between pt-2 border-t text-[10px]" style={{ borderColor: activeThemeTokens.border }}>
                 <span>
                   {isFa
-                    ? `نمایش ${drillOffset + 1} تا ${Math.min(drillOffset + serverDrill.limit, totalDisplayedCount)} از ${totalDisplayedCount.toLocaleString("fa-IR")}`
-                    : `${drillOffset + 1}-${Math.min(drillOffset + serverDrill.limit, totalDisplayedCount)} of ${totalDisplayedCount}`}
+                    ? `نمایش ${drillOffset + 1} تا ${Math.min(drillOffset + pageLimit, totalDisplayedCount)} از ${totalDisplayedCount.toLocaleString("fa-IR")}`
+                    : `${drillOffset + 1}-${Math.min(drillOffset + pageLimit, totalDisplayedCount)} of ${totalDisplayedCount}`}
                 </span>
                 <div className="flex items-center gap-1">
                   <button
                     type="button"
-                    disabled={drillOffset === 0}
-                    onClick={() => setDrillOffset((o) => Math.max(0, o - serverDrill.limit))}
+                    disabled={drillLoading || drillOffset === 0}
+                    onClick={() => setDrillOffset((o) => Math.max(0, o - pageLimit))}
                     className="px-2 py-0.5 rounded border disabled:opacity-40"
                     style={{ borderColor: activeThemeTokens.border }}
                   >
@@ -967,8 +1036,8 @@ export default function BpmnProcessViewer({
                   </button>
                   <button
                     type="button"
-                    disabled={drillOffset + serverDrill.limit >= totalDisplayedCount}
-                    onClick={() => setDrillOffset((o) => o + serverDrill.limit)}
+                    disabled={drillLoading || drillOffset + pageLimit >= totalDisplayedCount}
+                    onClick={() => setDrillOffset((o) => o + pageLimit)}
                     className="px-2 py-0.5 rounded border disabled:opacity-40"
                     style={{ borderColor: activeThemeTokens.border }}
                   >

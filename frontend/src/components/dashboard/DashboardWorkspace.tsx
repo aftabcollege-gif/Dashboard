@@ -1151,7 +1151,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                 })}
               </select>
             )}
-            {w.drill_rule?.drill_through_page_id && (
+            {w.drill_rule?.drill_through_page_id &&
+              dash.pages.some((p) => p.id === w.drill_rule?.drill_through_page_id) && (
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -1682,6 +1683,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           ) : (
             <div ref={gridContainerRef} dir="ltr" className="w-full min-w-0">
               <Responsive
+                key={activePageId}
                 className="layout"
                 width={effectiveGridWidth}
                 layouts={gridLayouts}

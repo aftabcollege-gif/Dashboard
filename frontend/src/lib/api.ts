@@ -382,7 +382,11 @@ export async function apiFetch<T = any>(
       path.startsWith("/queries/") ||
       path.includes("/execute-batch") ||
       path.includes("/filter-options") ||
-      (path.startsWith("/dashboards/widgets/") && (path.endsWith("/data") || path.endsWith("/drill-details"))))
+      (path.startsWith("/dashboards/") &&
+        (path.endsWith("/data") ||
+          path.endsWith("/drill-details") ||
+          path.endsWith("/bpmn-drill") ||
+          path.endsWith("/bpmn-drill/export"))))
   ) {
     try {
       const parsedBody = JSON.parse(effectiveBody);

@@ -373,7 +373,7 @@ def build_visual_query_sql(
         if candidate and str(candidate) in merged_hidden and str(candidate) not in avail_cols:
             raise PermissionError(f"Access denied to hidden column '{candidate}'")
 
-    if explicit_cols and not x_field and not y_field and not measures:
+    if (explicit_cols or agg in ("RAW", "NONE")) and not x_field and not y_field and not measures:
         safe_cols = [f'"{c}"' for c in explicit_cols if is_safe_column_ident(c) and c in avail_cols]
         sel_sql = ", ".join(safe_cols) if safe_cols else "*"
         lim = max(1, min(int(visual_spec.get("limit", 1000)), settings.MAX_QUERY_ROWS))
