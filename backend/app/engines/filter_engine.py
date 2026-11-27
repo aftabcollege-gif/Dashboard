@@ -1,9 +1,25 @@
 import re
 from datetime import date, timedelta
 from typing import Any, Optional
+from app.core.rls_cls import DataSecurityContext, build_security_projection_and_where, is_safe_column_ident
+from app.core.sql_guard import validate_filter_expression_ast
+from app.engines.formula_engine import gregorian_to_jalali, jalali_to_gregorian, parse_jalali_or_gregorian_date
 from app.engines.warehouse import warehouse
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _maybe_convert_jalali_bound(val: Any, calendar_hint: Optional[str] = None) -> Any:
+    if not isinstance(val, str):
+        return val
+    txt = val.strip()
+    if not txt:
+        return val
+    if calendar_hint == "jalali" or re.match(r"^(13|14|۱۳|۱۴)\d{2}[-/]", txt):
+        parsed = parse_jalali_or_gregorian_date(txt)
+        if parsed is not None:
+            return parsed.isoformat()
+    return val
 
 
 def compile_filters_to_sql(
@@ -13,10 +29,6 @@ def compile_filters_to_sql(
     """
     Advanced Filtering Engine Compiler (Section 7).
     Compiles Global, Dashboard, Widget, and Cross filters into parameterized DuckDB SQL.
-    Returns:
-      where_clauses: list[str]
-      params: list[Any]
-      top_n: Optional[dict] (for Top N / Bottom N / Ranking)
     """
     where_clauses: list[str] = []
     params: list[Any] = []
@@ -26,7 +38,7 @@ def compile_filters_to_sql(
         if f.get("is_active") is False:
             continue
         field = str(f.get("field_name") or f.get("field") or "").strip()
-        if not field or not IDENT_RE.match(field):
+        if not field or not is_safe_column_ident(field):
             continue
         if available_columns is not None and field not in available_columns:
             continue
@@ -42,7 +54,6 @@ def compile_filters_to_sql(
 
         col_sql = f'"{field}"'
 
-        # Null checks don't require value
         if op == "is_null":
             where_clauses.append(f"{col_sql} IS NULL")
             continue
@@ -50,7 +61,6 @@ def compile_filters_to_sql(
             where_clauses.append(f"{col_sql} IS NOT NULL")
             continue
 
-        # Skip unset/empty filters cleanly
         if val is None or val == "" or (isinstance(val, list) and len(val) == 0):
             continue
 
@@ -83,6 +93,7 @@ def compile_filters_to_sql(
             where_clauses.append(f"{col_sql} <= ?")
             params.append(val)
         elif op in ("between", "numeric_range", "date_range"):
+            cal_hint = str(f.get("calendar") or "").lower() or None
             if isinstance(val, dict):
                 low, high = val.get("min") or val.get("start"), val.get("max") or val.get("end")
             elif isinstance(val, (list, tuple)) and len(val) >= 2:
@@ -91,12 +102,11 @@ def compile_filters_to_sql(
                 continue
             if low is not None and low != "":
                 where_clauses.append(f"{col_sql} >= ?")
-                params.append(low)
+                params.append(_maybe_convert_jalali_bound(low, cal_hint))
             if high is not None and high != "":
                 where_clauses.append(f"{col_sql} <= ?")
-                params.append(high)
+                params.append(_maybe_convert_jalali_bound(high, cal_hint))
         elif op == "relative_date":
-            # e.g. last_7_days, last_30_days, last_90_days, last_365_days, ytd, mtd
             today = date.today()
             mode = str(val).lower()
             start_d: Optional[date] = None
@@ -112,6 +122,14 @@ def compile_filters_to_sql(
                 start_d = date(today.year, 1, 1)
             elif mode == "mtd":
                 start_d = date(today.year, today.month, 1)
+            elif mode == "jalali_ytd":
+                jy, _, _ = gregorian_to_jalali(today.year, today.month, today.day)
+                gy, gm, gd = jalali_to_gregorian(jy, 1, 1)
+                start_d = date(gy, gm, gd)
+            elif mode == "jalali_mtd":
+                jy, jm, _ = gregorian_to_jalali(today.year, today.month, today.day)
+                gy, gm, gd = jalali_to_gregorian(jy, jm, 1)
+                start_d = date(gy, gm, gd)
             if start_d is not None:
                 where_clauses.append(f"CAST({col_sql} AS DATE) >= ?")
                 params.append(start_d.isoformat())
@@ -134,10 +152,8 @@ def compile_filters_to_sql(
                 "field": order_metric or field,
             }
         elif op == "custom_expression":
-            expr = str(val).strip()
-            # Strict validation: allow safe column comparisons without DDL/DML/subqueries
-            if not re.search(r"[;]|(--)|(/\*)|(\bDROP\b|\bDELETE\b|\bUPDATE\b|\bINSERT\b|\bUNION\b)", expr.upper()):
-                where_clauses.append(f"({expr})")
+            expr = validate_filter_expression_ast(str(val), allowed_columns=available_columns)
+            where_clauses.append(f"({expr})")
 
     return {"where_clauses": where_clauses, "params": params, "top_n": top_n_spec}
 
@@ -150,13 +166,42 @@ def get_cascading_filter_options(
     rls_params: list[Any],
     search: Optional[str] = None,
     limit: int = 200,
+    sec_ctx: Optional[DataSecurityContext] = None,
 ) -> list[Any]:
-    if not IDENT_RE.match(warehouse_table) or not IDENT_RE.match(field_name):
+    if not IDENT_RE.match(warehouse_table) or not is_safe_column_ident(field_name):
         raise ValueError("Invalid table or field identifier")
 
-    compiled = compile_filters_to_sql(parent_filters)
-    where_parts = list(rls_clauses) + list(compiled["where_clauses"])
-    params = list(rls_params) + list(compiled["params"])
+    bounded_limit = max(1, min(int(limit), 1000))
+    cols_meta = warehouse.describe_table(warehouse_table)
+    eff_ctx = sec_ctx or DataSecurityContext(
+        user_id="filter_opts",
+        rls_where_clauses=list(rls_clauses or []),
+        rls_params=list(rls_params or []),
+        hidden_columns=set(),
+        masked_columns={},
+        context_hash="filter_opts",
+    )
+
+    if field_name in eff_ctx.hidden_columns:
+        return []
+
+    for pf in parent_filters or []:
+        if pf.get("is_active") is False:
+            continue
+        pfield = str(pf.get("field_name") or pf.get("field") or "").strip()
+        if pfield and pfield in eff_ctx.hidden_columns:
+            raise PermissionError(f"Access denied to hidden column '{pfield}' in filter")
+
+    sub_sql, sub_params, visible_cols = build_security_projection_and_where(
+        warehouse_table, cols_meta, eff_ctx, source_schema="main"
+    )
+    avail = set(visible_cols)
+    if field_name not in avail:
+        raise ValueError("Field not found or restricted in dataset")
+
+    compiled = compile_filters_to_sql(parent_filters, available_columns=avail)
+    where_parts = list(compiled["where_clauses"])
+    params = list(sub_params) + list(compiled["params"])
 
     if search:
         where_parts.append(f'LOWER(CAST("{field_name}" AS VARCHAR)) LIKE ?')
@@ -164,8 +209,8 @@ def get_cascading_filter_options(
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     sql = (
-        f'SELECT DISTINCT "{field_name}" AS val FROM "{warehouse_table}" '
-        f"{where_sql} ORDER BY 1 ASC LIMIT {int(limit)}"
+        f'SELECT DISTINCT "{field_name}" AS val FROM ({sub_sql}) AS _fopt '
+        f"{where_sql} ORDER BY 1 ASC LIMIT {bounded_limit}"
     )
-    res = warehouse.execute_query(sql, params, limit=limit)
+    res = warehouse.execute_query(sql, params, limit=bounded_limit)
     return [r["val"] for r in res["rows"] if r["val"] is not None]

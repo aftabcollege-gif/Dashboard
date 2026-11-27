@@ -453,21 +453,22 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
 
     # 2. Roles (10 Enterprise Roles + Scoped Viewer)
     all_pairs = list(perm_map.keys())
+    delegable_pairs = [k for k in all_pairs if k != ("dashboard", "public_restricted_override")]
     roles: dict[str, Role] = {}
     roles["super_admin"] = _create_role_with_perms(
         db, org.id, "Super Administrator", "super_admin", "Full unrestricted platform control", perm_map, all_pairs, is_super=True
     )
     roles["org_admin"] = _create_role_with_perms(
         db, org.id, "Organization Administrator", "org_admin", "Manage organization users, data & dashboards",
-        perm_map, [k for k in all_pairs if k[0] != "organization" or k[1] == "view"]
+        perm_map, [k for k in delegable_pairs if k[0] != "organization" or k[1] == "view"]
     )
     roles["security_admin"] = _create_role_with_perms(
-        db, org.id, "Security Administrator", "security_admin", "Manage RBAC, AD, RLS/CLS & Audit logs",
-        perm_map, [k for k in all_pairs if k[0] in ("admin", "organization", "dashboard", "widget")]
+        db, org.id, "Security Administrator", "security_admin", "Manage RBAC, AD, RLS/CLS, Security Logs & Audit",
+        perm_map, [k for k in delegable_pairs if k[0] in ("admin", "organization", "dashboard", "widget", "security_log", "process_intel")]
     )
     roles["dashboard_admin"] = _create_role_with_perms(
         db, org.id, "Dashboard Administrator", "dashboard_admin", "Manage dashboards, layouts, themes & permissions",
-        perm_map, [k for k in all_pairs if k[0] in ("workspace", "dashboard", "dashboard_page", "widget", "drill_down", "filter", "export", "dataset", "query")]
+        perm_map, [k for k in delegable_pairs if k[0] in ("workspace", "dashboard", "dashboard_page", "widget", "drill_down", "filter", "export", "dataset", "query", "process_intel")]
     )
     roles["dashboard_designer"] = _create_role_with_perms(
         db, org.id, "Dashboard Designer", "dashboard_designer", "Design dashboards, widgets, themes & queries",
@@ -488,6 +489,7 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
             ("dataset", "view"), ("data_source", "view"), ("query", "view"), ("query", "add"),
             ("query", "edit"), ("query", "execute"), ("filter", "view"), ("filter", "edit"),
             ("filter", "add"), ("export", "view"), ("export", "export_pdf"), ("export", "export_excel"), ("export", "export_csv"),
+            ("process_intel", "view"), ("process_intel", "manage_mapping"), ("process_intel", "view_case_details"),
         ],
     )
     roles["data_analyst"] = _create_role_with_perms(
@@ -503,12 +505,15 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
             ("data_source", "view"), ("query", "view"), ("query", "add"), ("query", "execute"),
             ("filter", "view"), ("filter", "edit"), ("export", "view"), ("export", "export_pdf"),
             ("export", "export_excel"), ("export", "export_csv"),
+            ("process_intel", "view"), ("process_intel", "view_case_details"),
+            ("security_log", "view"),
         ],
     )
     roles["data_engineer"] = _create_role_with_perms(
         db, org.id, "Data Engineer", "data_engineer", "Manage Data Sources, Datasets & ETL Pipelines",
         perm_map,
-        [k for k in all_pairs if k[0] in ("data_source", "dataset", "query", "workspace", "dashboard")]
+        [k for k in delegable_pairs if k[0] in ("data_source", "dataset", "query", "workspace", "dashboard", "process_intel")]
+        + [("security_log", "view"), ("security_log", "ingest")]
     )
     roles["report_viewer"] = _create_role_with_perms(
         db, org.id, "Report Viewer", "report_viewer", "Read-only viewer with interactive filtering",
@@ -529,6 +534,7 @@ def seed_core_catalog(db: Session) -> tuple[Organization, dict[str, Role], dict[
             ("drill_down", "drill_down"), ("drill_down", "drill_up"), ("drill_down", "drill_through"),
             ("drill_down", "drill_level_1"), ("drill_down", "drill_level_2"), ("drill_down", "drill_level_3"),
             ("filter", "view"), ("filter", "edit"), ("export", "view"), ("export", "export_pdf"), ("export", "export_excel"),
+            ("process_intel", "view"),
         ],
     )
     roles["custom_scoped"] = _create_role_with_perms(
@@ -1398,7 +1404,7 @@ def seed_sample_bi_content(
         description="Template featuring Funnel, Radar, Scatter, Waterfall, Sunburst, Geographic Map, Pivot & Statistical Charts",
         theme_id=theme_objs["glassmorphism"].id,
         is_template=True,
-        is_public=True,
+        is_public=False,
         created_by=owner_id,
     )
     db.add(d3)
@@ -1446,6 +1452,16 @@ def seed_database(db: Session) -> None:
     """
     existing_org = db.query(Organization).filter(Organization.slug == "enterprise-corp").first()
     if existing_org:
+        existing_perms = {(p.resource_type, p.action) for p in db.query(Permission).all()}
+        added_perm = False
+        for rt, act, desc in PERMISSION_CATALOG:
+            if (rt, act) not in existing_perms:
+                db.add(Permission(resource_type=rt, action=act, description=desc))
+                added_perm = True
+        if added_perm:
+            db.commit()
+            seed_core_catalog(db)
+            db.commit()
         # Ensure warehouse tables exist if already seeded earlier and warehouse file was cleaned
         if db.query(EtlPipeline).count() > 0 and not warehouse.table_exists("wh_enterprise_sales"):
             for pl in db.query(EtlPipeline).all():
@@ -1460,7 +1476,7 @@ def seed_database(db: Session) -> None:
 
     org, roles, theme_objs = seed_core_catalog(db)
 
-    if not settings.BI_SEED_DEMO_USERS:
+    if settings.ENVIRONMENT == "production" or not settings.BI_SEED_DEMO_USERS:
         # Production / Windows Secure Mode: zero default passwords, zero demo accounts, zero mock AD!
         db.commit()
         return

@@ -60,6 +60,7 @@ function proxyRequest(req, res, targetHost, targetPort) {
       proxyRes.pipe(res, { end: true });
     }
   );
+  proxyReq.setTimeout(600_000);
 
   proxyReq.on("error", (err) => {
     if (!res.headersSent) {
@@ -102,7 +103,7 @@ const server = http.createServer((req, res) => {
   proxyRequest(req, res, "127.0.0.1", NEXT_PORT);
 });
 
-server.requestTimeout = 120_000;
+server.requestTimeout = 600_000;
 server.headersTimeout = 60_000;
 
 server.listen(UI_PORT, HOSTNAME, () => {

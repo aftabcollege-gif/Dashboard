@@ -1,8 +1,11 @@
+import re
 from typing import Any
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from app.api.deps import get_current_user
+from app.api.deps import enforce_permission, get_current_user
+from app.core.permissions import permission_resolver
+from app.core.tenant import get_theme_for_org
 from app.database import get_db
 from app.models.dashboard import DashboardTheme
 from app.models.identity import User
@@ -12,14 +15,18 @@ router = APIRouter(prefix="/themes", tags=["Theme Engine & Customization"])
 
 class ThemeCreate(BaseModel):
     name: str
-    slug: str
+    slug: str = ""
     mode: str = "light"
     tokens_json: dict[str, Any]
 
 
 @router.get("")
 def list_themes(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = db.query(DashboardTheme).filter(DashboardTheme.organization_id == user.organization_id).all()
+    rows = (
+        db.query(DashboardTheme)
+        .filter((DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == user.organization_id))
+        .all()
+    )
     return [
         {
             "id": t.id, "name": t.name, "slug": t.slug, "is_builtin": t.is_builtin,
@@ -31,9 +38,12 @@ def list_themes(user: User = Depends(get_current_user), db: Session = Depends(ge
 
 @router.post("")
 def create_custom_theme(body: ThemeCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not permission_resolver.resolve(db, user, "dashboard", "*", "change_theme").allowed:
+        enforce_permission(db, user, "admin", "*", "edit")
+    slug = body.slug.strip() or re.sub(r"[^a-z0-9]+", "-", body.name.lower()).strip("-") or "custom-theme"
     existing = (
         db.query(DashboardTheme)
-        .filter(DashboardTheme.organization_id == user.organization_id, DashboardTheme.slug == body.slug)
+        .filter(DashboardTheme.organization_id == user.organization_id, DashboardTheme.slug == slug)
         .first()
     )
     if existing:
@@ -46,7 +56,7 @@ def create_custom_theme(body: ThemeCreate, user: User = Depends(get_current_user
     dt = DashboardTheme(
         organization_id=user.organization_id,
         name=body.name,
-        slug=body.slug,
+        slug=slug,
         is_builtin=False,
         mode=body.mode,
         tokens_json=body.tokens_json,
@@ -59,7 +69,5 @@ def create_custom_theme(body: ThemeCreate, user: User = Depends(get_current_user
 
 @router.get("/{theme_id}/export")
 def export_theme(theme_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    t = db.query(DashboardTheme).filter(DashboardTheme.id == theme_id).first()
-    if not t:
-        raise HTTPException(status_code=404, detail="Theme not found")
+    t = get_theme_for_org(db, theme_id, user.organization_id)
     return {"name": t.name, "slug": t.slug, "mode": t.mode, "tokens_json": t.tokens_json}

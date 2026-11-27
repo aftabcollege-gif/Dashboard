@@ -77,8 +77,9 @@ export default function QueryBuilderPage() {
         }),
       });
       setResult(res);
-      if (res.explain_plan) {
-        setPlan(Array.isArray(res.explain_plan) ? res.explain_plan : [String(res.explain_plan)]);
+      const rawPlan = res.query_plan ?? res.explain_plan;
+      if (rawPlan) {
+        setPlan(Array.isArray(rawPlan) ? rawPlan : [String(rawPlan)]);
       }
       load();
     } catch (err: any) {
@@ -442,7 +443,7 @@ export default function QueryBuilderPage() {
                 <div className="space-y-1 max-h-36 overflow-y-auto">
                   {history.slice(0, 10).map((h) => (
                     <div key={h.id} className="flex justify-between p-2 rounded border text-[11px]" style={{ borderColor: "var(--bi-border)" }}>
-                      <span className="font-mono truncate max-w-md">{h.sql_text}</span>
+                      <span className="font-mono truncate max-w-md">{h.sql_text || (h.query_hash ? `hash:${h.query_hash}` : h.id)}</span>
                       <span>{h.status} · {h.execution_ms} ms ({h.rows_returned} rows)</span>
                     </div>
                   ))}

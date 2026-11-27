@@ -17,12 +17,17 @@ import {
   Menu,
   Palette,
   RefreshCw,
+  ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Terminal,
+  Workflow,
   X,
 } from "lucide-react";
 import { apiFetch, setStoredToken } from "@/lib/api";
+import { isDemoPreviewMode } from "@/lib/demoStore";
 import { useBi } from "@/lib/context";
+import { APP_VERSION } from "@/lib/version";
 
 function InitialSetupScreen() {
   const { t, locale, setLocale, refreshUser, authStatus, showToast } = useBi();
@@ -72,7 +77,11 @@ function InitialSetupScreen() {
           setup_token: setupToken || undefined,
         }),
       });
-      setStoredToken(res.access_token);
+      if (isDemoPreviewMode()) {
+        setStoredToken(res.access_token);
+      } else {
+        setStoredToken(null);
+      }
       if (typeof window !== "undefined" && window.location.search.includes("setup_token")) {
         window.history.replaceState({}, "", window.location.pathname);
       }
@@ -260,7 +269,11 @@ function LoginScreen() {
         showToast("Enter your 6-digit MFA code");
         return;
       }
-      setStoredToken(res.access_token);
+      if (isDemoPreviewMode()) {
+        setStoredToken(res.access_token);
+      } else {
+        setStoredToken(null);
+      }
       await refreshUser();
     } catch (err: any) {
       setError(err.message || "Authentication failed");
@@ -442,9 +455,32 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     return <LoginScreen />;
   }
 
+  const hasScopeAccess = (resourceType: string, action: string = "view"): boolean => {
+    const ep = user?.effective_permissions;
+    if (!ep) return true;
+    if (ep.is_super_admin) return true;
+    const rolePerms: any[] = ep.role_permissions || [];
+    const resPerms: any[] = ep.resource_permissions || [];
+    const denied =
+      rolePerms.some((p) => p.resource_type === resourceType && p.action === action && p.effect === "deny") ||
+      resPerms.some((p) => p.resource_type === resourceType && p.action === action && p.effect === "deny");
+    if (denied) return false;
+    return (
+      rolePerms.some((p) => p.resource_type === resourceType && p.action === action && p.effect === "allow") ||
+      resPerms.some((p) => p.resource_type === resourceType && p.action === action && p.effect === "allow")
+    );
+  };
+
   const navItems = [
     { href: "/", label: t("home"), icon: Home },
     { href: "/dashboards", label: t("dashboards"), icon: FolderKanban },
+    { href: "/descriptive-builder", label: t("descriptiveBuilder"), icon: Sparkles },
+    ...(hasScopeAccess("process_intel", "view")
+      ? [{ href: "/process-intelligence", label: t("processIntelligence"), icon: Workflow }]
+      : []),
+    ...(hasScopeAccess("security_log", "view")
+      ? [{ href: "/security-intel", label: t("securityIntel"), icon: ShieldAlert }]
+      : []),
     { href: "/data-sources", label: t("dataSources"), icon: Database },
     { href: "/datasets", label: t("datasets"), icon: Layers },
     { href: "/query-builder", label: t("queryBuilder"), icon: Terminal },
@@ -542,6 +578,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               <LogOut className="w-3.5 h-3.5" />
             </button>
           </div>
+          <Link
+            href="/settings#about"
+            className="flex items-center justify-between px-2 py-1 rounded text-[10px] opacity-75 hover:opacity-100 transition"
+            style={{ color: "var(--bi-muted)" }}
+            title={locale === "fa" ? "درباره سامانه و یادداشت انتشار" : "About & Release Notes"}
+          >
+            <span>{locale === "fa" ? "نسخه سامانه" : "Platform Version"}</span>
+            <span className="font-mono font-bold">v{APP_VERSION}</span>
+          </Link>
         </div>
       </aside>
 

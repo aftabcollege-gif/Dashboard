@@ -3,19 +3,26 @@ import sqlparse
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from app.api.deps import enforce_permission, get_client_ip, get_current_user
+from app.api.deps import enforce_permission, enforce_scoped_rate_limit, get_client_ip, get_current_user
+from app.config import settings
 from app.core.audit import record_audit
 from app.core.rls_cls import apply_cls_and_masking, build_data_security_context
+from app.core.sql_guard import validate_readonly_sql_ast
+from app.core.tenant import (
+    get_dashboard_for_org,
+    get_dataset_for_org,
+    get_page_for_org,
+    list_org_allowed_dataset_tables,
+)
 from app.database import get_db
 from app.engines.query_engine import build_visual_query_sql, execute_dataset_sql
 from app.engines.warehouse import warehouse
 from app.models.dashboard import (
-    DashboardPage,
     Widget,
     WidgetConfig,
     WidgetQuery,
 )
-from app.models.data import DataLineage, Dataset, QueryParameter, SavedQuery
+from app.models.data import DataLineage, QueryParameter, SavedQuery
 from app.models.identity import User
 from app.models.performance import QueryExecutionLog
 
@@ -67,8 +74,19 @@ def execute_sql_editor(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    enforce_permission(db, user, "query", "*", "execute", ip_address=get_client_ip(request))
-    ds = db.query(Dataset).filter(Dataset.id == body.dataset_id).first() if body.dataset_id else None
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "execute_sql",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 5,
+    )
+    enforce_permission(db, user, "query", "*", "execute", ip_address=ip)
+    ds = get_dataset_for_org(db, body.dataset_id, user.organization_id) if body.dataset_id else None
+    bounded_limit = max(1, min(int(body.limit), settings.MAX_QUERY_ROWS))
     try:
         result = execute_dataset_sql(
             db,
@@ -76,9 +94,10 @@ def execute_sql_editor(
             body.sql_text,
             dataset=ds,
             named_params=body.parameters,
-            limit=body.limit,
+            limit=bounded_limit,
             include_explain=body.include_explain,
             use_cache=False,
+            enforce_dataset_rbac=True,
         )
         record_audit(
             db, user.organization_id, "sql_query_executed", "query",
@@ -87,27 +106,53 @@ def execute_sql_editor(
             details={"rows": result["row_count"], "ms": result["execution_ms"]}
         )
         return result
-    except Exception as exc:
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SQL error: {exc}")
 
 
 @router.post("/execute-visual")
 def execute_visual_builder(
     body: VisualExecuteRequest,
+    request: Request,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    enforce_permission(db, user, "query", "*", "execute")
-    ds = db.query(Dataset).filter(Dataset.id == body.dataset_id).first()
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "execute_visual",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN * 2,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 5,
+    )
+    enforce_permission(db, user, "query", "*", "execute", ip_address=ip)
+    ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
     try:
+        sec_bundle: dict[str, Any] = {}
         sec_ctx = build_data_security_context(db, user, ds.id)
-        sql, params, mode = build_visual_query_sql(
-            db, ds, body.visual_spec, body.filters, sec_ctx.rls_where_clauses, sec_ctx.rls_params
+        sql, params, _ = build_visual_query_sql(
+            db,
+            ds,
+            body.visual_spec,
+            body.filters,
+            sec_ctx.rls_where_clauses,
+            sec_ctx.rls_params,
+            user=user,
+            enforce_join_rbac=True,
+            security_bundle_out=sec_bundle,
         )
         res = warehouse.execute_query(sql, params)
-        vis_cols, masked_rows = apply_cls_and_masking(res["columns"], res["rows"], sec_ctx)
+        eff_ctx = sec_bundle.get("merged_sec_ctx") or sec_ctx
+        vis_cols, masked_rows = apply_cls_and_masking(res["columns"], res["rows"], eff_ctx)
         return {
             "generated_sql": sql,
             "columns": vis_cols,
@@ -115,6 +160,10 @@ def execute_visual_builder(
             "row_count": len(masked_rows),
             "execution_ms": res["execution_ms"],
         }
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -145,6 +194,22 @@ def list_saved_queries(user: User = Depends(get_current_user), db: Session = Dep
 @router.post("/saved")
 def save_query(body: SaveQueryRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "query", "*", "add")
+    if body.dataset_id:
+        ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
+        enforce_permission(db, user, "dataset", ds.id, "view")
+    if body.query_mode == "sql" and body.sql_text:
+        org_map = list_org_allowed_dataset_tables(db, user.organization_id)
+        try:
+            refs = validate_readonly_sql_ast(
+                body.sql_text, allowed_tables=set(org_map.keys()), require_table_allowlist=True
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid saved SQL: {exc}")
+        for tbl in refs:
+            rds = org_map.get(tbl.lower())
+            if rds:
+                enforce_permission(db, user, "dataset", rds.id, "view")
+
     sq = SavedQuery(
         organization_id=user.organization_id,
         name=body.name,
@@ -198,16 +263,37 @@ def convert_query_to_widget(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    dash = get_dashboard_for_org(db, body.dashboard_id, user.organization_id)
     enforce_permission(
-        db, user, "dashboard", body.dashboard_id, "add_widget", ip_address=get_client_ip(request)
+        db, user, "dashboard", dash.id, "add_widget", ip_address=get_client_ip(request)
     )
-    page = db.query(DashboardPage).filter(DashboardPage.id == body.page_id).first()
-    if not page:
-        raise HTTPException(status_code=404, detail="Dashboard page not found")
+    page, page_dash = get_page_for_org(db, body.page_id, user.organization_id)
+    if page_dash.id != dash.id:
+        raise HTTPException(status_code=400, detail="Dashboard page does not belong to target dashboard")
+    if body.dataset_id:
+        ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
+        enforce_permission(db, user, "dataset", ds.id, "view")
+    for j in (body.visual_spec or {}).get("joins", []) or []:
+        jid = j.get("dataset_id")
+        if jid:
+            jds = get_dataset_for_org(db, str(jid), user.organization_id)
+            enforce_permission(db, user, "dataset", jds.id, "view")
+    if body.query_mode == "sql" and body.sql_text:
+        org_map = list_org_allowed_dataset_tables(db, user.organization_id)
+        try:
+            refs = validate_readonly_sql_ast(
+                body.sql_text, allowed_tables=set(org_map.keys()), require_table_allowlist=True
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid widget SQL: {exc}")
+        for tbl in refs:
+            rds = org_map.get(tbl.lower())
+            if rds:
+                enforce_permission(db, user, "dataset", rds.id, "view")
 
     w = Widget(
-        dashboard_id=body.dashboard_id,
-        page_id=body.page_id,
+        dashboard_id=dash.id,
+        page_id=page.id,
         title=body.title,
         chart_type=body.chart_type,
         dataset_id=body.dataset_id,
@@ -245,7 +331,7 @@ def convert_query_to_widget(
                 DataLineage.source_type == "dataset",
                 DataLineage.source_id == body.dataset_id,
                 DataLineage.target_type == "dashboard",
-                DataLineage.target_id == body.dashboard_id,
+                DataLineage.target_id == dash.id,
             )
             .first()
         )
@@ -255,7 +341,7 @@ def convert_query_to_widget(
                     source_type="dataset",
                     source_id=body.dataset_id,
                     target_type="dashboard",
-                    target_id=body.dashboard_id,
+                    target_id=dash.id,
                 )
             )
     db.commit()

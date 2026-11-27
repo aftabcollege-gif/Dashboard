@@ -1,20 +1,19 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { CheckCircle2, Database, FileSpreadsheet, Play, Plus, Sparkles, Trash2, UploadCloud, XCircle } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 
 export default function DataSourcesPage() {
-  const router = useRouter();
   const { user, locale, showToast } = useBi();
   const [sources, setSources] = useState<any[]>([]);
   const [datasets, setDatasets] = useState<any[]>([]);
   const [supported, setSupported] = useState<{ databases: string[]; files: string[] }>({ databases: [], files: [] });
   const [lastImported, setLastImported] = useState<any>(null);
-  const [buildingDash, setBuildingDash] = useState(false);
+  const [studioDatasetId, setStudioDatasetId] = useState<string>("");
 
   // New DB Connector form
   const [name, setName] = useState("");
@@ -37,18 +36,38 @@ export default function DataSourcesPage() {
   const [fileObj, setFileObj] = useState<File | null>(null);
   const [datasetName, setDatasetName] = useState("");
   const [sheetName, setSheetName] = useState("");
+  const [selectedSheets, setSelectedSheets] = useState<string[]>([]);
+  const [mergeSheets, setMergeSheets] = useState(false);
+  const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
+  const [asyncImport, setAsyncImport] = useState(true);
+  const [activeJob, setActiveJob] = useState<any>(null);
   const [hasHeader, setHasHeader] = useState(true);
   const [nullStrategy, setNullStrategy] = useState("keep");
   const [deduplicate, setDeduplicate] = useState(false);
   const [previewData, setPreviewData] = useState<any>(null);
+  const [previewColPage, setPreviewColPage] = useState(0);
+  const [previewing, setPreviewing] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [colRenames, setColRenames] = useState<Record<string, string>>({});
   const [typeOverrides, setTypeOverrides] = useState<Record<string, string>>({});
   const [dragging, setDragging] = useState(false);
+
+  // Shared Composite Dataset Builder
+  const [compositeList, setCompositeList] = useState<any[]>([]);
+  const [compName, setCompName] = useState("");
+  const [compBaseTable, setCompBaseTable] = useState("");
+  const [compJoinTable, setCompJoinTable] = useState("");
+  const [compJoinType, setCompJoinType] = useState("LEFT");
+  const [compLeftCol, setCompLeftCol] = useState("");
+  const [compRightCol, setCompRightCol] = useState("");
+  const [compSchedule, setCompSchedule] = useState("manual");
+  const [compBusy, setCompBusy] = useState(false);
 
   const load = () => {
     apiFetch("/data-sources").then(setSources).catch(() => {});
     apiFetch("/datasets").then(setDatasets).catch(() => {});
     apiFetch("/data-sources/supported-types").then(setSupported).catch(() => {});
+    apiFetch("/data-sources/composite-datasets").then(setCompositeList).catch(() => {});
   };
 
   useEffect(() => {
@@ -96,10 +115,54 @@ export default function DataSourcesPage() {
 
   const handleInspectSchema = async (id: string) => {
     try {
-      const res = await apiFetch(`/data-sources/${id}/schema`);
+      const res: any = await apiFetch(`/data-sources/${id}/schema`);
       setSelectedSchema(res);
+      if (res?.tables?.[0]?.table_name) {
+        setCompBaseTable(res.tables[0].table_name);
+      }
     } catch (err: any) {
       showToast(err.message);
+    }
+  };
+
+  const handleCreateComposite = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedSchema || !compName || !compBaseTable) return;
+    setCompBusy(true);
+    try {
+      const joins =
+        compJoinTable && compLeftCol && compRightCol
+          ? [
+              {
+                table: compJoinTable,
+                join_type: compJoinType,
+                left_table: compBaseTable,
+                left_col: compLeftCol,
+                right_col: compRightCol,
+              },
+            ]
+          : [];
+      const res: any = await apiFetch("/data-sources/composite-datasets", {
+        method: "POST",
+        body: JSON.stringify({
+          data_source_id: selectedSchema.source_id,
+          name: compName,
+          base_table: compBaseTable,
+          joins,
+          refresh_schedule: compSchedule,
+        }),
+      });
+      setCompName("");
+      showToast(
+        locale === "fa"
+          ? `دیتاست ترکیبی با ${res.total_rows || 0} ردیف ساخته شد`
+          : `Composite dataset created (${res.total_rows || 0} rows)`
+      );
+      load();
+    } catch (err: any) {
+      showToast(err.message);
+    } finally {
+      setCompBusy(false);
     }
   };
 
@@ -118,7 +181,8 @@ export default function DataSourcesPage() {
 
   const handlePreviewFile = async (file: File, chosenSheet?: string) => {
     setFileObj(file);
-    if (!datasetName) setDatasetName(file.name.replace(/\.[^.]+$/, ""));
+    setPreviewColPage(0);
+    if (!chosenSheet) setDatasetName(file.name.replace(/\.[^.]+$/, ""));
     const fd = new FormData();
     fd.append("file", file);
     if (chosenSheet) fd.append("sheet_name", chosenSheet);
@@ -128,54 +192,91 @@ export default function DataSourcesPage() {
     fd.append("column_renames_json", JSON.stringify(colRenames));
     fd.append("type_overrides_json", JSON.stringify(typeOverrides));
 
+    setPreviewing(true);
     try {
-      const res = await apiFetch("/data-sources/files/preview", { method: "POST", body: fd });
+      const res: any = await apiFetch("/data-sources/files/preview", { method: "POST", body: fd });
       setPreviewData(res);
-      if (res.sheets?.length && !chosenSheet) setSheetName(res.sheets[0]);
+      if (res.sheets?.length && !chosenSheet) {
+        setSheetName(res.sheets[0]);
+        setSelectedSheets([res.sheets[0]]);
+      }
+      if (Array.isArray(res.columns)) {
+        setSelectedColumns(res.columns.map((c: any) => c.field_name));
+      }
     } catch (err: any) {
       showToast(err.message);
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  const pollBackgroundJob = async (jobId: string) => {
+    for (let i = 0; i < 240; i++) {
+      await new Promise((r) => setTimeout(r, 700));
+      const j: any = await apiFetch(`/jobs/${jobId}`);
+      setActiveJob(j);
+      if (j.status === "completed") {
+        setLastImported(j.result);
+        setPreviewData(null);
+        setPreviewColPage(0);
+        setFileObj(null);
+        setColRenames({});
+        setTypeOverrides({});
+        showToast(
+          locale === "fa"
+            ? `ورود داده‌ها با ${j.result?.row_count || 0} ردیف تکمیل شد!`
+            : `Imported ${j.result?.row_count || 0} rows!`
+        );
+        load();
+        return;
+      }
+      if (j.status === "failed") {
+        showToast(j.error_message || "Background import failed");
+        return;
+      }
     }
   };
 
   const handleImportDataset = async () => {
-    if (!fileObj || !datasetName) return;
+    if (!fileObj || !datasetName || importing) return;
     const fd = new FormData();
     fd.append("file", fileObj);
     fd.append("dataset_name", datasetName);
     if (sheetName) fd.append("sheet_name", sheetName);
+    fd.append("sheet_names_json", JSON.stringify(selectedSheets));
+    fd.append("merge_sheets", String(mergeSheets));
     fd.append("has_header", String(hasHeader));
     fd.append("null_strategy", nullStrategy);
     fd.append("deduplicate", String(deduplicate));
     fd.append("column_renames_json", JSON.stringify(colRenames));
     fd.append("type_overrides_json", JSON.stringify(typeOverrides));
+    fd.append("selected_columns_json", JSON.stringify(selectedColumns));
+    fd.append("async_mode", String(asyncImport));
+    setImporting(true);
     try {
-      const res = await apiFetch("/data-sources/files/import", { method: "POST", body: fd });
-      showToast(`Imported ${res.row_count} rows into '${res.name || res.warehouse_table}'!`);
-      setLastImported(res);
-      setPreviewData(null);
-      setFileObj(null);
-      setColRenames({});
-      setTypeOverrides({});
-      load();
-    } catch (err: any) {
-      showToast(err.message);
-    }
-  };
-
-  const handleBuildDashboardForDataset = async (dsId: string) => {
-    setBuildingDash(true);
-    try {
-      const res = await apiFetch<any>("/ai/generate-dashboard", {
-        method: "POST",
-        body: JSON.stringify({ dataset_id: dsId }),
-      });
-      showToast(locale === "fa" ? `داشبورد «${res.title}» ساخته شد!` : `Created dashboard "${res.title}"`);
-      router.push(`/dashboards/${res.dashboard_id}`);
+      const res: any = await apiFetch("/data-sources/files/import", { method: "POST", body: fd });
+      if (res.job_id) {
+        setActiveJob({ id: res.job_id, status: res.status, progress_pct: 5, stage_label: "شروع پردازش..." });
+        await pollBackgroundJob(res.job_id);
+      } else {
+        showToast(`Imported ${res.row_count} rows into '${res.name || res.warehouse_table}'!`);
+        setLastImported(res);
+        setPreviewData(null);
+        setPreviewColPage(0);
+        setFileObj(null);
+        setColRenames({});
+        setTypeOverrides({});
+        load();
+      }
     } catch (err: any) {
       showToast(err.message);
     } finally {
-      setBuildingDash(false);
+      setImporting(false);
     }
+  };
+
+  const handleBuildDashboardForDataset = (dsId: string) => {
+    setStudioDatasetId(dsId);
   };
 
   return (
@@ -186,14 +287,14 @@ export default function DataSourcesPage() {
             <Database className="w-5 h-5" style={{ color: "var(--bi-primary)" }} /> Data Connectivity & File Ingestion
           </h1>
           <p className="text-xs mt-1" style={{ color: "var(--bi-muted)" }}>
-            Connect to PostgreSQL, SQL Server, MySQL, MariaDB, Oracle, SQLite, MongoDB, REST/GraphQL APIs or drag & drop Excel/CSV/JSON/XML.
+            Connect to PostgreSQL, SQL Server, MySQL, MariaDB, Oracle, SQLite, MongoDB, REST/GraphQL APIs or drag & drop Excel, CSV, TSV, JSON/JSONL, Log (.log/.txt), or XML files (no row/column limits).
           </p>
         </div>
 
         {/* Section 1: Drag & Drop File Ingestion */}
         <div className="bi-card p-5 space-y-4">
           <h2 className="text-sm font-bold flex items-center gap-2">
-            <FileSpreadsheet className="w-4 h-4 text-emerald-500" /> Excel / CSV / JSON / XML File Importer
+            <FileSpreadsheet className="w-4 h-4 text-emerald-500" /> Excel / Log / CSV / JSON File Importer
           </h2>
 
           <div
@@ -213,16 +314,40 @@ export default function DataSourcesPage() {
             <UploadCloud className="w-8 h-8 mx-auto mb-2 opacity-60" />
             <p className="text-xs font-semibold">
               {locale === "fa"
-                ? "فایل اکسل (.xlsx / .xls / .csv / .json) را اینجا بکشید و رها کنید یا انتخاب نمایید"
-                : "Drag & drop .xlsx, .xls, .csv, .tsv, .json, .xml here or select a file"}
+                ? "فایل اکسل (.xlsx / .xls)، فایل لاگ (.log / .txt / .jsonl) یا CSV/JSON/XML را اینجا بکشید و رها کنید"
+                : "Drag & drop .xlsx, .xls, .csv, .tsv, .json, .jsonl, .ndjson, .log, .txt, .xml here or select a file"}
             </p>
             <input
               type="file"
-              accept=".xlsx,.xls,.csv,.tsv,.json,.xml"
+              accept=".xlsx,.xls,.csv,.tsv,.json,.jsonl,.ndjson,.log,.txt,.xml"
               onChange={(e) => e.target.files?.[0] && handlePreviewFile(e.target.files[0])}
               className="mt-3 text-xs"
             />
+            {previewing && (
+              <p className="text-xs mt-2 text-blue-500 font-semibold">
+                {locale === "fa" ? "در حال خواندن و پیش‌نمایش فایل..." : "Reading & generating preview..."}
+              </p>
+            )}
           </div>
+
+          {activeJob && (
+            <div className="p-3.5 rounded-xl border space-y-2 text-xs" style={{ borderColor: "var(--bi-border)", background: "rgba(37,99,235,0.06)" }}>
+              <div className="flex items-center justify-between font-bold">
+                <span>{activeJob.title || (locale === "fa" ? "پردازش ناهمزمان فایل" : "Async Job")}</span>
+                <span className="font-mono text-blue-500">{Math.round(activeJob.progress_pct || 0)}%</span>
+              </div>
+              <div className="w-full h-2 rounded-full bg-slate-500/20 overflow-hidden">
+                <div
+                  className="h-full transition-all duration-300"
+                  style={{ width: `${Math.max(4, Math.min(100, activeJob.progress_pct || 0))}%`, background: activeJob.status === "failed" ? "#ef4444" : "var(--bi-primary)" }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[11px] opacity-80">
+                <span>{activeJob.stage_label}</span>
+                {activeJob.processed_items > 0 && <span>{Number(activeJob.processed_items).toLocaleString()} ردیف پردازش شد</span>}
+              </div>
+            </div>
+          )}
 
           {lastImported && (
             <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-3.5 flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -234,18 +359,25 @@ export default function DataSourcesPage() {
                     : `Dataset "${lastImported.name}" (${lastImported.row_count} rows) imported and ready!`}
                 </span>
               </div>
-              <button
-                type="button"
-                disabled={buildingDash}
-                onClick={() => handleBuildDashboardForDataset(lastImported.dataset_id || lastImported.id)}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                {buildingDash
-                  ? locale === "fa" ? "در حال ساخت داشبورد..." : "Building..."
-                  : locale === "fa" ? "ساخت فوری داشبورد از این فایل" : "Auto-Build Dashboard"}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleBuildDashboardForDataset(lastImported.dataset_id || lastImported.id)}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-white font-semibold bg-emerald-600 hover:bg-emerald-700"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  {locale === "fa" ? "تحلیل، انتخاب KPIها و ساخت داشبورد" : "Analyze, Confirm KPIs & Build Dashboard"}
+                </button>
+              </div>
             </div>
+          )}
+
+          {studioDatasetId && (
+            <IntelligentDashboardStudio
+              key={studioDatasetId}
+              initialDatasetId={studioDatasetId}
+              onClose={() => setStudioDatasetId("")}
+            />
           )}
 
           {datasets.length > 0 && (
@@ -276,12 +408,11 @@ export default function DataSourcesPage() {
                     <div className="flex items-center gap-1 shrink-0">
                       <button
                         type="button"
-                        disabled={buildingDash}
                         onClick={() => handleBuildDashboardForDataset(ds.id)}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-violet-600 text-white text-[11px] font-semibold hover:bg-violet-700 disabled:opacity-60"
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-violet-600 text-white text-[11px] font-semibold hover:bg-violet-700"
                       >
                         <Sparkles className="w-3 h-3" />
-                        {locale === "fa" ? "ساخت داشبورد" : "Build Dashboard"}
+                        {locale === "fa" ? "انتخاب KPI و ساخت داشبورد" : "Confirm KPIs & Build"}
                       </button>
                       {ds.is_uploaded_excel && (
                         <button
@@ -300,91 +431,199 @@ export default function DataSourcesPage() {
             </div>
           )}
 
-          {previewData && (
-            <div className="space-y-3 pt-2 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
-              <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-                <input
-                  value={datasetName}
-                  onChange={(e) => setDatasetName(e.target.value)}
-                  placeholder="Dataset Name"
-                  className="px-2.5 py-1.5 rounded border bg-transparent"
-                  style={{ borderColor: "var(--bi-border)" }}
-                />
-                {previewData.sheets?.length > 0 && (
-                  <select
-                    value={sheetName}
-                    onChange={(e) => { setSheetName(e.target.value); fileObj && handlePreviewFile(fileObj, e.target.value); }}
+          {previewData && (() => {
+            const PREVIEW_COL_PAGE_SIZE = 40;
+            const totalCols = previewData.columns?.length || 0;
+            const totalColPages = Math.max(1, Math.ceil(totalCols / PREVIEW_COL_PAGE_SIZE));
+            const safeColPage = Math.min(previewColPage, totalColPages - 1);
+            const startCol = safeColPage * PREVIEW_COL_PAGE_SIZE;
+            const visibleCols = (previewData.columns || []).slice(startCol, startCol + PREVIEW_COL_PAGE_SIZE);
+            return (
+              <div className="space-y-3 pt-2 border-t text-xs" style={{ borderColor: "var(--bi-border)" }}>
+                {/* Row Accounting & Quality Warnings */}
+                {previewData.row_accounting && (
+                  <div className="p-2.5 rounded-lg border flex flex-wrap items-center justify-between gap-2 text-[11px]" style={{ borderColor: "var(--bi-border)", background: "rgba(16,185,129,0.06)" }}>
+                    <div className="flex flex-wrap gap-3">
+                      <span>{locale === "fa" ? "ردیف ورودی:" : "Input:"} <b>{(previewData.row_accounting.input_rows || 0).toLocaleString()}</b></span>
+                      <span>{locale === "fa" ? "ردیف معتبر:" : "Valid:"} <b className="text-emerald-500">{(previewData.row_accounting.valid_rows || 0).toLocaleString()}</b></span>
+                      <span>{locale === "fa" ? "نامعتبر/حذف‌شده:" : "Invalid:"} <b className="text-amber-500">{(previewData.row_accounting.invalid_rows || 0).toLocaleString()}</b></span>
+                      <span>{locale === "fa" ? "ستون انتخابی:" : "Selected Cols:"} <b>{selectedColumns.length} / {totalCols}</b></span>
+                    </div>
+                    {(previewData.row_accounting.warnings || []).length > 0 && (
+                      <div className="text-amber-500 font-semibold">{previewData.row_accounting.warnings.join(" · ")}</div>
+                    )}
+                  </div>
+                )}
+
+                {/* Multi-Sheet Selection Bar */}
+                {previewData.sheets?.length > 1 && (
+                  <div className="p-2.5 rounded-lg border space-y-2" style={{ borderColor: "var(--bi-border)" }}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold">
+                        {locale === "fa" ? `انتخاب شیت‌های اکسل (${previewData.sheets.length} شیت):` : `Select Sheets (${previewData.sheets.length}):`}
+                      </span>
+                      <label className="flex items-center gap-1.5 cursor-pointer font-semibold text-blue-500">
+                        <input type="checkbox" checked={mergeSheets} onChange={(e) => setMergeSheets(e.target.checked)} />
+                        {locale === "fa" ? "ادغام شیت‌های انتخابی در یک مجموعه داده واحد" : "Merge selected sheets into one Dataset"}
+                      </label>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {previewData.sheets.map((s: string) => {
+                        const checked = selectedSheets.includes(s);
+                        const sum = (previewData.sheet_summaries || []).find((x: any) => x.sheet_name === s);
+                        return (
+                          <label key={s} className="flex items-center gap-1.5 px-2.5 py-1 rounded border cursor-pointer" style={{ borderColor: checked ? "var(--bi-primary)" : "var(--bi-border)" }}>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) =>
+                                setSelectedSheets((prev) =>
+                                  e.target.checked ? [...prev, s] : prev.filter((x) => x !== s)
+                                )
+                              }
+                            />
+                            <span>{s}</span>
+                            {sum && <span className="opacity-65 text-[10px]">({sum.estimated_rows.toLocaleString()} ردیف)</span>}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-2 items-center">
+                  <input
+                    value={datasetName}
+                    onChange={(e) => setDatasetName(e.target.value)}
+                    placeholder="Dataset Name"
                     className="px-2.5 py-1.5 rounded border bg-transparent"
                     style={{ borderColor: "var(--bi-border)" }}
-                  >
-                    {previewData.sheets.map((s: string) => <option key={s} value={s}>Sheet: {s}</option>)}
+                  />
+                  {previewData.sheets?.length > 0 && (
+                    <select
+                      value={sheetName}
+                      onChange={(e) => { setSheetName(e.target.value); fileObj && handlePreviewFile(fileObj, e.target.value); }}
+                      className="px-2.5 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      {previewData.sheets.map((s: string) => <option key={s} value={s}>پیش‌نمایش: {s}</option>)}
+                    </select>
+                  )}
+                  <select value={nullStrategy} onChange={(e) => setNullStrategy(e.target.value)} className="px-2.5 py-1.5 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
+                    <option value="keep">مقادیر خالی: حفظ</option>
+                    <option value="drop_rows">مقادیر خالی: حذف سطر</option>
+                    <option value="fill_zero">پرکردن با صفر/نامشخص</option>
+                    <option value="fill_mean">پرکردن با میانگین</option>
                   </select>
-                )}
-                <select value={nullStrategy} onChange={(e) => setNullStrategy(e.target.value)} className="px-2.5 py-1.5 rounded border bg-transparent" style={{ borderColor: "var(--bi-border)" }}>
-                  <option value="keep">Nulls: Keep</option>
-                  <option value="drop_rows">Nulls: Drop Rows</option>
-                  <option value="fill_zero">Nulls: Fill Zero/Unknown</option>
-                  <option value="fill_mean">Nulls: Fill Mean</option>
-                </select>
-                <label className="flex items-center gap-1.5 px-2">
-                  <input type="checkbox" checked={hasHeader} onChange={(e) => setHasHeader(e.target.checked)} />
-                  <span>Auto Header</span>
-                </label>
-                <label className="flex items-center gap-1.5 px-2">
-                  <input type="checkbox" checked={deduplicate} onChange={(e) => setDeduplicate(e.target.checked)} />
-                  <span>Dedup ({previewData.duplicate_count})</span>
-                </label>
-                <button onClick={handleImportDataset} className="px-3 py-1.5 rounded text-white font-bold bg-emerald-600">
-                  Import ({previewData.total_rows} rows)
-                </button>
-              </div>
+                  <label className="flex items-center gap-1.5 px-2">
+                    <input type="checkbox" checked={deduplicate} onChange={(e) => setDeduplicate(e.target.checked)} />
+                    <span>حذف تکراری ({previewData.duplicate_count})</span>
+                  </label>
+                  <label className="flex items-center gap-1.5 px-2">
+                    <input type="checkbox" checked={asyncImport} onChange={(e) => setAsyncImport(e.target.checked)} />
+                    <span>پردازش پس‌زمینه (%)</span>
+                  </label>
+                  <button
+                    type="button"
+                    disabled={importing}
+                    onClick={handleImportDataset}
+                    className="px-3 py-1.5 rounded text-white font-bold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60"
+                  >
+                    {importing
+                      ? locale === "fa" ? "در حال ورود داده‌ها..." : "Importing..."
+                      : `${locale === "fa" ? "ورود" : "Import"} (${previewData.row_count_estimated ? "~" : ""}${(previewData.total_rows || 0).toLocaleString()} ردیف)`}
+                  </button>
+                </div>
 
-              <div className="overflow-auto max-h-56 rounded border" style={{ borderColor: "var(--bi-border)" }}>
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b" style={{ borderColor: "var(--bi-border)" }}>
-                      {previewData.columns.map((c: any) => (
-                        <th key={c.field_name} className="px-2.5 py-2 text-start font-semibold whitespace-nowrap align-top">
-                          <div className="space-y-1">
-                            <input
-                              value={colRenames[c.field_name] ?? c.field_name}
-                              onChange={(e) => setColRenames({ ...colRenames, [c.field_name]: e.target.value })}
-                              className="w-28 px-1.5 py-0.5 rounded border bg-transparent text-[11px] font-semibold"
-                              style={{ borderColor: "var(--bi-border)" }}
-                              title="Rename column"
-                            />
-                            <select
-                              value={typeOverrides[c.field_name] || ""}
-                              onChange={(e) => setTypeOverrides({ ...typeOverrides, [c.field_name]: e.target.value })}
-                              className="block w-28 px-1 py-0.5 rounded border bg-transparent text-[10px] opacity-80"
-                              style={{ borderColor: "var(--bi-border)" }}
-                              title="Cast data type"
-                            >
-                              <option value="">Auto ({c.data_type})</option>
-                              <option value="string">string</option>
-                              <option value="integer">integer</option>
-                              <option value="float">float</option>
-                              <option value="date">date</option>
-                              <option value="boolean">boolean</option>
-                            </select>
-                          </div>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {previewData.preview_rows.slice(0, 15).map((r: any, i: number) => (
-                      <tr key={i} className="border-b" style={{ borderColor: "var(--bi-border)" }}>
-                        {previewData.columns.map((c: any) => (
-                          <td key={c.field_name} className="px-2.5 py-1 whitespace-nowrap">{String(r[c.field_name] ?? "")}</td>
+                {totalCols > PREVIEW_COL_PAGE_SIZE && (
+                  <div className="flex items-center justify-between px-2 py-1 rounded bg-slate-500/10 text-[11px]">
+                    <span>
+                      Showing columns {startCol + 1}–{Math.min(startCol + PREVIEW_COL_PAGE_SIZE, totalCols)} of {totalCols.toLocaleString()}
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={safeColPage <= 0}
+                        onClick={() => setPreviewColPage((p) => Math.max(0, p - 1))}
+                        className="px-2 py-0.5 rounded border disabled:opacity-40"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        Prev Cols
+                      </button>
+                      <button
+                        type="button"
+                        disabled={safeColPage >= totalColPages - 1}
+                        onClick={() => setPreviewColPage((p) => Math.min(totalColPages - 1, p + 1))}
+                        className="px-2 py-0.5 rounded border disabled:opacity-40"
+                        style={{ borderColor: "var(--bi-border)" }}
+                      >
+                        Next Cols
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="overflow-auto max-h-56 rounded border" style={{ borderColor: "var(--bi-border)" }}>
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b" style={{ borderColor: "var(--bi-border)" }}>
+                        {visibleCols.map((c: any) => (
+                          <th key={c.field_name} className="px-2.5 py-2 text-start font-semibold whitespace-nowrap align-top">
+                            <div className="space-y-1">
+                              <label className="flex items-center gap-1 text-[10px] cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedColumns.includes(c.field_name)}
+                                  onChange={(e) =>
+                                    setSelectedColumns((prev) =>
+                                      e.target.checked
+                                        ? [...prev, c.field_name]
+                                        : prev.filter((x) => x !== c.field_name)
+                                    )
+                                  }
+                                />
+                                <span>{locale === "fa" ? "انتخاب ستون" : "Include"}</span>
+                              </label>
+                              <input
+                                value={colRenames[c.field_name] ?? c.field_name}
+                                onChange={(e) => setColRenames({ ...colRenames, [c.field_name]: e.target.value })}
+                                className="w-28 px-1.5 py-0.5 rounded border bg-transparent text-[11px] font-semibold"
+                                style={{ borderColor: "var(--bi-border)" }}
+                                title="Rename column"
+                              />
+                              <select
+                                value={typeOverrides[c.field_name] || ""}
+                                onChange={(e) => setTypeOverrides({ ...typeOverrides, [c.field_name]: e.target.value })}
+                                className="block w-28 px-1 py-0.5 rounded border bg-transparent text-[10px] opacity-80"
+                                style={{ borderColor: "var(--bi-border)" }}
+                                title="Cast data type"
+                              >
+                                <option value="">Auto ({c.data_type})</option>
+                                <option value="string">string</option>
+                                <option value="integer">integer</option>
+                                <option value="float">float</option>
+                                <option value="date">date</option>
+                                <option value="boolean">boolean</option>
+                              </select>
+                            </div>
+                          </th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {previewData.preview_rows.slice(0, 15).map((r: any, i: number) => (
+                        <tr key={i} className="border-b" style={{ borderColor: "var(--bi-border)" }}>
+                          {visibleCols.map((c: any) => (
+                            <td key={c.field_name} className="px-2.5 py-1 whitespace-nowrap">{String(r[c.field_name] ?? "")}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
         </div>
 
         {/* Section 2: Database & API Connections */}
@@ -492,7 +731,137 @@ export default function DataSourcesPage() {
                     </table>
                   </div>
                 )}
+
+                {/* Shared Composite Multi-Table Dataset Builder */}
+                <form onSubmit={handleCreateComposite} className="p-3 rounded-xl border space-y-2.5 mt-3" style={{ borderColor: "var(--bi-border)", background: "rgba(16,185,129,0.04)" }}>
+                  <div className="font-bold text-xs text-emerald-500">
+                    {locale === "fa"
+                      ? "ساخت مجموعه داده ترکیبی مشترک (Composite Dataset + Join چندجدولی برای استفاده در BPMN و داشبوردها)"
+                      : "Build Shared Multi-Table Joined Dataset"}
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <input
+                      value={compName}
+                      onChange={(e) => setCompName(e.target.value)}
+                      placeholder={locale === "fa" ? "نام مجموعه داده جدید" : "Composite Dataset Name"}
+                      className="px-2.5 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                      required
+                    />
+                    <select
+                      value={compBaseTable}
+                      onChange={(e) => setCompBaseTable(e.target.value)}
+                      className="px-2.5 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      {(selectedSchema.tables || []).map((tb: any) => (
+                        <option key={tb.table_name} value={tb.table_name}>جدول اصلی: {tb.table_name}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={compSchedule}
+                      onChange={(e) => setCompSchedule(e.target.value)}
+                      className="px-2.5 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      <option value="manual">{locale === "fa" ? "به‌روزرسانی دستی" : "Manual Refresh"}</option>
+                      <option value="hourly">{locale === "fa" ? "به‌روزرسانی ساعتی" : "Hourly"}</option>
+                      <option value="daily">{locale === "fa" ? "به‌روزرسانی روزانه" : "Daily"}</option>
+                      <option value="weekly">{locale === "fa" ? "به‌روزرسانی هفتگی" : "Weekly"}</option>
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <select
+                      value={compJoinTable}
+                      onChange={(e) => setCompJoinTable(e.target.value)}
+                      className="px-2 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      <option value="">{locale === "fa" ? "بدون Join (تک‌جدول)" : "No Join (Single Table)"}</option>
+                      {(selectedSchema.tables || []).filter((tb: any) => tb.table_name !== compBaseTable).map((tb: any) => (
+                        <option key={tb.table_name} value={tb.table_name}>Join با: {tb.table_name}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={compJoinType}
+                      onChange={(e) => setCompJoinType(e.target.value)}
+                      className="px-2 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      <option value="LEFT">LEFT JOIN</option>
+                      <option value="INNER">INNER JOIN</option>
+                      <option value="RIGHT">RIGHT JOIN</option>
+                    </select>
+                    <input
+                      value={compLeftCol}
+                      onChange={(e) => setCompLeftCol(e.target.value)}
+                      placeholder={locale === "fa" ? "کلید جدول اصلی" : "Left Key Col"}
+                      className="px-2 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    />
+                    <input
+                      value={compRightCol}
+                      onChange={(e) => setCompRightCol(e.target.value)}
+                      placeholder={locale === "fa" ? "کلید جدول دوم" : "Right Key Col"}
+                      className="px-2 py-1.5 rounded border bg-transparent"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={compBusy}
+                    className="px-4 py-1.5 rounded text-white font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    {compBusy ? "..." : locale === "fa" ? "ایجاد و بارگذاری در انبار مشترک" : "Build & Materialize Dataset"}
+                  </button>
+                </form>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* Composite Datasets Registry */}
+        {compositeList.length > 0 && (
+          <div className="bi-card p-5 space-y-3 text-xs">
+            <h2 className="text-sm font-bold">
+              {locale === "fa" ? `دیتاست‌های ترکیبی مشترک (${compositeList.length})` : `Shared Composite Datasets (${compositeList.length})`}
+            </h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {compositeList.map((c) => (
+                <div key={c.id} className="p-3 rounded-lg border flex items-center justify-between gap-2" style={{ borderColor: "var(--bi-border)" }}>
+                  <div className="min-w-0">
+                    <div className="font-bold truncate">{c.name}</div>
+                    <div className="text-[11px] opacity-75">
+                      {c.refresh_schedule} · {c.last_status} {c.last_refreshed_at ? `· ${new Date(c.last_refreshed_at).toLocaleString(locale === "fa" ? "fa-IR" : "en-US")}` : ""}
+                    </div>
+                    {c.last_error && <div className="text-[10px] text-red-500 truncate">{c.last_error}</div>}
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        apiFetch(`/data-sources/composite-datasets/${c.id}/refresh`, { method: "POST" })
+                          .then((res: any) => {
+                            showToast(`Refreshed (${res.total_rows || 0} rows)`);
+                            load();
+                          })
+                          .catch((e) => showToast(e.message))
+                      }
+                      className="px-2.5 py-1 rounded border hover:bg-blue-500/10"
+                      style={{ borderColor: "var(--bi-border)" }}
+                    >
+                      {locale === "fa" ? "به‌روزرسانی" : "Refresh"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => apiFetch(`/data-sources/composite-datasets/${c.id}`, { method: "DELETE" }).then(load)}
+                      className="p-1 text-red-500"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}

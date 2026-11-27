@@ -1,4 +1,4 @@
-import * as XLSX from "xlsx";
+import readXlsxFile from "read-excel-file/universal";
 
 export interface ParsedExcelColumn {
   field_name: string;
@@ -82,13 +82,154 @@ function inferType(values: any[], overrideType?: string): "integer" | "float" | 
 function inferSemanticRole(colLabel: string, dtype: string): "measure" | "dimension" | "time" {
   const low = normalizeFaDigits(colLabel).toLowerCase();
   if (dtype === "date") return "time";
-  if (["year", "month", "quarter", "day", "date", "سال", "ماه", "فصل", "تاریخ"].some((k) => low === k || low.includes("تاریخ"))) {
+  if (
+    ["year", "month", "quarter", "day", "date", "timestamp", "logged_at", "created_at", "سال", "ماه", "فصل", "تاریخ", "زمان"].some(
+      (k) => low === k || low.includes("تاریخ") || low.includes("timestamp")
+    )
+  ) {
     return "time";
   }
-  if ((dtype === "integer" || dtype === "float") && !["کد", "شناسه", "id", "code", "شماره", "سال"].some((k) => low === k || low.endsWith("_id"))) {
+  if (
+    (dtype === "integer" || dtype === "float") &&
+    !["کد", "شناسه", "id", "code", "شماره", "سال", "status_code", "http_status", "line_number", "port", "pid"].some(
+      (k) => low === k || low.endsWith("_id")
+    )
+  ) {
     return "measure";
   }
   return "dimension";
+}
+
+const APACHE_LOG_RE =
+  /^(\S+)\s+\S+\s+(\S+)\s+\[([^\]]+)\]\s+"([A-Z]+)\s+(\S+)[^"]*"\s+(\d{3})\s+(\d+|-)(?:\s+"([^"]*)"\s+"([^"]*)")?/;
+const TS_LEVEL_LOG_RE =
+  /^(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\[?(TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|CRITICAL|FATAL)\]?\s+(?:\[([^\]]+)\]\s+)?(.*)$/i;
+const KV_PAIR_RE = /\b([A-Za-z_][A-Za-z0-9_.-]*)=("[^"]*"|\S+)/g;
+
+function parseLogLineRecord(lineNo: number, line: string): Record<string, any> {
+  const mApache = line.match(APACHE_LOG_RE);
+  if (mApache) {
+    const rb = mApache[7];
+    return {
+      line_number: lineNo,
+      client_ip: mApache[1] || "",
+      user: mApache[2] === "-" ? "" : mApache[2] || "",
+      timestamp: mApache[3] || "",
+      method: mApache[4] || "",
+      path: mApache[5] || "",
+      status_code: Number(mApache[6]),
+      response_bytes: rb && /^\d+$/.test(rb) ? Number(rb) : 0,
+      referer: mApache[8] || "",
+      user_agent: mApache[9] || "",
+    };
+  }
+  const mTs = line.match(TS_LEVEL_LOG_RE);
+  if (mTs) {
+    const rest = (mTs[4] || "").trim();
+    const rec: Record<string, any> = {
+      line_number: lineNo,
+      timestamp: mTs[1] || "",
+      level: (mTs[2] || "INFO").toUpperCase() === "WARNING" ? "WARN" : (mTs[2] || "INFO").toUpperCase(),
+      logger: mTs[3] || "",
+      message: rest,
+    };
+    let match: RegExpExecArray | null;
+    KV_PAIR_RE.lastIndex = 0;
+    while ((match = KV_PAIR_RE.exec(rest)) !== null) {
+      const key = match[1].toLowerCase().replace(/[^a-z0-9_]+/g, "_");
+      if (["line_number", "timestamp", "level", "logger", "message"].includes(key)) continue;
+      const val = match[2].replace(/^"|"$/g, "");
+      if (val.endsWith("ms") && /^\d+(\.\d+)?$/.test(val.slice(0, -2))) {
+        rec[key.endsWith("_ms") ? key : `${key}_ms`] = Number(val.slice(0, -2));
+      } else if (/^-?\d+(\.\d+)?$/.test(val)) {
+        rec[key] = Number(val);
+      } else {
+        rec[key] = val;
+      }
+    }
+    return rec;
+  }
+  let level = "INFO";
+  for (const lvl of ["CRITICAL", "FATAL", "ERROR", "WARN", "WARNING", "DEBUG", "TRACE"]) {
+    if (new RegExp(`\\b${lvl}\\b`, "i").test(line)) {
+      level = lvl === "WARNING" ? "WARN" : lvl;
+      break;
+    }
+  }
+  return { line_number: lineNo, level, message: line };
+}
+
+function parseLogOrTextToMatrix(text: string, ext: string): { matrix: any[][]; label: string } {
+  const cleaned = text.replace(/^\uFEFF/, "");
+  const nonEmpty = cleaned.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (nonEmpty.length === 0) return { matrix: [], label: ext.toUpperCase() };
+
+  // 1. JSON Lines (.jsonl / .ndjson / JSON objects per line)
+  if (ext === "jsonl" || ext === "ndjson" || nonEmpty[0].trimStart().startsWith("{")) {
+    const objs: Record<string, any>[] = [];
+    const keys: string[] = [];
+    const keySet = new Set<string>();
+    for (let i = 0; i < nonEmpty.length; i++) {
+      const ln = nonEmpty[i].trim();
+      let obj: Record<string, any>;
+      try {
+        const parsed = JSON.parse(ln);
+        obj = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : { value: parsed };
+      } catch {
+        obj = parseLogLineRecord(i + 1, ln);
+      }
+      objs.push(obj);
+      for (const k of Object.keys(obj)) {
+        if (!keySet.has(k)) {
+          keySet.add(k);
+          keys.push(k);
+        }
+      }
+    }
+    return {
+      matrix: [keys, ...objs.map((o) => keys.map((k) => o[k] ?? ""))],
+      label: "JSONL",
+    };
+  }
+
+  // 2. Structured Apache/Nginx/Timestamped/Syslog lines
+  const looksLikeStructuredLog =
+    ext === "log" ||
+    nonEmpty.slice(0, 5).some((ln) => APACHE_LOG_RE.test(ln) || TS_LEVEL_LOG_RE.test(ln));
+
+  if (looksLikeStructuredLog) {
+    // Check if delimited .log/.txt first (only if not matching Apache/Timestamped)
+    const hasPatternMatch = nonEmpty.slice(0, 5).some((ln) => APACHE_LOG_RE.test(ln) || TS_LEVEL_LOG_RE.test(ln));
+    if (!hasPatternMatch) {
+      const first = nonEmpty[0];
+      for (const delim of ["\t", ",", "|", ";"]) {
+        const c0 = first.split(delim).length;
+        if (c0 >= 3 && nonEmpty.length >= 2 && nonEmpty.slice(1, 5).every((l) => Math.abs(l.split(delim).length - c0) <= 1)) {
+          return { matrix: parseDelimitedText(cleaned, delim), label: ext.toUpperCase() };
+        }
+      }
+    }
+    const recs: Record<string, any>[] = [];
+    const keys: string[] = [];
+    const keySet = new Set<string>();
+    for (let i = 0; i < nonEmpty.length; i++) {
+      const rec = parseLogLineRecord(i + 1, nonEmpty[i]);
+      recs.push(rec);
+      for (const k of Object.keys(rec)) {
+        if (!keySet.has(k)) {
+          keySet.add(k);
+          keys.push(k);
+        }
+      }
+    }
+    return {
+      matrix: [keys, ...recs.map((r) => keys.map((k) => r[k] ?? ""))],
+      label: "LOG",
+    };
+  }
+
+  // 3. Delimited .txt
+  return { matrix: parseDelimitedText(cleaned), label: ext.toUpperCase() };
 }
 
 function makeUniqueFieldName(rawHeader: string, idx: number, used: Set<string>): string {
@@ -107,7 +248,66 @@ function makeUniqueFieldName(rawHeader: string, idx: number, used: Set<string>):
   return candidate;
 }
 
-export function parseSpreadsheetBuffer(
+function parseDelimitedText(text: string, forcedDelimiter?: string): string[][] {
+  const cleaned = text.replace(/^\uFEFF/, "");
+  const firstLine = cleaned.split(/\r?\n/, 1)[0] || "";
+  const delimiter =
+    forcedDelimiter ||
+    (firstLine.includes("\t")
+      ? "\t"
+      : firstLine.split(";").length > firstLine.split(",").length
+      ? ";"
+      : ",");
+
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (cleaned[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === delimiter) {
+      row.push(field);
+      field = "";
+    } else if (ch === "\r") {
+      if (cleaned[i + 1] === "\n") i++;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (ch === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += ch;
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+export async function parseSpreadsheetBuffer(
   buffer: ArrayBuffer | Uint8Array,
   filename: string,
   options: {
@@ -118,7 +318,7 @@ export function parseSpreadsheetBuffer(
     columnRenames?: Record<string, string>;
     typeOverrides?: Record<string, string>;
   } = {}
-): ParsedExcelResult {
+): Promise<ParsedExcelResult> {
   const ext = (filename.split(".").pop() || "").toLowerCase();
   const hasHeader = options.hasHeader !== false;
   const nullStrategy = options.nullStrategy || "keep";
@@ -135,19 +335,47 @@ export function parseSpreadsheetBuffer(
     const parsed = JSON.parse(text);
     const arr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.data) ? parsed.data : [parsed];
     if (arr.length > 0 && typeof arr[0] === "object") {
-      const keys = Array.from(new Set<string>(arr.flatMap((r: any) => Object.keys(r || {}))));
+      const keySet = new Set<string>();
+      const keys: string[] = [];
+      for (const r of arr) {
+        if (r && typeof r === "object") {
+          for (const k of Object.keys(r)) {
+            if (!keySet.has(k)) {
+              keySet.add(k);
+              keys.push(k);
+            }
+          }
+        }
+      }
       rawMatrix = [keys, ...arr.map((r: any) => keys.map((k) => r?.[k] ?? ""))];
     }
     sheets = ["JSON"];
     selectedSheet = "JSON";
+  } else if (ext === "jsonl" || ext === "ndjson" || ext === "log" || ext === "txt") {
+    const text = new TextDecoder("utf-8").decode(buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer));
+    const parsed = parseLogOrTextToMatrix(text, ext);
+    rawMatrix = parsed.matrix;
+    sheets = [parsed.label];
+    selectedSheet = parsed.label;
+  } else if (ext === "csv" || ext === "tsv") {
+    const text = new TextDecoder("utf-8").decode(buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer));
+    rawMatrix = parseDelimitedText(text, ext === "tsv" ? "\t" : undefined);
+    sheets = [ext.toUpperCase()];
+    selectedSheet = ext.toUpperCase();
+  } else if (ext === "xls") {
+    throw new Error(
+      "Legacy binary .xls files require server-side upload or saving as .xlsx/.csv in browser preview mode."
+    );
   } else {
-    const wb = XLSX.read(buffer, { type: "array", cellDates: true, raw: false });
-    sheets = wb.SheetNames || [];
-    selectedSheet = selectedSheet && sheets.includes(selectedSheet) ? selectedSheet : sheets[0] || "";
-    const ws = selectedSheet ? wb.Sheets[selectedSheet] : undefined;
-    if (ws) {
-      rawMatrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" }) as any[][];
-    }
+    const inputBuffer = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const parsedSheets = await readXlsxFile(inputBuffer);
+    sheets = parsedSheets.map((s) => s.sheet);
+    const targetSheet =
+      (selectedSheet ? parsedSheets.find((s) => s.sheet === selectedSheet) : undefined) || parsedSheets[0];
+    selectedSheet = targetSheet?.sheet || "";
+    rawMatrix = (targetSheet?.data || []).map((row) =>
+      row.map((cell) => (cell === null || cell === undefined ? "" : cell))
+    );
   }
 
   // Filter completely empty trailing/leading rows
@@ -167,7 +395,7 @@ export function parseSpreadsheetBuffer(
 
   const maxCols = rawMatrix.reduce((mx, r) => Math.max(mx, r.length), 0);
   const headerRow = hasHeader
-    ? rawMatrix[0].map((v, i) => String(v ?? "").trim() || `ستون ${i + 1}`)
+    ? Array.from({ length: maxCols }, (_, i) => String(rawMatrix[0][i] ?? "").trim() || `ستون ${i + 1}`)
     : Array.from({ length: maxCols }, (_, i) => `ستون ${i + 1}`);
   const dataMatrix = hasHeader ? rawMatrix.slice(1) : rawMatrix;
 
@@ -189,7 +417,7 @@ export function parseSpreadsheetBuffer(
       } else if (typeof val === "string") {
         val = val.trim();
       }
-      obj[c.fieldName] = val === undefined ? "" : val;
+      obj[c.fieldName] = val === undefined || val === null ? "" : val;
     }
     return obj;
   });
@@ -215,12 +443,21 @@ export function parseSpreadsheetBuffer(
   }
   records = deduped;
 
-  // Infer column types and cast values cleanly
+  // Infer column types and cast values cleanly without allocating full-column temporary copies
   const columns: ParsedExcelColumn[] = colDefs.map((c) => {
-    const vals = records.map((r) => r[c.fieldName]);
+    const sampleNonNull: any[] = [];
+    let nullable = false;
+    for (let i = 0; i < records.length; i++) {
+      const v = records[i][c.fieldName];
+      if (v === "" || v === null || v === undefined) {
+        nullable = true;
+      } else if (sampleNonNull.length < 150) {
+        sampleNonNull.push(v);
+      }
+      if (nullable && sampleNonNull.length >= 150) break;
+    }
     const ov = typeOverrides[c.fieldName] || typeOverrides[c.rawHdr];
-    const dtype = inferType(vals, ov);
-    const nullable = vals.some((v) => v === "" || v === null || v === undefined);
+    const dtype = inferType(sampleNonNull, ov);
     const semanticRole = inferSemanticRole(c.displayName, dtype);
     return {
       field_name: c.fieldName,

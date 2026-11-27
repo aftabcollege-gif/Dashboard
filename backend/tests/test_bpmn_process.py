@@ -118,14 +118,218 @@ def test_bpmn_widget_crud_switch_and_persian_ai(client, admin_headers):
     gen = client.post(
         "/api/v1/ai/generate-dashboard",
         headers=admin_headers,
-        json={"dataset_id": new_ds_id, "title": "داشبورد فرآیند اکسل"},
+        json={"dataset_id": new_ds_id, "title": "داشبورد فرآیند اکسل", "auto_generate_kpis": True},
     )
     assert gen.status_code == 200, gen.text
     gen_dash_id = gen.json()["dashboard_id"]
     gen_det = client.get(f"/api/v1/dashboards/{gen_dash_id}", headers=admin_headers).json()
     assert any(w["chart_type"] == "bpmn" for w in gen_det["widgets"])
+    excel_bpmn_w = next(w for w in gen_det["widgets"] if w["chart_type"] == "bpmn")
+    excel_exec = client.post(
+        f"/api/v1/dashboards/widgets/{excel_bpmn_w['id']}/data",
+        headers=admin_headers,
+        json={"active_filters": [], "cross_filters": [], "drill_stack": [], "use_cache": False},
+    )
+    assert excel_exec.status_code == 200, excel_exec.text
+    ex_ba = excel_exec.json().get("bpmn_analytics")
+    assert ex_ba is not None
+    assert ex_ba["total_source_rows"] == 3
+    ex_drill = client.post(
+        f"/api/v1/dashboards/widgets/{excel_bpmn_w['id']}/bpmn-drill",
+        headers=admin_headers,
+        json={"step_name": "تأیید مدیریت", "pending_only": True},
+    )
+    assert ex_drill.status_code == 200, ex_drill.text
+    ex_names = {a["assigneeName"] for a in ex_drill.json()["assignees"]}
+    assert {"سارا محمدی", "رضا کریمی"} <= ex_names
 
     # Cleanup temporary dashboards & uploaded dataset
     client.delete(f"/api/v1/dashboards/{new_dash_id}", headers=admin_headers)
     client.delete(f"/api/v1/dashboards/{gen_dash_id}", headers=admin_headers)
     client.delete(f"/api/v1/datasets/{new_ds_id}", headers=admin_headers)
+
+
+def test_400k_multiprocess_bpmn_sql_scale_and_drill(client, admin_headers):
+    """
+    Validates 100%-row DuckDB SQL BPMN + Process Intelligence across 400,000 rows
+    with multiple Persian processes and collision-prone column names
+    (نام فرآیند / مرحله فرآیند / نام فرد در کارتابل).
+    """
+    from app.database import SessionLocal
+    from app.engines.warehouse import warehouse, _WriteGuard
+    from app.models.data import Dataset, DatasetField
+    from app.models import Workspace
+
+    table_name = "wh_test_400k_bpmn"
+    total_rows = 400_000
+
+    with _WriteGuard(warehouse._rw):
+        conn = warehouse._ensure_conn_unlocked()
+        conn.execute(f"DROP TABLE IF EXISTS main.{table_name}")
+        conn.execute(
+            f"""
+            CREATE TABLE main.{table_name} AS
+            SELECT
+                'REQ-' || ((i % 100000) + 1)::VARCHAR AS "کد درخواست",
+                CASE (i % 4)
+                    WHEN 0 THEN 'فرآیند خرید'
+                    WHEN 1 THEN 'فرآیند خرید'
+                    WHEN 2 THEN 'فرآیند مرخصی'
+                    ELSE 'فرآیند تدارکات'
+                END AS "نام فرآیند",
+                CASE (i % 3)
+                    WHEN 0 THEN 'ثبت درخواست'
+                    WHEN 1 THEN 'تایید مدیر واحد'
+                    ELSE 'بررسی مالی'
+                END AS "مرحله فرآیند",
+                CASE ((i // 4) % 4)
+                    WHEN 0 THEN 'علی رضایی'
+                    WHEN 1 THEN 'سارا محمدی'
+                    WHEN 2 THEN 'حسین کریمی'
+                    ELSE 'مریم احمدی'
+                END AS "نام فرد در کارتابل",
+                CASE (i % 3)
+                    WHEN 0 THEN 4.0
+                    WHEN 1 THEN 38.0
+                    ELSE 14.0
+                END AS "مدت انتظار",
+                CASE (i % 2)
+                    WHEN 0 THEN 'در انتظار اقدام'
+                    ELSE 'تکمیل شده'
+                END AS "وضعیت"
+            FROM range(0, {total_rows}) t(i)
+            """
+        )
+
+    db = SessionLocal()
+    ds_id = None
+    dash_id = None
+    try:
+        ws = db.query(Workspace).first()
+        assert ws is not None
+        ds = Dataset(
+            organization_id=ws.organization_id,
+            name="لاگ ۴۰۰ هزار رکوردی فرآیندها",
+            warehouse_table=table_name,
+            row_count=total_rows,
+        )
+        db.add(ds)
+        db.flush()
+        ds_id = ds.id
+        for idx, (fname, dtype, role) in enumerate(
+            [
+                ("کد درخواست", "string", "dimension"),
+                ("نام فرآیند", "string", "dimension"),
+                ("مرحله فرآیند", "string", "dimension"),
+                ("نام فرد در کارتابل", "string", "dimension"),
+                ("مدت انتظار", "float", "measure"),
+                ("وضعیت", "string", "dimension"),
+            ]
+        ):
+            db.add(
+                DatasetField(
+                    dataset_id=ds.id,
+                    field_name=fname,
+                    display_name=fname,
+                    data_type=dtype,
+                    semantic_role=role,
+                )
+            )
+        db.commit()
+
+        # 1. AI generates dashboard for the 400k multi-process dataset
+        gen = client.post(
+            "/api/v1/ai/generate-dashboard",
+            headers=admin_headers,
+            json={"dataset_id": ds_id, "title": "داشبورد ۴۰۰ هزار رکوردی", "auto_generate_kpis": True},
+        )
+        assert gen.status_code == 200, gen.text
+        dash_id = gen.json()["dashboard_id"]
+        det = client.get(f"/api/v1/dashboards/{dash_id}", headers=admin_headers).json()
+        bpmn_w = next((w for w in det["widgets"] if w["chart_type"] == "bpmn"), None)
+        assert bpmn_w is not None, f"Expected BPMN widget, got {[w['chart_type'] for w in det['widgets']]}"
+
+        # 2. Execute batch -> verify 100% of 400,000 rows counted, zero column collision
+        batch = client.post(
+            f"/api/v1/dashboards/{dash_id}/execute-batch",
+            headers=admin_headers,
+            json={"active_filters": [], "cross_filters": [], "drill_states": {}, "use_cache": False},
+        )
+        assert batch.status_code == 200, batch.text
+        wdata = batch.json()["widgets"][bpmn_w["id"]]
+        ba = wdata.get("bpmn_analytics")
+        assert ba is not None
+        assert ba["total_source_rows"] == total_rows
+        assert ba["mapping"]["process_field"] == "نام فرآیند"
+        assert ba["mapping"]["step_field"] == "مرحله فرآیند"
+        assert ba["mapping"]["assignee_field"] == "نام فرد در کارتابل"
+        assert len(ba["processes"]) == 3
+        assert sum(p["total_count"] for p in ba["processes"]) == total_rows
+
+        # 3. Switch process to فرآیند مرخصی -> verify scoped to 100,000 rows
+        switched = client.post(
+            f"/api/v1/dashboards/widgets/{bpmn_w['id']}/data",
+            headers=admin_headers,
+            json={
+                "active_filters": [],
+                "cross_filters": [],
+                "drill_stack": [],
+                "use_cache": False,
+                "bpmn_process_name": "فرآیند مرخصی",
+            },
+        )
+        assert switched.status_code == 200, switched.text
+        sw_ba = switched.json()["bpmn_analytics"]
+        assert sw_ba["active_process"] == "فرآیند مرخصی"
+        assert sw_ba["active_source_rows"] == 100_000
+        assert sum(s["total_count"] for s in sw_ba["step_summary"]) == 100_000
+
+        # 4. Live SQL step cartable drill-down -> verify real assignees, never "نامشخص"
+        drill = client.post(
+            f"/api/v1/dashboards/widgets/{bpmn_w['id']}/bpmn-drill",
+            headers=admin_headers,
+            json={
+                "step_name": "تایید مدیر واحد",
+                "process_name": "فرآیند خرید",
+                "pending_only": True,
+                "limit": 25,
+                "offset": 0,
+            },
+        )
+        assert drill.status_code == 200, drill.text
+        dr = drill.json()
+        assignee_names = {a["assigneeName"] for a in dr["assignees"]}
+        assert "نامشخص" not in assignee_names
+        assert {"علی رضایی", "سارا محمدی", "حسین کریمی", "مریم احمدی"} <= assignee_names
+        assert len(dr["items"]) == 25
+        assert dr["total_items"] > 30_000
+
+        # 5. Process Intelligence /processes + 100%-row SQL /analyze on 400k dataset
+        pi_procs = client.get(
+            f"/api/v1/process-intelligence/datasets/{ds_id}/processes",
+            headers=admin_headers,
+        )
+        assert pi_procs.status_code == 200, pi_procs.text
+        pi_p_json = pi_procs.json()
+        assert pi_p_json["total_rows"] == total_rows
+        assert len(pi_p_json["processes"]) == 3
+
+        pi_ana = client.post(
+            f"/api/v1/process-intelligence/datasets/{ds_id}/analyze",
+            headers=admin_headers,
+            json={"process_name": "فرآیند تدارکات"},
+        )
+        assert pi_ana.status_code == 200, pi_ana.text
+        ana_json = pi_ana.json()
+        assert ana_json["status"] == "ok"
+        assert ana_json["summary"]["total_events_analyzed"] == 100_000
+        assert len(ana_json["bottlenecks"]) == 3
+    finally:
+        if dash_id:
+            client.delete(f"/api/v1/dashboards/{dash_id}", headers=admin_headers)
+        if ds_id:
+            client.delete(f"/api/v1/datasets/{ds_id}", headers=admin_headers)
+        with _WriteGuard(warehouse._rw):
+            warehouse._ensure_conn_unlocked().execute(f"DROP TABLE IF EXISTS main.{table_name}")
+        db.close()
+

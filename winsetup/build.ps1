@@ -115,6 +115,8 @@ if (Test-Path $PublicSrc) {
 
 Write-Host "=== Step 3/7: Staging clean backend application (excluding dev data & venv) ==="
 Copy-Item -Path (Join-Path $BackendDir "app") -Destination (Join-Path $StageDir "backend\app") -Recurse -Force
+Copy-Item -Path (Join-Path $BackendDir "alembic") -Destination (Join-Path $StageDir "backend\alembic") -Recurse -Force
+Copy-Item -Path (Join-Path $BackendDir "alembic.ini") -Destination (Join-Path $StageDir "backend\alembic.ini") -Force
 Copy-Item -Path (Join-Path $BackendDir "migrations") -Destination (Join-Path $StageDir "backend\migrations") -Recurse -Force
 Copy-Item -Path (Join-Path $BackendDir "requirements.txt") -Destination (Join-Path $StageDir "backend\requirements.txt") -Force
 Get-ChildItem -Path (Join-Path $StageDir "backend") -Include "__pycache__", "*.pyc", ".pytest_cache" -Recurse -Force |
@@ -142,7 +144,7 @@ if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
 if ($LASTEXITCODE -ne 0) { throw "pip install requirements failed" }
 
 # Smoke-check critical Python C-extension imports inside bundled runtime
-& $BundledPython -c "import fastapi, uvicorn, sqlalchemy, duckdb, pandas, openpyxl, reportlab, cryptography, bcrypt, apscheduler, sqlparse, ldap3; print('PYTHON_RUNTIME_OK')"
+& $BundledPython -c "import fastapi, uvicorn, sqlalchemy, alembic, duckdb, pandas, openpyxl, reportlab, cryptography, bcrypt, apscheduler, sqlparse, sqlglot, defusedxml, ldap3; print('PYTHON_RUNTIME_OK')"
 if ($LASTEXITCODE -ne 0) { throw "Bundled Python dependency smoke check failed" }
 
 # Strip __pycache__ inside site-packages to keep installer compact

@@ -1,6 +1,13 @@
 import rawDemoData from "@/lib/vercelDemoData.json";
 import { parseSpreadsheetBuffer } from "@/lib/excelParser";
-import { DEFAULT_PROCUREMENT_BPMN_GRAPH, inferBpmnFieldMapping } from "@/lib/bpmnParser";
+import { computeBpmnAnalytics, DEFAULT_PROCUREMENT_BPMN_GRAPH, inferBpmnFieldMapping, normalizeBpmnText } from "@/lib/bpmnParser";
+import { handleDemoDescriptiveBuilder } from "@/lib/vercelDemoDescriptiveBuilder";
+import {
+  evaluateDemoKpiFormula,
+  evaluateDemoStandardAndBusinessKpis,
+  formatKpiVal,
+} from "@/lib/vercelDemoKpi";
+import { APP_VERSION, PREVIOUS_VERSION, RELEASE_NOTES, SCHEMA_VERSION } from "@/lib/version";
 
 const demoData = rawDemoData as any;
 
@@ -54,7 +61,8 @@ function resolveDemoUser(authHeader: string | null): { username: string; account
 function applyRlsAndFilters(
   rows: Row[],
   username: string | null,
-  filters: any[] = []
+  filters: any[] = [],
+  availableColumns?: string[]
 ): Row[] {
   let out = rows;
   const account = username ? demoData.demo_accounts?.[username] : null;
@@ -62,12 +70,19 @@ function applyRlsAndFilters(
   if (userRegion && userRegion !== "All") {
     out = out.filter((r) => !("region" in r) || r.region === userRegion);
   }
+  const colSet = availableColumns && availableColumns.length > 0 ? new Set(availableColumns) : null;
 
   for (const f of filters || []) {
     if (f?.is_active === false) continue;
     const field = f?.field_name;
     const val = f?.value;
     if (!field || val === undefined || val === null || val === "" || (Array.isArray(val) && val.length === 0)) {
+      continue;
+    }
+    if (colSet && !colSet.has(field)) {
+      continue;
+    }
+    if (!colSet && out.length > 0 && !out.some((r) => Object.prototype.hasOwnProperty.call(r, field))) {
       continue;
     }
     const op = String(f?.operator || "eq").toLowerCase();
@@ -114,7 +129,7 @@ function executeVisualSpec(
   extraDatasets: any[] = []
 ) {
   const { rows: allRows, columns: tableCols } = getTableForDataset(datasetId, extraDatasets);
-  const filtered = applyRlsAndFilters(allRows, username, filters);
+  const filtered = applyRlsAndFilters(allRows, username, filters, tableCols);
   const agg = String(spec?.aggregation || "SUM").toUpperCase();
   const limit = Number(spec?.limit || (rawMode ? 1000 : 200));
 
@@ -137,8 +152,27 @@ function executeVisualSpec(
   const yField = spec?.y_field || "revenue";
   const secField = spec?.secondary_y_field || null;
   const sizeField = spec?.size_field || null;
+  const calMode = spec?.calendar_mode || "jalali";
+  const msa = spec?.multi_source_agg || null;
+  const rightRowsForMsa = msa?.right_dataset_id
+    ? applyRlsAndFilters(getTableForDataset(msa.right_dataset_id, extraDatasets).rows, username, [])
+    : undefined;
 
   if (!xField) {
+    if (spec?.formula || msa) {
+      const fVal = evaluateDemoKpiFormula(
+        spec?.formula || "",
+        filtered,
+        calMode,
+        msa,
+        rightRowsForMsa
+      );
+      return {
+        columns: ["value"],
+        rows: [{ value: fVal !== null ? Math.round(fVal * 10000) / 10000 : null }],
+        row_count: 1,
+      };
+    }
     const val = aggregateGroup(filtered, yField, agg);
     return {
       columns: ["value"],
@@ -160,7 +194,12 @@ function executeVisualSpec(
     const sample = grp[0];
     const row: Row = { [xField]: sample[xField] };
     if (seriesField) row[seriesField] = sample[seriesField];
-    row.value = Math.round(aggregateGroup(grp, yField, agg) * 100) / 100;
+    if (spec?.formula) {
+      const fVal = evaluateDemoKpiFormula(spec.formula, grp, calMode, null);
+      row.value = fVal !== null ? Math.round(fVal * 100) / 100 : null;
+    } else {
+      row.value = Math.round(aggregateGroup(grp, yField, agg) * 100) / 100;
+    }
     if (secField) {
       row.secondary_value = Math.round(aggregateGroup(grp, secField, spec?.secondary_aggregation || agg) * 100) / 100;
     }
@@ -187,13 +226,278 @@ function executeVisualSpec(
   return { columns: cols, rows: sliced, row_count: sliced.length };
 }
 
+function buildDemoBpmnPayload(
+  widget: any,
+  username: string | null,
+  combinedFilters: any[],
+  extraDatasets: any[] = [],
+  bpmnProcessName: string | null = null,
+  bpmnFieldOverrides: Record<string, string> | null = null
+) {
+  const tbl = getTableForDataset(widget.dataset_id, extraDatasets);
+  const cols = tbl.columns || [];
+  const baseRows = applyRlsAndFilters(tbl.rows || [], username, combinedFilters);
+  const spec = widget.query?.visual_spec || {};
+  const viz = widget.config?.visualization || {};
+  const rawCfg = {
+    ...(spec.bpmn_config || {}),
+    ...(viz.bpmn_config || {}),
+    ...(bpmnFieldOverrides || {}),
+  };
+  const mapping = inferBpmnFieldMapping(cols, rawCfg);
+  const procCol = mapping.process_field;
+  const processesMap = new Map<string, { total: number; steps: Set<string>; waits: number[] }>();
+  if (procCol) {
+    for (const r of baseRows) {
+      const pName = String(r[procCol] ?? "").trim();
+      if (!pName) continue;
+      if (!processesMap.has(pName)) processesMap.set(pName, { total: 0, steps: new Set(), waits: [] });
+      const cur = processesMap.get(pName)!;
+      cur.total += 1;
+      if (mapping.step_field && r[mapping.step_field]) cur.steps.add(String(r[mapping.step_field]).trim());
+      if (mapping.wait_field) cur.waits.push(Number(r[mapping.wait_field] || 0) || 0);
+    }
+  }
+  const processes = Array.from(processesMap.entries())
+    .map(([process_name, info]) => ({
+      process_name,
+      total_count: info.total,
+      step_count: info.steps.size,
+      avg_wait_hours: info.waits.length
+        ? Math.round((info.waits.reduce((a, b) => a + b, 0) / info.waits.length) * 10) / 10
+        : 0,
+    }))
+    .sort((a, b) => b.total_count - a.total_count);
+
+  let activeProcess: string | null = null;
+  if (bpmnProcessName && bpmnProcessName !== "__ALL__" && bpmnProcessName !== "ALL") {
+    activeProcess = bpmnProcessName;
+  } else if (!bpmnProcessName && processes.length > 1) {
+    activeProcess = processes[0].process_name;
+  }
+  const scopedRows =
+    procCol && activeProcess
+      ? baseRows.filter((r) => normalizeBpmnText(r[procCol]) === normalizeBpmnText(activeProcess))
+      : baseRows;
+
+  const computed = computeBpmnAnalytics(scopedRows, cols, rawCfg, "avg_wait");
+  const stepList = Object.values(computed.stepMap);
+  const assignees_by_step: Record<string, any[]> = {};
+  for (const st of stepList) {
+    assignees_by_step[st.stepKey] = st.assignees.map((a) => ({
+      assigneeName: a.assigneeName,
+      assigneeRole: a.assigneeRole,
+      pendingCount: a.pendingCount,
+      totalCount: a.totalCount,
+      avgWaitHours: a.avgWaitHours,
+      maxWaitHours: a.maxWaitHours,
+      overdueCount: a.overdueCount,
+    }));
+  }
+
+  return {
+    mode: "sql_aggregated",
+    total_source_rows: baseRows.length,
+    active_source_rows: scopedRows.length,
+    sampled_raw_rows: Math.min(scopedRows.length, 1500),
+    processes: processes.map((p) => ({ ...p, pending_count: p.total_count })),
+    active_process: activeProcess,
+    mapping: {
+      process_field: mapping.process_field || null,
+      step_field: mapping.step_field,
+      assignee_field: mapping.assignee_field || null,
+      assignee_role_field: mapping.assignee_role_field || null,
+      wait_field: mapping.wait_field || null,
+      sla_field: mapping.sla_field || null,
+      status_field: mapping.status_field || null,
+      request_id_field: mapping.request_id_field || null,
+      request_title_field: mapping.request_title_field || null,
+      department_field: mapping.department_field || null,
+      entered_at_field: mapping.entered_at_field || null,
+    },
+    available_columns: cols,
+    step_summary: stepList.map((st, idx) => ({
+      step_name: st.stepKey,
+      step_order: idx + 1,
+      total_count: st.totalCount,
+      pending_count: st.pendingCount,
+      completed_count: st.completedCount,
+      avg_wait_hours: st.avgWaitHours,
+      max_wait_hours: st.maxWaitHours,
+      sla_hours: st.slaHours,
+      overdue_count: st.overdueCount,
+      assignee_count: st.assignees.length,
+    })),
+    transitions: [],
+    assignees_by_step,
+  };
+}
+
+function executeDemoBpmnStepDrill(
+  widget: any,
+  username: string | null,
+  body: any,
+  extraDatasets: any[] = []
+) {
+  const combinedFilters = [
+    ...(body?.active_filters || []),
+    ...(body?.cross_filters || []).filter((c: any) => c?.source_widget_id !== widget.id),
+  ];
+  const tbl = getTableForDataset(widget.dataset_id, extraDatasets);
+  const cols = tbl.columns || [];
+  let rows = applyRlsAndFilters(tbl.rows || [], username, combinedFilters, cols);
+  const spec = widget.query?.visual_spec || {};
+  const viz = widget.config?.visualization || {};
+  const rawCfg = {
+    ...(spec.bpmn_config || {}),
+    ...(viz.bpmn_config || {}),
+    ...(body?.field_overrides || {}),
+  };
+  const mapping = inferBpmnFieldMapping(cols, rawCfg);
+  if (mapping.process_field && body?.process_name && body.process_name !== "__ALL__") {
+    const pNorm = normalizeBpmnText(body.process_name);
+    rows = rows.filter((r) => normalizeBpmnText(r[mapping.process_field!]) === pNorm);
+  }
+  const computed = computeBpmnAnalytics(rows, cols, rawCfg, "avg_wait");
+  const targetNorm = normalizeBpmnText(body?.step_name);
+  const stepStats = Object.values(computed.stepMap).find(
+    (s) => normalizeBpmnText(s.stepKey) === targetNorm || normalizeBpmnText(s.stepLabel) === targetNorm
+  );
+  if (!stepStats) {
+    return {
+      step_name: body?.step_name || "",
+      process_name: body?.process_name || null,
+      available_columns: cols,
+      step_summary: {
+        step_key: body?.step_name || "",
+        total_count: 0,
+        pending_count: 0,
+        completed_count: 0,
+        avg_wait_hours: 0,
+        max_wait_hours: 0,
+        sla_hours: 48,
+        overdue_count: 0,
+      },
+      timeline: [],
+      assignees: [],
+      items: [],
+      total_items: 0,
+      limit: Number(body?.limit || 80),
+      offset: Number(body?.offset || 0),
+    };
+  }
+  let items = [
+    ...(body?.pending_only && stepStats.pendingItems.length > 0 ? stepStats.pendingItems : stepStats.items),
+  ].sort((a, b) => b.waitHours - a.waitHours || String(a.requestId).localeCompare(String(b.requestId)));
+  if (body?.assignee_name) {
+    const aNorm = normalizeBpmnText(body.assignee_name);
+    items = items.filter((it) => normalizeBpmnText(it.assigneeName) === aNorm);
+  }
+  if (body?.search) {
+    const qNorm = normalizeBpmnText(body.search);
+    items = items.filter(
+      (it) =>
+        normalizeBpmnText(it.requestId).includes(qNorm) ||
+        normalizeBpmnText(it.requestTitle).includes(qNorm) ||
+        normalizeBpmnText(it.assigneeName).includes(qNorm) ||
+        normalizeBpmnText(it.department).includes(qNorm)
+    );
+  }
+  const limit = Math.max(1, Math.min(Number(body?.limit || 80), 500));
+  const rawOffset = Math.max(0, Number(body?.offset || 0));
+  const offset = items.length > 0 && rawOffset >= items.length
+    ? Math.max(0, Math.floor((items.length - 1) / limit) * limit)
+    : rawOffset;
+
+  const sortedWaits = stepStats.items.map((it) => it.waitHours).sort((a, b) => a - b);
+  const medianWait = sortedWaits.length
+    ? Math.round(sortedWaits[Math.floor(sortedWaits.length / 2)] * 10) / 10
+    : stepStats.avgWaitHours;
+  const p95Wait = sortedWaits.length
+    ? Math.round(sortedWaits[Math.min(sortedWaits.length - 1, Math.floor(sortedWaits.length * 0.95))] * 10) / 10
+    : stepStats.maxWaitHours;
+  const slaBreachPct = stepStats.totalCount > 0
+    ? Math.round((stepStats.overdueCount / stepStats.totalCount) * 1000) / 10
+    : 0;
+
+  const tlBuckets = new Map<string, { total: number; pending: number; waits: number[]; overdue: number }>();
+  for (const it of stepStats.items) {
+    if (!it.enteredAt) continue;
+    const period = String(it.enteredAt).slice(0, 7);
+    if (!/^\d{4}[-/]\d{2}$/.test(period)) continue;
+    if (!tlBuckets.has(period)) tlBuckets.set(period, { total: 0, pending: 0, waits: [], overdue: 0 });
+    const b = tlBuckets.get(period)!;
+    b.total += 1;
+    if (it.isPending) b.pending += 1;
+    b.waits.push(it.waitHours);
+    if (it.isOverdue) b.overdue += 1;
+  }
+  const timeline = Array.from(tlBuckets.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .slice(0, 60)
+    .map(([period, b]) => ({
+      period,
+      total_count: b.total,
+      pending_count: b.pending,
+      avg_wait_hours: b.waits.length ? Math.round((b.waits.reduce((x, y) => x + y, 0) / b.waits.length) * 10) / 10 : 0,
+      overdue_count: b.overdue,
+    }));
+
+  return {
+    step_name: stepStats.stepKey,
+    process_name: body?.process_name || null,
+    available_columns: cols,
+    step_summary: {
+      step_key: stepStats.stepKey,
+      step_label: stepStats.stepLabel,
+      total_count: stepStats.totalCount,
+      pending_count: stepStats.pendingCount,
+      completed_count: stepStats.completedCount,
+      avg_wait_hours: stepStats.avgWaitHours,
+      median_wait_hours: medianWait,
+      p95_wait_hours: p95Wait,
+      max_wait_hours: stepStats.maxWaitHours,
+      sla_hours: stepStats.slaHours,
+      overdue_count: stepStats.overdueCount,
+      sla_breach_pct: slaBreachPct,
+    },
+    timeline,
+    assignees: stepStats.assignees.map((a) => ({
+      assigneeName: a.assigneeName,
+      assigneeRole: a.assigneeRole,
+      pendingCount: a.pendingCount,
+      totalCount: a.totalCount,
+      avgWaitHours: a.avgWaitHours,
+      maxWaitHours: a.maxWaitHours,
+      overdueCount: a.overdueCount,
+    })),
+    items: items.slice(offset, offset + limit),
+    total_items: items.length,
+    limit,
+    offset,
+  };
+}
+
+function findWidgetInDemo(widgetId: string, body?: any): any | null {
+  const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards)
+    ? body.demo_context.custom_dashboards
+    : [];
+  for (const d of customDashes) {
+    const hit = (d?.widgets || []).find((x: any) => x.id === widgetId);
+    if (hit) return hit;
+  }
+  return findWidget(widgetId)?.widget || null;
+}
+
 function executeWidgetForDemo(
   widget: any,
   username: string | null,
   activeFilters: any[] = [],
   crossFilters: any[] = [],
   drillStack: any[] = [],
-  extraDatasets: any[] = []
+  extraDatasets: any[] = [],
+  bpmnProcessName: string | null = null,
+  bpmnFieldOverrides: Record<string, string> | null = null
 ) {
   const drillRule = widget.drill_rule;
   const hierarchy = drillRule?.hierarchy || [];
@@ -235,6 +539,9 @@ function executeWidgetForDemo(
   const spec = widget.query?.visual_spec || {};
   const isBpmn = effectiveChartType === "bpmn";
   const res = executeVisualSpec(widget.dataset_id, spec, username, combinedFilters, effectiveDim, isRaw || isBpmn, extraDatasets);
+  const bpmnPayload = isBpmn
+    ? buildDemoBpmnPayload(widget, username, combinedFilters, extraDatasets, bpmnProcessName, bpmnFieldOverrides)
+    : undefined;
 
   return {
     widget_id: widget.id,
@@ -254,6 +561,7 @@ function executeWidgetForDemo(
     cache_hit: false,
     data_version: 2,
     generated_sql: "-- Preview Demo Snapshot Engine",
+    ...(bpmnPayload ? { bpmn_analytics: bpmnPayload } : {}),
   };
 }
 
@@ -1040,22 +1348,47 @@ function buildDemoFullDashboard(ds: any, title: string, layoutPreset: string, th
   const labelMap = new Map<string, string>(colsInfo.map((c: any) => [c.name, c.label]));
   const lbl = (col?: string | null) => (!col || col === "*" ? "رکوردها" : labelMap.get(col) || col.replace(/_/g, " "));
 
-  const prefDims = ["contractor_name", "region", "project_type", "category", "department", "product", "channel", "city"].filter((c) => dimCols.includes(c));
-  const restDims = dimCols.filter((c: string) => !prefDims.includes(c) && !c.endsWith("_code"));
+  const prefDims = [
+    "level",
+    "status_code",
+    "service",
+    "method",
+    "logger",
+    "contractor_name",
+    "region",
+    "project_type",
+    "category",
+    "department",
+    "product",
+    "channel",
+    "city",
+  ].filter((c) => dimCols.includes(c));
+  const restDims = dimCols.filter((c: string) => !prefDims.includes(c) && !c.endsWith("_code") && c !== "line_number");
   const orderedDims = [...prefDims, ...restDims];
   const primaryDim = orderedDims[0] || null;
   const secondaryDim = orderedDims[1] || primaryDim;
   const timeCol = colsInfo.find((c: any) => c.role === "time")?.name || null;
 
-  const prefNums = ["project_count", "revenue", "profit", "actual_amount", "performance_score", "contract_value", "salary"].filter((c) => numCols.includes(c));
-  const restNums = numCols.filter((c: string) => !prefNums.includes(c));
+  const prefNums = [
+    "project_count",
+    "revenue",
+    "profit",
+    "actual_amount",
+    "performance_score",
+    "contract_value",
+    "salary",
+    "latency_ms",
+    "duration_ms",
+    "response_bytes",
+  ].filter((c) => numCols.includes(c));
+  const restNums = numCols.filter((c: string) => !prefNums.includes(c) && c !== "line_number" && c !== "status_code");
   const orderedNums = [...prefNums, ...restNums];
   const primaryNum = orderedNums[0] || "*";
   const secondaryNum = orderedNums[1] || primaryNum;
 
   const aggFor = (col: string) => {
     if (col === "*") return "COUNT";
-    if (["score", "pct", "rate", "ratio", "margin"].some((k) => col.toLowerCase().includes(k))) return "AVG";
+    if (["score", "pct", "rate", "ratio", "margin", "latency", "duration"].some((k) => col.toLowerCase().includes(k))) return "AVG";
     return "SUM";
   };
   const pAgg = aggFor(primaryNum);
@@ -1074,14 +1407,16 @@ function buildDemoFullDashboard(ds: any, title: string, layoutPreset: string, th
       visual_spec: { y_field: "*", aggregation: "COUNT" },
       style: { number_format: "number" },
     });
-    specs.push({
-      title: `${pAgg === "AVG" ? "میانگین" : "مجموع"} ${lbl(primaryNum)}`,
-      chart_type: "kpi",
-      layout: { x: 4, y: 0, w: 4, h: 3 },
-      visual_spec: { y_field: primaryNum, aggregation: pAgg },
-      style: { number_format: isCurrP && pAgg !== "COUNT" ? "currency" : "number" },
-    });
-    if (secondaryNum !== primaryNum) {
+    if (primaryNum !== "*") {
+      specs.push({
+        title: `${pAgg === "AVG" ? "میانگین" : "مجموع"} ${lbl(primaryNum)}`,
+        chart_type: "kpi",
+        layout: { x: 4, y: 0, w: 4, h: 3 },
+        visual_spec: { y_field: primaryNum, aggregation: pAgg },
+        style: { number_format: isCurrP && pAgg !== "COUNT" ? "currency" : "number" },
+      });
+    }
+    if (secondaryNum !== primaryNum && secondaryNum !== "*") {
       specs.push({
         title: `${sAgg === "AVG" ? "میانگین" : "مجموع"} ${lbl(secondaryNum)}`,
         chart_type: "kpi",
@@ -1608,9 +1943,11 @@ function handleAssistantDemo(body: any, username: string | null) {
     ].some((k) => normLow.includes(k));
     const hasDash = ["داشبورد", "dashboard", "صفحه گزارش"].some((k) => normLow.includes(k));
     const hasWidget = ["ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget", "bpmn", "گلوگاه", "گردش کار"].some((k) => normLow.includes(k));
+    const isQa = ["چقدر", "کدام", "چند ", "میانگین", "مجموع", "جمع ", "بیشترین", "کمترین", "چرا", "؟", "?"].some((k) => normLow.includes(k));
 
     if (body?.widget_id || isEditKw) effMode = "edit";
     else if (hasDash && !hasWidget) effMode = "create_dashboard";
+    else if (isQa && !hasWidget) effMode = "qa";
     else if (hasWidget || ["از روی منبع", "بر اساس", "به تفکیک"].some((k) => normLow.includes(k))) effMode = "add_widget";
   }
 
@@ -1624,6 +1961,7 @@ function handleAssistantDemo(body: any, username: string | null) {
           key: "mode",
           question: "یکی از کارهای زیر را انتخاب کنید:",
           options: [
+            { value: "qa", label: "پرسش و تحلیل مستقیم از داده‌ها (Q&A)", hint: "پاسخ محاسبه‌شده با منبع واقعی" },
             { value: "create_dashboard", label: "ساخت یک داشبورد کامل جدید", hint: "با چند نمودار و کارت خلاصه آماده" },
             { value: "add_widget", label: "افزودن یک نمودار یا عدد آماری جدید", hint: "به داشبورد فعلی یا دلخواه" },
             { value: "edit", label: "ویرایش داشبورد یا نمودارهای موجود", hint: "تغییر رنگ/ظاهر، نام، نوع نمودار یا حذف" },
@@ -1634,6 +1972,24 @@ function handleAssistantDemo(body: any, username: string | null) {
     };
   }
 
+  if (effMode === "qa") {
+    const wRes: any = handleTextToWidgetDemo(body, username);
+    if (wRes.status === "needs_clarification") return wRes;
+    const rows = wRes.preview_data?.rows || [];
+    const cols = wRes.preview_data?.columns || [];
+    return {
+      status: "qa_answered",
+      action: "qa",
+      message_fa: rows.length
+        ? `پاسخ محاسبه‌شده از داده‌ها (${rows.length} نتیجه): ${cols.slice(0, 2).map((c: string) => `${c}: ${rows[0][c]}`).join(" · ")}`
+        : "داده‌ای یافت نشد.",
+      generated_sql: wRes.generated_sql || "-- Preview Demo SQL",
+      recommended_chart_type: wRes.widget_spec?.chart_type || "bar",
+      source_datasets: ["Demo Dataset"],
+      confidence: 0.9,
+      preview_data: wRes.preview_data,
+    };
+  }
   if (effMode === "create_dashboard") return handleCreateDashboardDemo(body);
   if (effMode === "edit") return handleEditDashboardOrWidgetDemo(body, username);
   return { action: "add_widget", ...handleTextToWidgetDemo(body, username) };
@@ -1727,13 +2083,31 @@ export async function handleVercelDemoApi(
               config: w.config,
               query: w.query,
               drill_rule: w.drill_rule,
-              data: { columns: res.columns, rows: res.rows, row_count: res.row_count },
+              data: {
+                columns: res.columns,
+                rows: res.rows,
+                row_count: res.row_count,
+                ...(res.bpmn_analytics ? { bpmn_analytics: res.bpmn_analytics } : {}),
+              },
             };
           }),
         },
       };
     }
     return { status: 200, body: { ...pub, themes: demoData.themes || [] } };
+  }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "public" && segments[2] && segments[3] === "widgets" && segments[4] && segments[5] === "bpmn-drill") {
+    const token = segments[2];
+    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
+    const detMatch =
+      (customDashes.find((d: any) => d?.is_public && d?.embed_token === token) as any) ||
+      (Object.values(demoData.dashboards_detail || {}).find(
+        (d: any) => d.is_public && d.embed_token === token
+      ) as any);
+    if (!detMatch) return { status: 404, body: { detail: "Public dashboard not found" } };
+    const w = (detMatch.widgets || []).find((x: any) => x.id === segments[4]) || findWidgetInDemo(segments[4], body);
+    if (!w) return { status: 404, body: { detail: "Widget not found" } };
+    return { status: 200, body: executeDemoBpmnStepDrill(w, null, body, getExtraDatasets(body)) };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "public" && segments[2] && segments[3] === "execute-batch") {
     const token = segments[2];
@@ -1746,7 +2120,16 @@ export async function handleVercelDemoApi(
       const hierarchy = w.drill_rule?.hierarchy || [];
       const rawStack = body?.drill_states?.[w.id] || [];
       const dStack = hierarchy.length > 0 ? rawStack.slice(0, Math.max(0, hierarchy.length - 1)) : [];
-      widgets[w.id] = executeWidgetForDemo(w, null, body?.active_filters || [], body?.cross_filters || [], dStack);
+      widgets[w.id] = executeWidgetForDemo(
+        w,
+        null,
+        body?.active_filters || [],
+        body?.cross_filters || [],
+        dStack,
+        [],
+        body?.bpmn_process_map?.[w.id] || null,
+        body?.bpmn_field_overrides_map?.[w.id] || null
+      );
     }
     return {
       status: 200,
@@ -1822,7 +2205,16 @@ export async function handleVercelDemoApi(
     for (const w of det.widgets || []) {
       if (pageId && w.page_id !== pageId) continue;
       const dStack = body?.drill_states?.[w.id] || [];
-      widgets[w.id] = executeWidgetForDemo(w, username, body?.active_filters || [], body?.cross_filters || [], dStack, extraDatasets);
+      widgets[w.id] = executeWidgetForDemo(
+        w,
+        username,
+        body?.active_filters || [],
+        body?.cross_filters || [],
+        dStack,
+        extraDatasets,
+        body?.bpmn_process_map?.[w.id] || null,
+        body?.bpmn_field_overrides_map?.[w.id] || null
+      );
     }
     return {
       status: 200,
@@ -1836,15 +2228,7 @@ export async function handleVercelDemoApi(
     };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "data") {
-    const customDashes: any[] = Array.isArray(body?.demo_context?.custom_dashboards) ? body.demo_context.custom_dashboards : [];
-    let foundWidget: any = null;
-    for (const d of customDashes) {
-      const hit = (d?.widgets || []).find((x: any) => x.id === segments[2]);
-      if (hit) { foundWidget = hit; break; }
-    }
-    if (!foundWidget) {
-      foundWidget = findWidget(segments[2])?.widget || null;
-    }
+    const foundWidget = findWidgetInDemo(segments[2], body);
     if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
     return {
       status: 200,
@@ -1854,8 +2238,61 @@ export async function handleVercelDemoApi(
         body?.active_filters || [],
         body?.cross_filters || [],
         body?.drill_stack || [],
-        extraDatasets
+        extraDatasets,
+        body?.bpmn_process_name || null,
+        body?.bpmn_field_overrides || null
       ),
+    };
+  }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "bpmn-drill" && segments[4] === "export") {
+    const foundWidget = findWidgetInDemo(segments[2], body);
+    if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
+    const drillRes = executeDemoBpmnStepDrill(foundWidget, username, { ...(body || {}), limit: 500, offset: 0 }, extraDatasets);
+    const cols = ["requestId", "requestTitle", "assigneeName", "assigneeRole", "department", "waitHours", "slaHours", "status", "enteredAt"];
+    const csvText = "\ufeff" + toCsv(cols, drillRes.items || []);
+    return { status: 200, textBody: csvText, contentType: "text/csv; charset=utf-8" };
+  }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "bpmn-drill") {
+    const foundWidget = findWidgetInDemo(segments[2], body);
+    if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
+    return { status: 200, body: executeDemoBpmnStepDrill(foundWidget, username, body, extraDatasets) };
+  }
+  if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "drill-details") {
+    const foundWidget = findWidgetInDemo(segments[2], body);
+    if (!foundWidget) return { status: 404, body: { detail: "Widget not found" } };
+    const dsId = foundWidget.dataset_id;
+    const dsObj = getEffectiveDatasets(extraDatasets).find((d: any) => d.id === dsId);
+    const { dimCols } = dsObj ? getDemoDatasetSchema(dsObj) : { dimCols: [] };
+    const hier = (foundWidget.drill_rule?.hierarchy || []).map((h: any) => h?.field).filter(Boolean);
+    const availableDims = Array.from(new Set([...hier, ...dimCols])).filter(Boolean) as string[];
+    const chosenDim = body?.breakdown_dimension && availableDims.includes(body.breakdown_dimension)
+      ? body.breakdown_dimension
+      : (availableDims[0] || null);
+
+    const combinedFilters = [
+      ...(body?.active_filters || []),
+      ...(body?.cross_filters || []).filter((c: any) => c?.source_widget_id !== foundWidget.id),
+    ];
+    const limit = Math.max(10, Math.min(Number(body?.limit || 100), 200));
+    const rawRes = executeVisualSpec(dsId, { ...(foundWidget.query?.visual_spec || {}), limit }, username, combinedFilters, null, true, extraDatasets);
+    const bdRes = chosenDim && !foundWidget.query?.visual_spec?.multi_source_agg
+      ? executeVisualSpec(dsId, { ...(foundWidget.query?.visual_spec || {}), limit: 25 }, username, combinedFilters, chosenDim, false, extraDatasets)
+      : { columns: [], rows: [] };
+    return {
+      status: 200,
+      body: {
+        widget_id: foundWidget.id,
+        title: foundWidget.title,
+        formula: foundWidget.query?.visual_spec?.formula || null,
+        drill_through_page_id: foundWidget.drill_rule?.drill_through_page_id || null,
+        available_dimensions: availableDims,
+        breakdown_dimension: chosenDim,
+        breakdown_columns: bdRes.columns,
+        breakdown_rows: bdRes.rows,
+        columns: rawRes.columns,
+        rows: rawRes.rows,
+        row_count: rawRes.row_count,
+      },
     };
   }
   if (method === "POST" && segments[0] === "dashboards" && segments[1] === "widgets" && segments[3] === "switch-chart") {
@@ -1915,6 +2352,12 @@ export async function handleVercelDemoApi(
   if (method === "GET" && segments[0] === "dashboards" && segments[2] === "versions") {
     return { status: 200, body: [{ id: "v1", version_number: 1, label: "Baseline Seeded Snapshot", created_at: "2026-11-16T08:30:00Z" }] };
   }
+  if (method === "GET" && segments[0] === "dashboards" && segments[2] === "named-layouts") {
+    return { status: 200, body: [] };
+  }
+  if (method === "GET" && path === "/actions") {
+    return { status: 200, body: [] };
+  }
   if (method === "GET" && segments[0] === "dashboards" && segments[2] === "comments") {
     return { status: 200, body: [{ id: "c1", widget_id: null, author_name: "System Administrator", content: "Q4 executive KPIs synced with warehouse.", created_at: "2026-11-16T09:00:00Z" }] };
   }
@@ -1924,6 +2367,24 @@ export async function handleVercelDemoApi(
   }
 
   // Datasets & Semantic Layer
+  if (method === "GET" && path === "/about") {
+    return {
+      status: 200,
+      body: {
+        name: "Enterprise BI Platform",
+        version: APP_VERSION,
+        previous_version: PREVIOUS_VERSION,
+        schema_version: SCHEMA_VERSION,
+        releases: RELEASE_NOTES,
+      },
+    };
+  }
+  if (method === "GET" && path === "/jobs") {
+    return { status: 200, body: [] };
+  }
+  if (method === "GET" && segments[0] === "jobs" && segments[1]) {
+    return { status: 200, body: { id: segments[1], status: "completed", progress_pct: 100, stage_label: "تکمیل‌شده" } };
+  }
   if (method === "GET" && path === "/datasets") {
     return { status: 200, body: demoData.datasets || [] };
   }
@@ -1938,6 +2399,21 @@ export async function handleVercelDemoApi(
   }
   if (method === "GET" && segments[0] === "datasets" && segments[2] === "lineage") {
     return { status: 200, body: demoData.dataset_lineage?.[segments[1]] || { nodes: [], edges: [] } };
+  }
+  if (method === "GET" && segments[0] === "datasets" && segments[2] === "analytics-diagnostics") {
+    return {
+      status: 200,
+      body: {
+        dataset_id: segments[1],
+        duplicate_rows: 0,
+        incomplete_columns: [],
+        outliers: [],
+        correlations: [],
+        period_comparison: null,
+        trend_anomalies: [],
+        row_accounting: { input_rows: 100, processed_rows: 100, valid_rows: 100, invalid_rows: 0 },
+      },
+    };
   }
   if (method === "GET" && segments[0] === "datasets" && segments[2] === "preview") {
     const limit = Number(searchParams.get("limit") || 30);
@@ -1974,7 +2450,7 @@ export async function handleVercelDemoApi(
     try {
       if (body.type_overrides_json) typeOverrides = JSON.parse(String(body.type_overrides_json));
     } catch { /* ignore */ }
-    const parsed = parseSpreadsheetBuffer(f.buffer, f.name, {
+    const parsed = await parseSpreadsheetBuffer(f.buffer, f.name, {
       sheetName: body.sheet_name || undefined,
       hasHeader: String(body.has_header ?? "true") !== "false",
       nullStrategy: body.null_strategy || "keep",
@@ -1987,11 +2463,19 @@ export async function handleVercelDemoApi(
         status: 200,
         body: {
           sheets: parsed.sheets,
+          sheet_summaries: (parsed.sheets || []).map((s: string) => ({ sheet_name: s, estimated_rows: parsed.total_rows })),
           selected_sheet: parsed.selected_sheet,
           total_rows: parsed.total_rows,
           duplicate_count: parsed.duplicate_count,
           columns: parsed.columns,
           preview_rows: parsed.preview_rows,
+          row_accounting: {
+            input_rows: parsed.total_rows,
+            processed_rows: parsed.total_rows,
+            valid_rows: parsed.total_rows,
+            invalid_rows: 0,
+            warnings: [],
+          },
         },
       };
     }
@@ -2021,11 +2505,21 @@ export async function handleVercelDemoApi(
       },
     };
   }
+  if (method === "GET" && path === "/data-sources/composite-datasets") {
+    return { status: 200, body: [] };
+  }
+  if (method === "POST" && path === "/data-sources/composite-datasets") {
+    return { status: 200, body: { composite_id: `comp_${Date.now()}`, total_rows: 0, status: "completed" } };
+  }
   if (method === "GET" && path === "/data-sources") {
     return { status: 200, body: demoData.data_sources || [] };
   }
   if (method === "GET" && path === "/data-sources/supported-types") {
-    return { status: 200, body: demoData.supported_types || { databases: [], files: [] } };
+    const base = demoData.supported_types || { databases: [], files: [] };
+    const mergedFiles = Array.from(
+      new Set([...(base.files || []), "xlsx", "xls", "csv", "tsv", "json", "jsonl", "ndjson", "log", "txt", "xml"])
+    );
+    return { status: 200, body: { ...base, files: mergedFiles } };
   }
   if (method === "POST" && segments[0] === "data-sources" && segments[2] === "test") {
     return { status: 200, body: { ok: true, latency_ms: 4.1, message: "Preview ERP SQLite source reachable (demo snapshot)" } };
@@ -2073,8 +2567,24 @@ export async function handleVercelDemoApi(
   if (method === "GET" && path === "/rbac/users") {
     return { status: 200, body: demoData.rbac_users || [] };
   }
+  if (method === "GET" && segments[0] === "rbac" && segments[1] === "users" && segments[3] === "effective-permissions") {
+    const u = (demoData.rbac_users || []).find((x: any) => x.id === segments[2]);
+    return {
+      status: 200,
+      body: {
+        user_id: segments[2],
+        username: u?.username || "demo",
+        roles: u?.roles || [],
+        effective_permissions: [{ resource_type: "*", resource_id: "*", action: "*", effect: "allow", source: "demo" }],
+        has_admin_wildcard: true,
+      },
+    };
+  }
   if (method === "GET" && path === "/rbac/roles") {
-    return { status: 200, body: demoData.rbac_roles || { roles: [], catalog: {} } };
+    return { status: 200, body: demoData.rbac_roles || { roles: [], catalog: [] } };
+  }
+  if (method === "GET" && path === "/rbac/groups") {
+    return { status: 200, body: demoData.rbac_groups || [] };
   }
   if (method === "GET" && path === "/rbac/permissions/matrix") {
     return { status: 200, body: demoData.rbac_matrix || { rules: [], dashboards: [], widgets: [] } };
@@ -2165,19 +2675,347 @@ export async function handleVercelDemoApi(
       },
     };
   }
+  // Intelligent KPI & Semantic Class Discovery (Demo Preview Parity)
+  if (method === "GET" && path === "/ai/semantic-classes") {
+    return {
+      status: 200,
+      body: [
+        { id: "Additive Measure", name_fa: "سنجه جمع‌پذیر", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Semi-additive Measure", name_fa: "سنجه نیمه‌جمع‌پذیر", policy: "semi_additive", default_agg: "LAST_VALUE", sum_allowed: false },
+        { id: "Non-additive Measure", name_fa: "سنجه غیرجمع‌پذیر", policy: "non_additive", default_agg: "AVG", sum_allowed: false },
+        { id: "Count Measure", name_fa: "سنجه شمارشی", policy: "count", default_agg: "SUM", sum_allowed: true },
+        { id: "Ratio", name_fa: "نسبت", policy: "non_additive", default_agg: "AVG", sum_allowed: false },
+        { id: "Percentage", name_fa: "درصد / نرخ", policy: "non_additive", default_agg: "AVG", sum_allowed: false },
+        { id: "Currency", name_fa: "مبلغ مالی", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Duration", name_fa: "مدت زمان / تاخیر", policy: "duration", default_agg: "AVG", sum_allowed: true },
+        { id: "Date/Time", name_fa: "تاریخ و زمان", policy: "temporal", default_agg: "NONE", sum_allowed: false },
+        { id: "Identifier", name_fa: "شناسه / کد یکتا", policy: "identifier", default_agg: "COUNT_DISTINCT", sum_allowed: false },
+        { id: "Category", name_fa: "دسته‌بندی", policy: "dimension", default_agg: "COUNT_DISTINCT", sum_allowed: false },
+        { id: "Status", name_fa: "وضعیت", policy: "dimension", default_agg: "COUNT_DISTINCT", sum_allowed: false },
+        { id: "Geographic", name_fa: "موقعیت جغرافیایی", policy: "dimension", default_agg: "COUNT_DISTINCT", sum_allowed: false },
+        { id: "Boolean", name_fa: "بولی / دودویی", policy: "boolean", default_agg: "COUNT", sum_allowed: false },
+        { id: "Target", name_fa: "هدف / بودجه", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Actual", name_fa: "عملکرد واقعی", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Quantity", name_fa: "تعداد / مقدار", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Unit Price", name_fa: "قیمت واحد / فی", policy: "non_additive", default_agg: "AVG", sum_allowed: false },
+        { id: "Cost", name_fa: "هزینه", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Revenue", name_fa: "فروش / درآمد", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Profit", name_fa: "سود", policy: "additive", default_agg: "SUM", sum_allowed: true },
+        { id: "Balance", name_fa: "مانده / موجودی لحظه‌ای", policy: "semi_additive", default_agg: "LAST_VALUE", sum_allowed: false },
+      ],
+    };
+  }
+  if (method === "GET" && segments[0] === "ai" && segments[1] === "recommend" && segments[2]) {
+    const allDs = getEffectiveDatasets(extraDatasets);
+    const ds = allDs.find((d) => d.id === segments[2]) || allDs[0];
+    if (!ds) return { status: 404, body: { detail: "Dataset not found" } };
+    const table = getTableForDataset(ds.id, extraDatasets);
+    const rows = table.rows || [];
+    const fields = ds.fields || [];
+    const fieldClassifications = fields.map((f: any) => {
+      const fn = String(f.field_name || "").toLowerCase();
+      const dt = String(f.data_type || "string").toLowerCase();
+      const isNum = ["int", "integer", "float", "decimal", "numeric", "number"].includes(dt);
+      let semanticClass = isNum ? "Additive Measure" : "Category";
+      let sumAllowed = isNum;
+      let defAgg = isNum ? "SUM" : "COUNT";
+      if (/(revenue|sales|income)/.test(fn)) semanticClass = "Revenue";
+      else if (/(cost|expense)/.test(fn)) semanticClass = "Cost";
+      else if (/(profit|margin)/.test(fn) && !/pct|rate/.test(fn)) semanticClass = "Profit";
+      else if (/(pct|percent|rate|ratio)/.test(fn) && isNum) {
+        semanticClass = "Percentage";
+        sumAllowed = false;
+        defAgg = "AVG";
+      } else if (/(date|time|created)/.test(fn) || dt.includes("date")) {
+        semanticClass = "Date/Time";
+      } else if (/(region|city|province|country|state)/.test(fn)) {
+        semanticClass = "Geographic";
+      } else if (/(_id|^id$|code)/.test(fn)) {
+        semanticClass = "Identifier";
+        sumAllowed = false;
+        defAgg = "COUNT_DISTINCT";
+      }
+      const numVals = isNum ? rows.map((r: any) => Number(r[f.field_name])).filter((v: number) => !Number.isNaN(v)) : [];
+      const sum = numVals.reduce((a: number, b: number) => a + b, 0);
+      const avg = numVals.length ? Math.round((sum / numVals.length) * 100) / 100 : undefined;
+      return {
+        field_name: f.field_name,
+        display_name: f.display_name || f.field_name,
+        data_type: isNum ? "numeric" : dt.includes("date") ? "date" : "categorical",
+        raw_type: f.data_type,
+        semantic_class: semanticClass,
+        confidence: 0.9,
+        needs_user_confirmation: false,
+        default_aggregation: defAgg,
+        sum_allowed: sumAllowed,
+        stats: {
+          avg,
+          median: avg,
+          stddev: avg ? Math.round(avg * 0.25 * 100) / 100 : undefined,
+          null_pct: 0,
+          distinct_count: new Set(rows.map((r: any) => r[f.field_name])).size,
+          iqr_outlier_count: 0,
+        },
+      };
+    });
+    const calMode = searchParams.get("calendar_mode") || "jalali";
+    const evalStd = evaluateDemoStandardAndBusinessKpis(ds, rows, calMode, {});
+    const numCls = fieldClassifications.filter((f: any) => f.data_type === "numeric" && f.semantic_class !== "Identifier");
+    const extraKpis = numCls.slice(0, 6).map((f: any, idx: number) => {
+      const vals = rows.map((r: any) => Number(r[f.field_name])).filter((v: number) => !Number.isNaN(v));
+      const sum = vals.reduce((a: number, b: number) => a + b, 0);
+      const val = f.sum_allowed ? sum : vals.length ? sum / vals.length : 0;
+      const fmt = ["Revenue", "Cost", "Profit", "Currency"].includes(f.semantic_class)
+        ? "currency"
+        : f.semantic_class === "Percentage"
+        ? "percentage"
+        : "number";
+      return {
+        id: `demo_${f.field_name}`,
+        slug: `${f.field_name}_${f.default_aggregation.toLowerCase()}`,
+        name: `${f.sum_allowed ? "مجموع" : "میانگین"} ${f.display_name}`,
+        formula: `${f.default_aggregation}("${f.field_name}")`,
+        base_fields: [f.field_name],
+        format_type: fmt,
+        display_format: fmt,
+        unit: fmt === "percentage" ? "%" : "",
+        value: Math.round(val * 100) / 100,
+        formatted_value: formatKpiVal(val, fmt, fmt === "percentage" ? "%" : ""),
+        category: idx === 0 ? "domain" : "aggregate",
+        score: 88 - idx * 4,
+        confidence: 0.92,
+        status: "suggested",
+        computability_status: "computable",
+        computability_status_fa: "قابل محاسبه",
+        source: ds.name,
+        source_datasets: [ds.name],
+        comparison_basis: "کل دوره داده‌ها",
+        limitations: [],
+      };
+    });
+    const stdSigs = new Set(evalStd.computableStandard.map((k) => k.formula.toLowerCase().replace(/\s+/g, "")));
+    const filteredExtra = extraKpis.filter((k: any) => !stdSigs.has(k.formula.toLowerCase().replace(/\s+/g, "")));
+    const allBiz = [...evalStd.computableStandard, ...filteredExtra];
+    return {
+      status: 200,
+      body: {
+        dataset_id: ds.id,
+        dataset_name: ds.name,
+        domain_detection: {
+          primary_domain: "sales_ecommerce",
+          primary_domain_fa: "فروش و عملکرد سازمانی",
+          confidence: 0.88,
+          evidence_fa: `شناسایی خودکار بر اساس ستون‌های ${fields.slice(0, 4).map((x: any) => x.field_name).join("، ")}`,
+        },
+        deep_profile: {
+          row_count: rows.length || ds.row_count || 0,
+          field_count: fields.length,
+          duplicate_row_count: 0,
+          completeness_pct: 99.6,
+          is_approximate: false,
+        },
+        field_classifications: fieldClassifications,
+        kpis: {
+          standard: evalStd.standard,
+          selected: allBiz.slice(0, 5),
+          suggested: allBiz.slice(5),
+          needs_confirmation: [],
+          needs_data: evalStd.needsData,
+          data_quality: [
+            {
+              id: "dq_completeness",
+              name: "درصد تکمیل داده‌ها",
+              formula: "100.0",
+              formatted_value: "99.6%",
+            },
+          ],
+          uncomputable: evalStd.uncomputable,
+          all_business: allBiz,
+          all_candidates: [...evalStd.standard, ...filteredExtra],
+        },
+        recommended_pages: [
+          { title: "۱. خلاصه مدیریتی و KPIها", page_key: "executive_summary", widgets_count: 6, chart_types: ["kpi", "bullet", "grouped_bar", "bar", "pie"] },
+          { title: "۲. تحلیل روند و زمان", page_key: "trends", widgets_count: 3, chart_types: ["line", "area", "calendar_heatmap"] },
+          { title: "۳. مقایسه و تفکیک ابعادی", page_key: "breakdown", widgets_count: 3, chart_types: ["grouped_bar", "treemap"] },
+          { title: "۴. توزیع و شاخص‌های آماری", page_key: "statistical", widgets_count: 2, chart_types: ["histogram", "scatter"] },
+          { title: "۵. جزئیات رکوردها و کیفیت داده", page_key: "details", widgets_count: 2, chart_types: ["table", "kpi"] },
+        ],
+        suggested_widgets: allBiz.map((k: any) => ({ title: k.name, chart_type: "kpi" })),
+      },
+    };
+  }
+  if (method === "POST" && segments[0] === "ai" && segments[1] === "datasets" && segments[3] === "field-overrides") {
+    return { status: 200, body: { status: "ok", updated: Array.isArray(body?.overrides) ? body.overrides.length : 0 } };
+  }
+  if (method === "POST" && segments[0] === "ai" && segments[1] === "datasets" && segments[3] === "kpis" && segments[4] === "preview") {
+    const allDs = getEffectiveDatasets(extraDatasets);
+    const ds = allDs.find((d) => d.id === segments[2]) || allDs[0];
+    const table = ds ? getTableForDataset(ds.id, extraDatasets) : { rows: [] };
+    const rows = table.rows || [];
+    const formula = String(body?.formula || "");
+    const msa = body?.multi_source_agg || null;
+    const rightRows = msa?.right_dataset_id ? getTableForDataset(msa.right_dataset_id, extraDatasets).rows : undefined;
+    const val = evaluateDemoKpiFormula(formula, rows, body?.calendar_mode || "jalali", msa, rightRows);
+    const fmt = body?.format_type || "number";
+    return {
+      status: 200,
+      body: {
+        valid: true,
+        name: body?.name || "Custom KPI",
+        formula,
+        value: val !== null ? Math.round(val * 10000) / 10000 : null,
+        formatted_value: formatKpiVal(val, fmt, body?.unit || (fmt === "percentage" ? "%" : "")),
+        target_value: body?.target_value,
+        warnings: [],
+      },
+    };
+  }
+  if (method === "POST" && segments[0] === "ai" && segments[1] === "datasets" && segments[3] === "kpis" && segments[4] === "register") {
+    return { status: 200, body: { status: "ok", count: Array.isArray(body?.kpis) ? body.kpis.length : 0 } };
+  }
   if (method === "POST" && path === "/ai/generate-dashboard") {
+    const hasConfirmed = Array.isArray(body?.confirmed_kpis) && body.confirmed_kpis.length > 0;
+    const hasSelIds = Array.isArray(body?.selected_kpi_ids) && body.selected_kpi_ids.length > 0;
+    const isAuto = Boolean(body?.auto_generate_kpis);
+    if (!hasConfirmed && !hasSelIds && !isAuto) {
+      return {
+        status: 400,
+        body: {
+          detail: "انتخاب و تأیید KPIها پیش از تولید داشبورد الزامی است. لطفاً حداقل یک KPI را تأیید کنید.",
+        },
+      };
+    }
+
     const allDs = getEffectiveDatasets(extraDatasets);
     const targetDs = allDs.find((d) => d.id === body?.dataset_id) || allDs[0];
     if (targetDs) {
       const [friendly] = friendlyDemoDatasetLabel(targetDs);
-      const title = `داشبورد ${friendly.split("(")[0].trim()}`;
-      const built = buildDemoFullDashboard(targetDs, title, "executive_full", null);
+      const title = body?.title || `داشبورد ${friendly.split("(")[0].trim()}`;
+      const built = buildDemoFullDashboard(targetDs, title, "executive_full", body?.theme_id || null);
+      const dash: any = built.created_dashboard;
+      if (body?.dashboard_id) {
+        dash.id = String(body.dashboard_id);
+      }
+      const dsRows = getTableForDataset(targetDs.id, extraDatasets).rows || [];
+      const calMode = body?.calendar_mode || "jalali";
+      const stdEval = evaluateDemoStandardAndBusinessKpis(targetDs, dsRows, calMode, body?.target_values || {});
+
+      // Resolve final confirmed KPI list
+      let finalKpis: any[] = [];
+      if (hasConfirmed) {
+        finalKpis = body.confirmed_kpis;
+      } else if (hasSelIds) {
+        const byId = new Map<string, any>(stdEval.computableStandard.map((k) => [k.id, k]));
+        for (const ck of body.custom_kpis || []) byId.set(ck.id, ck);
+        finalKpis = body.selected_kpi_ids.map((id: string) => byId.get(id)).filter(Boolean);
+      }
+      if (!finalKpis.length && isAuto) {
+        finalKpis = stdEval.computableStandard.slice(0, 4);
+      }
+
+      // Add hidden drill-through Details page
+      const detPageId = `page_${dash.id}_details`;
+      const mainPageId = dash.pages[0]?.id;
+      const nonKpiWidgets = (dash.widgets || []).filter((w: any) => w.chart_type !== "kpi" && w.chart_type !== "table");
+      const rawTableWidget = (dash.widgets || []).find((w: any) => w.chart_type === "table") || {
+        id: `w_${dash.id}_raw`,
+        dashboard_id: dash.id,
+        page_id: detPageId,
+        title: `جزئیات رکوردهای ${targetDs.name}`,
+        description: "رکوردهای خام جهت تحلیل عمیق (Drill-Through)",
+        chart_type: "table",
+        dataset_id: targetDs.id,
+        layout: { x: 0, y: 0, w: 12, h: 10 },
+        config: { style: {}, visualization: {}, interactions: { cross_filter: false }, advanced: { ai_generated: true } },
+        query: { query_mode: "visual", sql_text: null, visual_spec: { aggregation: "RAW", limit: 200 }, parameters: {} },
+        drill_rule: { hierarchy: [], level_rules: [], drill_through_page_id: null },
+        widget_filters: [],
+        permissions: { view: true, edit: true, delete: true, drill_down: true },
+      };
+      rawTableWidget.page_id = detPageId;
+      rawTableWidget.layout = { x: 0, y: 0, w: 12, h: 10 };
+
+      // Build confirmed KPI widgets cleanly at top of Page 1
+      const { dimCols } = getDemoDatasetSchema(targetDs);
+      const hier = dimCols.slice(0, 2).map((f: string) => ({ field: f }));
+      const kpiWidgets = finalKpis.slice(0, 9).map((k: any, idx: number) => {
+        const fmt = k.display_format || k.format_type || "number";
+        const useGauge = Boolean(k.target_value && Number(k.target_value) > 0 && idx === 0 && (fmt === "percentage" || fmt === "percent" || k.chart_type === "gauge"));
+        const col = idx % 3;
+        const row = Math.floor(idx / 3);
+        return {
+          id: `w_${dash.id}_kpi_${idx + 1}`,
+          dashboard_id: dash.id,
+          page_id: mainPageId,
+          title: k.name,
+          description: k.formula || "",
+          chart_type: useGauge ? "gauge" : "kpi",
+          dataset_id: targetDs.id,
+          dataset_freshness: { status: "fresh", last_refreshed_at: new Date().toISOString(), row_count: targetDs.row_count || 0, data_version: 1 },
+          layout: { x: col * 4, y: row * 4, w: 4, h: useGauge ? 5 : 4 },
+          config: {
+            style: {
+              number_format: fmt === "percentage" ? "percent" : fmt,
+              unit: k.unit || "",
+              target_value: k.target_value ?? undefined,
+              previous_value: k.previous_value ?? undefined,
+            },
+            visualization: { show_legend: false, show_tooltip: true },
+            interactions: { cross_filter: false, drill_down: true },
+            advanced: { ai_generated: true, formula: k.formula, kpi_id: k.id, sources_used: k.source_datasets || [targetDs.name] },
+          },
+          query: {
+            query_mode: "visual",
+            sql_text: null,
+            visual_spec: {
+              formula: k.formula,
+              calendar_mode: calMode,
+              multi_source_agg: k.multi_source_agg || undefined,
+              pre_agg_grain: k.pre_agg_grain || undefined,
+              time_field: k.time_field || undefined,
+            },
+            parameters: {},
+          },
+          drill_rule: { hierarchy: hier, level_rules: [], drill_through_page_id: detPageId },
+          widget_filters: [],
+          permissions: { view: true, edit: true, delete: true, drill_down: true },
+        };
+      });
+
+      const kpiRowsCount = kpiWidgets.length > 0 ? Math.ceil(kpiWidgets.length / 3) * 4 + 1 : 0;
+      const shiftedCharts = nonKpiWidgets.map((w: any) => ({
+        ...w,
+        dashboard_id: dash.id,
+        layout: { ...w.layout, y: (w.layout?.y || 0) + kpiRowsCount },
+        drill_rule: { ...(w.drill_rule || { hierarchy: hier, level_rules: [] }), drill_through_page_id: detPageId },
+      }));
+
+      dash.widgets = [...kpiWidgets, ...shiftedCharts, rawTableWidget];
+      dash.pages = [
+        { ...dash.pages[0], is_drill_through: false },
+        { id: detPageId, title: "جزئیات رکوردها و تحلیل", page_order: 1, is_drill_through: true, layout_settings: { columns_count: 12, row_height: 42, gap_px: 16, grid_enabled: true } },
+      ];
+      dash.settings = {
+        ai_generated: true,
+        kpi_config: {
+          dataset_id: targetDs.id,
+          confirmed_kpis: finalKpis,
+          selected_kpi_ids: finalKpis.map((k: any) => k.id),
+          calendar_mode: calMode,
+          template_mode: body?.template_mode || "executive",
+          detail_level: body?.detail_level || "standard",
+        },
+      };
+
       return {
         status: 200,
         body: {
-          dashboard_id: built.created_dashboard.id,
-          title: built.created_dashboard.title,
-          created_dashboard: built.created_dashboard,
+          dashboard_id: dash.id,
+          title: dash.title,
+          pages_count: dash.pages.length,
+          widgets_count: dash.widgets.length,
+          confirmed_kpis_count: finalKpis.length,
+          created_dashboard: dash,
         },
       };
     }
@@ -2189,6 +3027,267 @@ export async function handleVercelDemoApi(
   }
   if (method === "POST" && path === "/ai/assistant") {
     return { status: 200, body: handleAssistantDemo(body, username) };
+  }
+
+  // Descriptive Dashboard Builder
+  if (segments[0] === "descriptive-builder") {
+    return handleDemoDescriptiveBuilder(method, segments, body, {
+      datasets: getEffectiveDatasets(extraDatasets),
+      themes: demoData.themes || [],
+      getRowsForDataset: (dsId: string) => getTableForDataset(dsId, extraDatasets),
+      executeVisual: (dsId: string, spec: any) =>
+        executeVisualSpec(dsId, spec, username, [], null, String(spec?.aggregation || "").toUpperCase() === "RAW", extraDatasets),
+    });
+  }
+
+  // Process Intelligence (Vercel Preview Demo over real sample rows)
+  if (segments[0] === "process-intelligence") {
+    if (segments[1] === "bpmn-layout") {
+      return { status: 200, body: { node_positions: body?.node_positions || {}, zoom: body?.zoom || 1 } };
+    }
+    if (segments[1] === "datasets" && segments[2]) {
+      const dsId = segments[2];
+      if (segments[3] === "bottleneck-rules") {
+        if (method === "GET") return { status: 200, body: { presets: [], rules: [] } };
+        return { status: 200, body: { id: "demo_rule", ...(body || {}) } };
+      }
+      const tbl = getTableForDataset(dsId, extraDatasets);
+      const cols = (tbl.columns || []).map((c) => ({ field_name: c, display_name: c, type: "string" }));
+      const bpmnInf = inferBpmnFieldMapping(tbl.columns || []);
+      const inferCol = (pats: string[]) => tbl.columns.find((c) => pats.some((p) => c.toLowerCase().includes(p))) || null;
+      const mapping = {
+        case_id: bpmnInf.request_id_field || inferCol(["request_code", "case_id", "request_id", "order_id"]),
+        activity: bpmnInf.step_field || inferCol(["step_name", "activity", "stage"]),
+        timestamp: bpmnInf.entered_at_field || inferCol(["event_time", "timestamp", "started_at", "order_date", "date"]),
+        wait_hours: bpmnInf.wait_field || inferCol(["wait_hours", "wait"]),
+        sla_hours: bpmnInf.sla_field || inferCol(["sla_hours", "sla"]),
+        actor: bpmnInf.assignee_field || inferCol(["assignee", "actor", "sales_rep"]),
+        department: bpmnInf.department_field || inferCol(["department", "region"]),
+        status: bpmnInf.status_field || inferCol(["status"]),
+        process_name: bpmnInf.process_field || null,
+      };
+      if (segments[3] === "processes") {
+        const allRows = applyRlsAndFilters(tbl.rows, username, []);
+        const pCol = mapping.process_name;
+        const pMap = new Map<string, number>();
+        if (pCol) {
+          for (const r of allRows) {
+            const pv = String(r[pCol] || "").trim();
+            if (pv) pMap.set(pv, (pMap.get(pv) || 0) + 1);
+          }
+        }
+        return {
+          status: 200,
+          body: {
+            dataset_id: dsId,
+            process_field: pCol,
+            total_rows: allRows.length,
+            processes: Array.from(pMap.entries())
+              .map(([process_name, total_count]) => ({ process_name, total_count }))
+              .sort((a, b) => b.total_count - a.total_count),
+          },
+        };
+      }
+      if (segments[3] === "mapping") {
+        return {
+          status: 200,
+          body: {
+            dataset_id: dsId,
+            mapping,
+            confidences: Object.fromEntries(Object.entries(mapping).map(([k, v]) => [k, v ? 0.9 : 0])),
+            reference_sequence: [],
+            user_confirmed: method === "POST",
+            needs_confirmation: method !== "POST",
+            available_columns: cols,
+          },
+        };
+      }
+      if (segments[3] === "analyze") {
+        let rows = applyRlsAndFilters(tbl.rows, username, []);
+        if (mapping.process_name && body?.process_name) {
+          const pn = normalizeBpmnText(body.process_name);
+          rows = rows.filter((r) => normalizeBpmnText(r[mapping.process_name!]) === pn);
+        }
+        if (!mapping.case_id || !mapping.activity) {
+          return {
+            status: 200,
+            body: { status: "needs_mapping", mapping_info: { mapping, available_columns: cols }, error_fa: "ستون‌های Case ID و Activity در این دیتاست یافت نشد." },
+          };
+        }
+        const byCase = new Map<string, any[]>();
+        for (const r of rows) {
+          const cid = String(r[mapping.case_id] || "").trim();
+          if (!cid) continue;
+          if (!byCase.has(cid)) byCase.set(cid, []);
+          byCase.get(cid)!.push(r);
+        }
+        const byAct = new Map<string, { cnt: number; waits: number[]; breaches: number }>();
+        const varMap = new Map<string, number>();
+        let reworkCases = 0;
+        let slaBreachCases = 0;
+        for (const [, evs] of byCase) {
+          const acts = evs.map((e) => String(e[mapping.activity!] || ""));
+          if (new Set(acts).size < acts.length) reworkCases++;
+          const vk = acts.join(" -> ");
+          varMap.set(vk, (varMap.get(vk) || 0) + 1);
+          let cBreach = false;
+          for (const e of evs) {
+            const act = String(e[mapping.activity!] || "");
+            const cur = byAct.get(act) || { cnt: 0, waits: [], breaches: 0 };
+            cur.cnt++;
+            const w = mapping.wait_hours ? Number(e[mapping.wait_hours] || 0) : 0;
+            const s = mapping.sla_hours ? Number(e[mapping.sla_hours] || 0) : 0;
+            if (mapping.wait_hours) cur.waits.push(w);
+            if (mapping.sla_hours && w > s) { cur.breaches++; cBreach = true; }
+            byAct.set(act, cur);
+          }
+          if (cBreach) slaBreachCases++;
+        }
+        const bottlenecks = Array.from(byAct.entries()).map(([activity, st]) => {
+          const avgW = st.waits.length ? Number((st.waits.reduce((a, b) => a + b, 0) / st.waits.length).toFixed(2)) : null;
+          return {
+            activity,
+            case_count: st.cnt,
+            event_count: st.cnt,
+            avg_wait_hours: avgW,
+            rework_events: 0,
+            rework_rate_pct: 0,
+            sla_breach_pct: Number(((st.breaches * 100) / Math.max(st.cnt, 1)).toFixed(1)),
+            composite_bottleneck_score: Number(Math.min(100, (avgW || 0) * 4 + st.cnt * 1.5).toFixed(1)),
+          };
+        }).sort((a, b) => b.composite_bottleneck_score - a.composite_bottleneck_score);
+        const totalCases = byCase.size || 1;
+        const variants = Array.from(varMap.entries()).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([k, v], i) => ({
+          rank: i + 1,
+          variant_key: k,
+          steps: k.split(" -> "),
+          case_count: v,
+          share_pct: Number(((v * 100) / totalCases).toFixed(1)),
+          avg_cycle_hours: null,
+          rework_rate_pct: 0,
+          sla_breach_pct: 0,
+          skipped_steps: [],
+          is_deviant: i > 0,
+        }));
+        return {
+          status: 200,
+          body: {
+            status: "ok",
+            dataset_id: dsId,
+            mapping_info: { mapping, available_columns: cols },
+            summary: {
+              total_events_analyzed: rows.length,
+              total_cases: byCase.size,
+              unique_activities: byAct.size,
+              unique_variants: varMap.size,
+              avg_cycle_hours: null,
+              median_cycle_hours: null,
+              avg_wait_hours: bottlenecks[0]?.avg_wait_hours ?? null,
+              avg_processing_hours: null,
+              processing_time_note_fa: "[پیش‌نمایش ابری] نیازمند هر دو ستون start_time و end_time.",
+              wait_time_basis_fa: "ستون wait_hours (داده نمونه پیش‌نمایش)",
+              rework_case_count: reworkCases,
+              rework_rate_pct: Number(((reworkCases * 100) / totalCases).toFixed(1)),
+              self_loop_case_count: 0,
+              sla_evaluated_cases: byCase.size,
+              sla_breach_cases: slaBreachCases,
+              sla_breach_rate_pct: Number(((slaBreachCases * 100) / totalCases).toFixed(1)),
+            },
+            data_quality: { warnings_fa: ["پیش‌نمایش ابری بر پایه رکوردهای نمونه؛ برای ذخیره نگاشت و اقدامات اصلاحی به FastAPI متصل شوید."] },
+            bottlenecks,
+            variants,
+            hypotheses: [],
+          },
+        };
+      }
+      if (segments[3] === "cases") {
+        const rows = applyRlsAndFilters(tbl.rows, username, []);
+        const actF = searchParams.get("activity") || "";
+        if (segments[4]) {
+          const cid = decodeURIComponent(segments[4]);
+          const evs = rows.filter((r) => mapping.case_id && String(r[mapping.case_id]) === cid);
+          return {
+            status: 200,
+            body: {
+              case_id: cid,
+              events: evs.map((e, i) => ({
+                seq: i + 1,
+                activity: mapping.activity ? e[mapping.activity] : "",
+                timestamp: mapping.timestamp ? e[mapping.timestamp] : null,
+                actor: mapping.actor ? e[mapping.actor] : null,
+                department: mapping.department ? e[mapping.department] : null,
+                wait_hours: mapping.wait_hours ? e[mapping.wait_hours] : null,
+              })),
+            },
+          };
+        }
+        const matched = rows.filter((r) => !actF || (mapping.activity && String(r[mapping.activity]) === actF)).slice(0, 40);
+        return {
+          status: 200,
+          body: {
+            total: matched.length,
+            cases: matched.map((r, i) => ({
+              case_id: mapping.case_id ? String(r[mapping.case_id]) : `CASE-${i + 1}`,
+              event_count: 1,
+              wait_hours: mapping.wait_hours ? Number(r[mapping.wait_hours] || 0) : null,
+              has_rework: false,
+              sla_breached: Boolean(mapping.sla_hours && mapping.wait_hours && Number(r[mapping.wait_hours]) > Number(r[mapping.sla_hours])),
+            })),
+          },
+        };
+      }
+      if (segments[3] === "actions") {
+        return { status: 200, body: [] };
+      }
+    }
+  }
+
+  // Security Log Intelligence (Honest Preview Demo status)
+  if (segments[0] === "security-intel") {
+    if (segments[1] === "connectors") {
+      return {
+        status: 200,
+        body: {
+          connectors: [
+            { id: "syslog_security_jsonl", name_fa: "جمع‌آورنده بومی لاگ امنیتی (JSONL / Syslog / Key-Value)", status_fa: "پیاده‌سازی‌شده و آزمایش‌شده (نیازمند سرور Backend)", tested: true, requirements_fa: "در محیط کامل FastAPI فعال است." },
+            { id: "defender_edr", name_fa: "Microsoft Defender for Endpoint (EDR)", status_fa: "طرح‌شده — نیازمند زیرساخت و اعتبارنامه", tested: false, requirements_fa: "نیازمند اعتبارنامه Graph API." },
+            { id: "fortinet_fortigate", name_fa: "فایروال Fortinet FortiGate", status_fa: "طرح‌شده — نیازمند زیرساخت و اعتبارنامه", tested: false, requirements_fa: "نیازمند Syslog / API فایروال." },
+          ],
+        },
+      };
+    }
+    if (segments[1] === "overview") {
+      return {
+        status: 200,
+        body: {
+          window_hours: 720,
+          total_events: 0,
+          action_breakdown: { Detect: 0, Block: 0, Quarantine: 0, Clean: 0, Failed: 0, Allow: 0 },
+          interpretation_notes_fa: [
+            "[پیش‌نمایش ابری]: برای دریافت و ذخیره‌سازی واقعی لاگ‌های امنیتی و هشدارهای آماری، BACKEND_INTERNAL_URL را به سرور FastAPI متصل کنید.",
+            "نبود رویداد در پیش‌نمایش به‌معنای سلامت امنیتی نیست.",
+          ],
+        },
+      };
+    }
+    if (segments[1] === "events") return { status: 200, body: { total: 0, can_view_raw: false, events: [] } };
+    if (segments[1] === "classification-rules") {
+      return { status: 200, body: { categories: [], rules: [] } };
+    }
+    if (
+      segments[1] === "unparsed" ||
+      segments[1] === "collectors" ||
+      segments[1] === "alerts" ||
+      segments[1] === "incidents" ||
+      segments[1] === "vulnerabilities" ||
+      segments[1] === "exposures"
+    ) {
+      return { status: 200, body: [] };
+    }
+  }
+
+  if (segments[0] === "correlation" && segments[1] === "analyze") {
+    return { status: 200, body: { status: "no_security_events", error_fa: "در پیش‌نمایش ابری رویداد امنیتی ذخیره نمی‌شود؛ برای همبستگی زنده به سرور FastAPI متصل شوید." } };
   }
 
   // Fallback for preview demo mutations (read-only preview note)

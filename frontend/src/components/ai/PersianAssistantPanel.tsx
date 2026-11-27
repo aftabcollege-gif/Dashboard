@@ -3,7 +3,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Sparkles, CheckCircle2, ArrowLeft, Wand2, LayoutDashboard, Pencil, PlusCircle, RotateCcw, FileSpreadsheet, Upload } from "lucide-react";
+import { Sparkles, CheckCircle2, ArrowLeft, Wand2, LayoutDashboard, Pencil, PlusCircle, RotateCcw, FileSpreadsheet, Upload, MessageSquare, AlertTriangle } from "lucide-react";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
 import {
@@ -22,7 +22,7 @@ interface AssistantPanelProps {
   dashboardId?: string | null;
   pageId?: string | null;
   initialWidgetId?: string | null;
-  initialMode?: "auto" | "create_dashboard" | "add_widget" | "edit";
+  initialMode?: "auto" | "create_dashboard" | "add_widget" | "edit" | "qa";
   currentWidgets?: any[];
   onApplied?: (result: any) => void;
   compact?: boolean;
@@ -68,7 +68,7 @@ export function PersianAssistantPanel({
   const router = useRouter();
   const { showToast, authStatus } = useBi();
 
-  const [mode, setMode] = useState<"auto" | "create_dashboard" | "add_widget" | "edit">(initialMode);
+  const [mode, setMode] = useState<"auto" | "create_dashboard" | "add_widget" | "edit" | "qa">(initialMode);
   const [prompt, setPrompt] = useState("");
   const [clarifications, setClarifications] = useState<Record<string, string>>({});
   const [freeTextReply, setFreeTextReply] = useState("");
@@ -244,7 +244,7 @@ export function PersianAssistantPanel({
 
   const runAssistant = async (
     overridePrompt?: string,
-    overrideMode?: "auto" | "create_dashboard" | "add_widget" | "edit",
+    overrideMode?: "auto" | "create_dashboard" | "add_widget" | "edit" | "qa",
     overrideClar?: Record<string, string>
   ) => {
     const pText = (overridePrompt ?? prompt).trim();
@@ -355,8 +355,25 @@ export function PersianAssistantPanel({
         )}
       </div>
 
-      {/* 3 Friendly Action Mode Buttons */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+      {/* 4 Friendly Action Mode Buttons */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            setMode("qa");
+            setClarifications({});
+            setResult(null);
+            setPrompt((p) => p || "مجموع فروش بر اساس منطقه چقدر است؟");
+          }}
+          className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border text-xs font-semibold text-right transition-all ${
+            mode === "qa" ? "bg-violet-600/15 border-violet-500 text-violet-500" : ""
+          }`}
+          style={mode === "qa" ? undefined : { borderColor: "var(--bi-border)", backgroundColor: "var(--bi-surface)" }}
+        >
+          <MessageSquare className="w-4 h-4 shrink-0" />
+          <span>پرسش و تحلیل از داده‌ها (Q&amp;A)</span>
+        </button>
+
         <button
           type="button"
           onClick={() => {
@@ -645,6 +662,59 @@ export function PersianAssistantPanel({
         <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-4 flex items-center gap-2 text-emerald-600 dark:text-emerald-400 text-xs sm:text-sm font-semibold">
           <CheckCircle2 className="w-5 h-5 shrink-0" />
           <span>{result.message_fa}</span>
+        </div>
+      )}
+
+      {/* Honest Needs-Data Explanation (Zero Hallucination) */}
+      {result?.status === "needs_data" && (
+        <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-4 space-y-2 text-xs">
+          <div className="flex items-center gap-2 font-bold text-amber-600 dark:text-amber-400">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>{result.message_fa}</span>
+          </div>
+          {Array.isArray(result.available_measures) && result.available_measures.length > 0 && (
+            <div className="text-[11px]" style={{ color: "var(--bi-muted)" }}>
+              ستون‌های عددی موجود: <b>{result.available_measures.join("، ")}</b>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Honest SQL-Backed Q&A Result */}
+      {result?.status === "qa_answered" && (
+        <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-4 space-y-3 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400 font-bold text-sm">
+              <CheckCircle2 className="w-5 h-5 shrink-0" />
+              <span>{result.message_fa}</span>
+            </div>
+            <div className="flex items-center gap-1.5 text-[10px]">
+              {Array.isArray(result.source_datasets) && (
+                <span className="px-2 py-0.5 rounded bg-blue-500/15 text-blue-500 font-semibold">
+                  منبع: {result.source_datasets.join("، ")}
+                </span>
+              )}
+              {typeof result.confidence === "number" && (
+                <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-600 font-semibold">
+                  اطمینان {Math.round(result.confidence * 100)}%
+                </span>
+              )}
+            </div>
+          </div>
+          {result.generated_sql && (
+            <div dir="ltr" className="font-mono text-[10px] p-2 rounded bg-slate-900/80 text-emerald-400 overflow-x-auto">
+              {result.generated_sql}
+            </div>
+          )}
+          {result.preview_data && (
+            <div className="h-56 rounded-lg border p-2" style={{ backgroundColor: "var(--bi-surface)", borderColor: "var(--bi-border)" }}>
+              <WidgetRenderer
+                chartType={result.recommended_chart_type || "bar"}
+                columns={result.preview_data.columns || []}
+                rows={result.preview_data.rows || []}
+              />
+            </div>
+          )}
         </div>
       )}
 

@@ -39,6 +39,10 @@ def client():
 
 @pytest.fixture(scope="session")
 def admin_headers(client):
-    res = client.post("/api/v1/auth/login", json={"username": "admin", "password": "Admin!2026"})
+    res = client.post(
+        "/api/v1/auth/login",
+        json={"username": "admin", "password": "Admin!2026"},
+        headers={"X-Auth-Mode": "bearer"},
+    )
     assert res.status_code == 200
     return {"Authorization": f"Bearer {res.json()['access_token']}"}

@@ -10,6 +10,7 @@ export interface ChartTypeMeta {
 export const CHART_REGISTRY: ChartTypeMeta[] = [
   { id: "bar", label: "Bar Chart", labelFa: "نمودار ستونی", category: "Basic" },
   { id: "horizontal_bar", label: "Horizontal Bar", labelFa: "نمودار میله‌ای افقی", category: "Basic" },
+  { id: "grouped_bar", label: "Grouped Bar", labelFa: "ستونی خوشه‌ای", category: "Comparison", requiresSeries: true },
   { id: "stacked_bar", label: "Stacked Bar", labelFa: "ستونی انباشته", category: "Comparison", requiresSeries: true },
   { id: "stacked_bar_100", label: "100% Stacked Bar", labelFa: "ستونی انباشته ۱۰۰٪", category: "Comparison", requiresSeries: true },
   { id: "line", label: "Line Chart", labelFa: "نمودار خطی", category: "Basic" },
@@ -34,6 +35,7 @@ export const CHART_REGISTRY: ChartTypeMeta[] = [
   { id: "sankey", label: "Sankey Diagram", labelFa: "نمودار جریان سنکی", category: "Specialized", requiresSeries: true },
   { id: "bpmn", label: "BPMN Process & Bottlenecks", labelFa: "فرایند BPMN و گلوگاه‌ها", category: "Specialized" },
   { id: "gauge", label: "Gauge", labelFa: "عقربه‌ای (Gauge)", category: "KPI & Table" },
+  { id: "bullet", label: "Bullet Chart", labelFa: "نمودار بولِت (هدف در برابر عملکرد)", category: "KPI & Table" },
   { id: "kpi", label: "KPI Card", labelFa: "کارت شاخص KPI", category: "KPI & Table" },
   { id: "progress", label: "Progress Bar", labelFa: "نوار پیشرفت", category: "KPI & Table" },
   { id: "table", label: "Data Table", labelFa: "جدول داده", category: "KPI & Table" },

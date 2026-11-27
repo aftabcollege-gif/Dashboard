@@ -4,7 +4,11 @@ from app.engines.warehouse import warehouse
 
 
 def _login(client, username, password):
-    r = client.post("/api/v1/auth/login", json={"username": username, "password": password})
+    r = client.post(
+        "/api/v1/auth/login",
+        json={"username": username, "password": password},
+        headers={"X-Auth-Mode": "bearer"},
+    )
     assert r.status_code == 200
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
@@ -70,6 +74,22 @@ def test_f_and_g_performance_rls_cls_and_cache_security(client, admin_headers):
         "amount": [float((i % 500) + 100) for i in range(50000)],
     })
     warehouse.load_dataframe("wh_bench_50k", big_df, mode="replace")
+    from app.database import db_session_scope
+    from app.models.data import Dataset
+    from app.models.identity import Organization
+    with db_session_scope() as sdb:
+        org_row = sdb.query(Organization).first()
+        if not sdb.query(Dataset).filter(Dataset.warehouse_table == "wh_bench_50k").first():
+            sdb.add(
+                Dataset(
+                    organization_id=org_row.id,
+                    name="Benchmark 50k",
+                    warehouse_table="wh_bench_50k",
+                    row_count=50000,
+                    freshness_status="fresh",
+                )
+            )
+            sdb.commit()
     t0 = time.perf_counter()
     agg_res = client.post(
         "/api/v1/queries/execute-sql",

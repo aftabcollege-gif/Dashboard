@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Responsive, WidthProvider } from "react-grid-layout";
+import { Responsive } from "react-grid-layout";
 import {
   ArrowLeft,
   ArrowUp,
@@ -13,6 +13,7 @@ import {
   Download,
   Edit3,
   Eye,
+  FileText,
   Filter,
   History,
   Layers,
@@ -34,6 +35,7 @@ import WidgetRenderer from "@/components/charts/WidgetRenderer";
 import GlobalFilterBar from "@/components/dashboard/GlobalFilterBar";
 import PropertiesPanel from "@/components/dashboard/PropertiesPanel";
 import { PersianAssistantPanel } from "@/components/ai/PersianAssistantPanel";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { apiDownload, apiFetch } from "@/lib/api";
 import { CHART_REGISTRY } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
@@ -51,9 +53,8 @@ import {
   DashboardWidget,
   DatasetInfo,
   WidgetDataResult,
+  WidgetDrillDetailsResponse,
 } from "@/types/bi";
-
-const ResponsiveGridLayout = WidthProvider(Responsive);
 
 export default function DashboardWorkspace({ dashboardId }: { dashboardId: string }) {
   const { locale, t, authStatus, themes, applyThemeTokens, showToast } = useBi();
@@ -65,6 +66,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [editMode, setEditMode] = useState(false);
   const [selectedWidgetId, setSelectedWidgetId] = useState<string | null>(null);
   const [isMobile, setIsMobile] = useState(false);
+  const gridContainerRef = useRef<HTMLDivElement>(null);
+  const [gridWidth, setGridWidth] = useState<number>(0);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -88,6 +91,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [drillStates, setDrillStates] = useState<
     Record<string, { field: string; value: any }[]>
   >({});
+  const [bpmnProcessMap, setBpmnProcessMap] = useState<Record<string, string>>({});
+  const [bpmnFieldOverridesMap, setBpmnFieldOverridesMap] = useState<Record<string, Record<string, string | null>>>({});
   const [widgetChartOverrides, setWidgetChartOverrides] = useState<Record<string, string>>({});
   const [clickModes, setClickModes] = useState<Record<string, "drill" | "cross_filter">>({});
 
@@ -102,6 +107,13 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [showVersions, setShowVersions] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [shareInfo, setShareInfo] = useState<string | null>(null);
+  const [showEditKpisModal, setShowEditKpisModal] = useState(false);
+  const [prevNonDrillPageId, setPrevNonDrillPageId] = useState<string>("");
+
+  // KPI / Bullet / Gauge Interactive Drill-Down Modal State
+  const [kpiDrillWidget, setKpiDrillWidget] = useState<DashboardWidget | null>(null);
+  const [kpiDrillData, setKpiDrillData] = useState<WidgetDrillDetailsResponse | null>(null);
+  const [kpiDrillLoading, setKpiDrillLoading] = useState(false);
 
   // Add Widget Form
   const [newWTitle, setNewWTitle] = useState("");
@@ -140,8 +152,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const [nlqResult, setNlqResult] = useState<any>(null);
   const [aiInsights, setAiInsights] = useState<any>(null);
 
-  // Versions & Comments State
+  // Versions, Named Layouts & Comments State
   const [versionsList, setVersionsList] = useState<any[]>([]);
+  const [namedLayouts, setNamedLayouts] = useState<any[]>([]);
   const [commentsList, setCommentsList] = useState<any[]>([]);
   const [newComment, setNewComment] = useState("");
 
@@ -150,7 +163,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
   const loadDashboard = useCallback(async () => {
     try {
       const localCreated = getDemoCreatedDashboards().find((x) => x.id === dashboardId) || null;
-      const [d, dsList, savedState, dashList] = await Promise.all([
+      const [d, dsList, savedState, dashList, namedLayoutList] = await Promise.all([
         localCreated
           ? Promise.resolve(localCreated)
           : apiFetch<DashboardDetail>(`/dashboards/${dashboardId}`).catch((e) => {
@@ -161,7 +174,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         apiFetch<DatasetInfo[]>("/datasets").catch(() => []),
         apiFetch<any>(`/dashboards/${dashboardId}/state`).catch(() => null),
         apiFetch<any[]>("/dashboards").catch(() => []),
+        apiFetch<any[]>(`/dashboards/${dashboardId}/named-layouts`).catch(() => []),
       ]);
+      setNamedLayouts(namedLayoutList || []);
       const mergedList = authStatus?.environment === "vercel-preview-demo" ? mergeDemoDashboardList(dashList || []) : (dashList || []);
       setAllDashboards(mergedList);
       const resolvedDash =
@@ -175,8 +190,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       }
       if (savedState?.active_page_id && d.pages.some((p) => p.id === savedState.active_page_id)) {
         setActivePageId(savedState.active_page_id);
-      } else if (!activePageId && d.pages.length > 0) {
-        setActivePageId(d.pages[0].id);
+      } else if ((!activePageId || !d.pages.some((p) => p.id === activePageId)) && d.pages.length > 0) {
+        const firstMain = d.pages.find((p) => !p.is_drill_through) || d.pages[0];
+        setActivePageId(firstMain.id);
       }
       if (savedState?.filter_state && Object.keys(filterValues).length === 0) {
         setFilterValues(savedState.filter_state);
@@ -244,6 +260,14 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       setLoadingWidgets((prev) => ({ ...prev, ...loadingMap }));
 
       try {
+        const cleanOverridesMap: Record<string, Record<string, string>> = {};
+        for (const [wid, ov] of Object.entries(bpmnFieldOverridesMap)) {
+          const clean: Record<string, string> = {};
+          for (const [k, v] of Object.entries(ov || {})) {
+            if (v) clean[k] = v;
+          }
+          if (Object.keys(clean).length > 0) cleanOverridesMap[wid] = clean;
+        }
         const res = await apiFetch<any>(`/dashboards/${dash.id}/execute-batch`, {
           method: "POST",
           body: JSON.stringify({
@@ -252,6 +276,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             cross_filters: crossFilters,
             drill_states: drillStates,
             use_cache: useCache,
+            bpmn_process_map: bpmnProcessMap,
+            bpmn_field_overrides_map: cleanOverridesMap,
           }),
         }).catch(() => ({ widgets: {}, load_ms: 1 }));
         const mergedWidgets: Record<string, any> = { ...(res.widgets || {}) };
@@ -301,7 +327,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         setLoadingWidgets((prev) => ({ ...prev, ...doneMap }));
       }
     },
-    [dash, compiledActiveFilters, crossFilters, drillStates]
+    [dash, compiledActiveFilters, crossFilters, drillStates, bpmnProcessMap, bpmnFieldOverridesMap]
   );
 
   useEffect(() => {
@@ -310,8 +336,14 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     }
   }, [dash, activePageId, compiledActiveFilters, crossFilters, drillStates]);
 
-  // Execute single widget (used on drill down / manual widget refresh)
-  const executeSingleWidget = async (w: DashboardWidget, nextDrillStack: { field: string; value: any }[], useCache = true) => {
+  // Execute single widget (used on drill down / manual widget refresh / BPMN process switch)
+  const executeSingleWidget = async (
+    w: DashboardWidget,
+    nextDrillStack: { field: string; value: any }[],
+    useCache = true,
+    overrideProcessName?: string | null,
+    overrideFields?: Record<string, string | null>
+  ) => {
     const prevLen = (drillStates[w.id] || []).length;
     if (nextDrillStack.length !== prevLen) {
       setWidgetChartOverrides((prev) => {
@@ -323,6 +355,13 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     }
     setLoadingWidgets((p) => ({ ...p, [w.id]: true }));
     try {
+      const effectiveProc =
+        overrideProcessName !== undefined ? overrideProcessName : bpmnProcessMap[w.id] ?? null;
+      const rawFieldOv = overrideFields !== undefined ? overrideFields : bpmnFieldOverridesMap[w.id] || {};
+      const cleanFieldOv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(rawFieldOv)) {
+        if (v) cleanFieldOv[k] = v;
+      }
       const res = await apiFetch<WidgetDataResult>(`/dashboards/widgets/${w.id}/data`, {
         method: "POST",
         body: JSON.stringify({
@@ -330,6 +369,8 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           cross_filters: crossFilters,
           drill_stack: nextDrillStack,
           use_cache: useCache,
+          bpmn_process_name: effectiveProc,
+          bpmn_field_overrides: Object.keys(cleanFieldOv).length > 0 ? cleanFieldOv : null,
         }),
       });
       setWidgetData((prev) => ({ ...prev, [w.id]: res }));
@@ -341,6 +382,16 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     }
   };
 
+  const handleBpmnProcessSelect = async (w: DashboardWidget, processName: string) => {
+    setBpmnProcessMap((prev) => ({ ...prev, [w.id]: processName }));
+    await executeSingleWidget(w, drillStates[w.id] || [], false, processName, undefined);
+  };
+
+  const handleBpmnFieldOverride = async (w: DashboardWidget, overrides: Record<string, string | null>) => {
+    setBpmnFieldOverridesMap((prev) => ({ ...prev, [w.id]: overrides }));
+    await executeSingleWidget(w, drillStates[w.id] || [], false, undefined, overrides);
+  };
+
   const getWidgetClickMode = (w: DashboardWidget): "drill" | "cross_filter" => {
     if (clickModes[w.id]) return clickModes[w.id];
     const hasDrill = (w.drill_rule?.hierarchy?.length || 0) > 0;
@@ -349,8 +400,34 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     return "drill";
   };
 
-  // Handle click on any chart point (Drill Down OR Cross-Filter!)
+  const loadKpiDrillDetails = async (w: DashboardWidget, breakdownDim?: string) => {
+    setKpiDrillWidget(w);
+    setKpiDrillLoading(true);
+    try {
+      const res = await apiFetch<WidgetDrillDetailsResponse>(`/dashboards/widgets/${w.id}/drill-details`, {
+        method: "POST",
+        body: JSON.stringify({
+          active_filters: compiledActiveFilters,
+          cross_filters: crossFilters,
+          breakdown_dimension: breakdownDim || undefined,
+          limit: 100,
+        }),
+      });
+      setKpiDrillData(res);
+    } catch (err: any) {
+      showToast(err.message || "خطا در دریافت جزئیات KPI");
+    } finally {
+      setKpiDrillLoading(false);
+    }
+  };
+
+  // Handle click on any chart point (KPI Drill Modal OR Chart Drill Down OR Cross-Filter!)
   const handleWidgetPointClick = async (w: DashboardWidget, field: string, value: any) => {
+    if (field === "__kpi_drill__") {
+      await loadKpiDrillDetails(w);
+      return;
+    }
+
     const hierarchy = w.drill_rule?.hierarchy || [];
     const currentStack = drillStates[w.id] || [];
     const mode = getWidgetClickMode(w);
@@ -392,33 +469,127 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     showToast(`Applied ${stack.map((s) => `${s.field}=${s.value}`).join(" & ")} to all dashboard widgets`);
   };
 
-  // Layout change handler with Undo stack
+  // Layout change handler with Undo stack + RTL mirroring & container-width awareness
   const currentPage = dash?.pages.find((p) => p.id === activePageId);
+  const colsCount = currentPage?.layout_settings?.columns_count || 12;
+  const isRtl = locale === "fa";
+
   const pageWidgets = useMemo(
     () => (dash?.widgets || []).filter((w) => w.page_id === activePageId),
     [dash, activePageId]
   );
 
+  useEffect(() => {
+    if (isMobile) return;
+    const el = gridContainerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const measured = Math.floor(el.getBoundingClientRect().width);
+      if (measured > 0) setGridWidth((prev) => (prev === measured ? prev : measured));
+    };
+    measure();
+    const ro = new ResizeObserver((entries) => {
+      const measured = Math.floor(entries[0]?.contentRect?.width || el.getBoundingClientRect().width);
+      if (measured > 0) setGridWidth((prev) => (prev === measured ? prev : measured));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [Boolean(dash), activePageId, isMobile, showAiDrawer, Boolean(selectedWidgetId)]);
+
+  const effectiveGridWidth =
+    gridWidth > 0
+      ? gridWidth
+      : typeof window !== "undefined"
+      ? Math.max(680, window.innerWidth - 320)
+      : 1120;
+
+  const activeBreakpoint =
+    effectiveGridWidth > 960
+      ? "lg"
+      : effectiveGridWidth > 680
+      ? "md"
+      : effectiveGridWidth > 480
+      ? "sm"
+      : "xs";
+
   const gridLayouts = useMemo(() => {
-    const lg = pageWidgets.map((w) => ({
-      i: w.id,
-      x: w.layout.x,
-      y: w.layout.y,
-      w: w.layout.w,
-      h: w.layout.h,
-      minW: 2,
-      minH: 2,
-    }));
-    return { lg, md: lg, sm: lg.map((item) => ({ ...item, w: Math.min(item.w, 6) })), xs: lg.map((item) => ({ ...item, w: 4, x: 0 })) };
-  }, [pageWidgets]);
+    const sorted = [...pageWidgets].sort(
+      (a, b) => (Number(a.layout?.y || 0) - Number(b.layout?.y || 0)) || (Number(a.layout?.x || 0) - Number(b.layout?.x || 0))
+    );
+
+    const lg = sorted.map((w) => {
+      const rawW = Math.max(2, Math.min(Number(w.layout?.w || 4), colsCount));
+      const rawX = Math.max(0, Math.min(Number(w.layout?.x || 0), Math.max(0, colsCount - rawW)));
+      const rawY = Math.max(0, Number(w.layout?.y || 0));
+      const hasFooter = Boolean(
+        w.config?.advanced?.narrative_fa ||
+          (w.config?.advanced?.analysis_type && w.description)
+      );
+      const minCardH = w.chart_type === "kpi" || w.chart_type === "gauge" ? (hasFooter ? 4 : 3) : 4;
+      const rawH = Math.max(minCardH, Number(w.layout?.h || 4));
+      const displayX = isRtl ? Math.max(0, colsCount - rawW - rawX) : rawX;
+      return {
+        i: w.id,
+        x: displayX,
+        y: rawY,
+        w: rawW,
+        h: rawH,
+        minW: 2,
+        minH: w.chart_type === "kpi" || w.chart_type === "gauge" ? 3 : 4,
+      };
+    });
+
+    // Clean collision-free 6-col packing for narrow desktop / drawer-open split
+    const sm: any[] = [];
+    let smX = 0;
+    let smY = 0;
+    let smRowMaxH = 0;
+    for (const item of lg) {
+      const smW = item.w <= 4 ? 3 : 6;
+      if (smX + smW > 6) {
+        smY += smRowMaxH;
+        smX = 0;
+        smRowMaxH = 0;
+      }
+      const displaySmX = isRtl ? 6 - smW - smX : smX;
+      sm.push({
+        ...item,
+        x: displaySmX,
+        y: smY,
+        w: smW,
+        minW: Math.min(item.minW, smW),
+      });
+      smRowMaxH = Math.max(smRowMaxH, item.h);
+      smX += smW;
+      if (smX >= 6) {
+        smY += smRowMaxH;
+        smX = 0;
+        smRowMaxH = 0;
+      }
+    }
+
+    let xsY = 0;
+    const xs = lg.map((item) => {
+      const out = { ...item, x: 0, y: xsY, w: 4, minW: 2 };
+      xsY += item.h;
+      return out;
+    });
+
+    return { lg, md: lg, sm, xs };
+  }, [pageWidgets, colsCount, isRtl]);
 
   const handleLayoutChange = (currentLayout: any[]) => {
     if (!editMode || !dash) return;
+    // Never overwrite canonical 12/16/24-col coordinates when viewing a narrow sm/xs breakpoint
+    if (activeBreakpoint !== "lg" && activeBreakpoint !== "md") return;
     const prevSnapshot = pageWidgets.map((w) => ({ i: w.id, ...w.layout }));
-    // Only record if coordinates actually shifted
-    const changed = currentLayout.some((item) => {
+    const canonicalLayout = currentLayout.map((item) => {
+      const canonicalX = isRtl ? Math.max(0, colsCount - item.w - item.x) : item.x;
+      return { ...item, canonicalX };
+    });
+    const changed = canonicalLayout.some((item) => {
       const old = prevSnapshot.find((o) => o.i === item.i);
-      return old && (old.x !== item.x || old.y !== item.y || old.w !== item.w || old.h !== item.h);
+      return old && (old.x !== item.canonicalX || old.y !== item.y || old.w !== item.w || old.h !== item.h);
     });
     if (!changed) return;
 
@@ -429,8 +600,10 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       return {
         ...prev,
         widgets: prev.widgets.map((w) => {
-          const updated = currentLayout.find((l) => l.i === w.id);
-          return updated ? { ...w, layout: { x: updated.x, y: updated.y, w: updated.w, h: updated.h } } : w;
+          const updated = canonicalLayout.find((l) => l.i === w.id);
+          return updated
+            ? { ...w, layout: { x: updated.canonicalX, y: updated.y, w: updated.w, h: updated.h } }
+            : w;
         }),
       };
     });
@@ -800,8 +973,9 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       ])
     );
     const customStyle = w.config.style || {};
+    const isCompactMetric = w.chart_type === "kpi" || effType === "gauge";
     const mobileCardClass = mobileStack
-      ? w.chart_type === "kpi"
+      ? isCompactMetric
         ? "col-span-1 h-36"
         : effType === "bpmn"
         ? "col-span-2 h-[440px]"
@@ -813,6 +987,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
     return (
       <div
         key={w.id}
+        dir={isRtl ? "rtl" : "ltr"}
         onClick={() => editMode && setSelectedWidgetId(w.id)}
         className={`bi-card flex flex-col overflow-hidden transition-shadow ${mobileCardClass} ${
           isSelected ? "ring-2 ring-blue-500" : isCrossSource ? "ring-2 ring-emerald-500/70" : ""
@@ -825,14 +1000,14 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
       >
         {/* Widget Header */}
         <div
-          className={`px-3 sm:px-3.5 py-2 border-b flex flex-wrap items-center justify-between gap-1.5 sm:gap-2 ${
+          className={`px-3 py-1.5 border-b flex flex-wrap items-center justify-between gap-1.5 ${
             editMode && !mobileStack ? "widget-drag-handle cursor-move" : ""
           }`}
           style={{ borderColor: "var(--bi-border)" }}
         >
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="text-xs font-bold leading-snug line-clamp-1 sm:truncate">{w.title}</span>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-xs font-bold leading-snug truncate" title={w.title}>{w.title}</span>
               {hasDrill && canCrossFilter ? (
                 <button
                   type="button"
@@ -976,10 +1151,14 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                 })}
               </select>
             )}
-            {w.drill_rule?.drill_through_page_id && (
+            {w.drill_rule?.drill_through_page_id &&
+              dash.pages.some((p) => p.id === w.drill_rule?.drill_through_page_id) && (
               <button
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (!currentPage?.is_drill_through) {
+                    setPrevNonDrillPageId(activePageId);
+                  }
                   setActivePageId(w.drill_rule.drill_through_page_id!);
                 }}
                 className="text-[10px] px-1.5 py-1 sm:py-0.5 rounded border hover:bg-blue-500/10"
@@ -1044,7 +1223,7 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         </div>
 
         {/* Widget Body */}
-        <div className="flex-1 p-2.5 sm:p-3 min-h-0">
+        <div className={`flex-1 min-h-0 ${isCompactMetric ? "px-2.5 py-2" : "p-2.5 sm:p-3"}`}>
           {wd?.error ? (
             <div className="h-full flex items-center justify-center text-xs text-red-500 text-center p-2">
               {wd.error}
@@ -1058,9 +1237,54 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               vizConfig={w.config.visualization}
               visualSpec={w.query.visual_spec}
               onPointClick={(field, val) => handleWidgetPointClick(w, field, val)}
+              widgetId={w.id}
+              datasetId={w.dataset_id || undefined}
+              activeFilters={compiledActiveFilters}
+              crossFilters={crossFilters}
+              bpmnAnalytics={wd?.bpmn_analytics}
+              onProcessSelect={(proc) => handleBpmnProcessSelect(w, proc)}
+              onFieldMappingOverride={(ov) => handleBpmnFieldOverride(w, ov)}
             />
           )}
         </div>
+
+        {/* Descriptive Narrative & Source Provenance Footer */}
+        {(w.config?.advanced?.narrative_fa || (w.config?.advanced?.analysis_type && w.description)) && (
+          <div
+            className="px-3 py-1.5 border-t text-[10px] leading-relaxed flex flex-wrap items-start justify-between gap-1.5"
+            style={{
+              borderColor: "var(--bi-border)",
+              background: "color-mix(in srgb, var(--bi-surface) 75%, transparent)",
+            }}
+          >
+            <div className="flex items-start gap-1.5 flex-1 min-w-0">
+              <FileText className="w-3 h-3 text-emerald-500 shrink-0 mt-0.5" />
+              <span className="line-clamp-2" title={w.config?.advanced?.narrative_fa || w.description}>
+                {w.config?.advanced?.narrative_fa || w.description}
+              </span>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              {typeof w.config?.advanced?.confidence === "number" && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-semibold">
+                  {Math.round(w.config.advanced.confidence * 100)}%
+                </span>
+              )}
+              {Array.isArray(w.config?.advanced?.limitations) && w.config.advanced.limitations.length > 0 && (
+                <span
+                  className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 font-semibold cursor-help"
+                  title={w.config.advanced.limitations.join(" | ")}
+                >
+                  محدودیت
+                </span>
+              )}
+              {Array.isArray(w.config?.advanced?.sources_used) && w.config.advanced.sources_used.length > 0 && (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-500 font-semibold">
+                  {w.config.advanced.sources_used.join(" + ")}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     );
   };
@@ -1156,6 +1380,58 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               <button onClick={saveLayoutToServer} className="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1" style={{ borderColor: "var(--bi-primary)", color: "var(--bi-primary)" }}>
                 <Save className="w-3.5 h-3.5" /> {t("saveLayout")}
               </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const nm = prompt(locale === "fa" ? "نام چیدمان جدید:" : "Named layout title:");
+                  if (!nm?.trim()) return;
+                  try {
+                    await saveLayoutToServer();
+                    await apiFetch(`/dashboards/${dash.id}/named-layouts`, {
+                      method: "POST",
+                      body: JSON.stringify({ name: nm.trim() }),
+                    });
+                    const updated = await apiFetch<any[]>(`/dashboards/${dash.id}/named-layouts`).catch(() => []);
+                    setNamedLayouts(updated);
+                    showToast(locale === "fa" ? `چیدمان «${nm}» ذخیره شد` : "Named layout saved");
+                  } catch (err: any) {
+                    showToast(err.message);
+                  }
+                }}
+                className="px-2 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1"
+                style={{ borderColor: "var(--bi-border)" }}
+                title={locale === "fa" ? "ذخیره با نام برای جابه‌جایی سریع بین چیدمان‌ها" : "Save named layout preset"}
+              >
+                <Plus className="w-3 h-3" /> {locale === "fa" ? "چیدمان جدید" : "Named Layout"}
+              </button>
+              {namedLayouts.length > 0 && (
+                <select
+                  aria-label={locale === "fa" ? "اعمال چیدمان ذخیره‌شده" : "Apply Named Layout"}
+                  defaultValue=""
+                  onChange={async (e) => {
+                    const lid = e.target.value;
+                    if (!lid) return;
+                    try {
+                      await apiFetch(`/dashboards/${dash.id}/named-layouts/${lid}/apply`, { method: "POST" });
+                      showToast(locale === "fa" ? "چیدمان اعمال شد" : "Layout applied");
+                      await loadDashboard();
+                    } catch (err: any) {
+                      showToast(err.message);
+                    } finally {
+                      e.target.value = "";
+                    }
+                  }}
+                  className="px-2 py-1.5 rounded-lg border text-xs max-w-[140px]"
+                  style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+                >
+                  <option value="">{locale === "fa" ? "چیدمان‌ها..." : "Layouts..."}</option>
+                  {namedLayouts.map((nl) => (
+                    <option key={nl.id} value={nl.id}>
+                      {nl.name}
+                    </option>
+                  ))}
+                </select>
+              )}
               <select
                 value={currentPage?.layout_settings?.columns_count || 12}
                 onChange={(e) => {
@@ -1209,6 +1485,16 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
             <BookmarkCheck className="w-3.5 h-3.5" />
           </button>
           <button
+            type="button"
+            onClick={() => setShowEditKpisModal(true)}
+            className="px-2.5 py-1.5 rounded-lg border border-violet-500/40 text-violet-600 dark:text-violet-300 text-xs font-semibold flex items-center gap-1 hover:bg-violet-500/10"
+            title={locale === "fa" ? "انتخاب و ویرایش شاخص‌های کلیدی این داشبورد" : "Edit & Re-confirm Dashboard KPIs"}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            {locale === "fa" ? "ویرایش KPIها" : "Edit KPIs"}
+          </button>
+
+          <button
             onClick={() => {
               setAssistantEditWidgetId(null);
               setAssistantMode("auto");
@@ -1249,24 +1535,29 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
         </div>
       )}
 
-      {/* Multi-Page Tabs */}
+      {/* Multi-Page Tabs (hide drill-through pages unless actively opened) */}
       <div className="flex items-center gap-2 overflow-x-auto pb-1">
-        {dash.pages.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => setActivePageId(p.id)}
-            className="px-3.5 py-1.5 rounded-lg text-xs font-semibold border transition whitespace-nowrap flex items-center gap-1.5"
-            style={{
-              background: p.id === activePageId ? "var(--bi-primary)" : "var(--bi-card)",
-              color: p.id === activePageId ? "#fff" : "var(--bi-text)",
-              borderColor: "var(--bi-border)",
-            }}
-          >
-            <Layers className="w-3.5 h-3.5" />
-            {p.title}
-            {p.is_drill_through && <span className="text-[10px] opacity-75">(Detail)</span>}
-          </button>
-        ))}
+        {dash.pages
+          .filter((p) => !p.is_drill_through || p.id === activePageId)
+          .map((p) => (
+            <button
+              key={p.id}
+              onClick={() => {
+                if (!p.is_drill_through) setPrevNonDrillPageId(p.id);
+                setActivePageId(p.id);
+              }}
+              className="px-3.5 py-1.5 rounded-lg text-xs font-semibold border transition whitespace-nowrap flex items-center gap-1.5"
+              style={{
+                background: p.id === activePageId ? "var(--bi-primary)" : "var(--bi-card)",
+                color: p.id === activePageId ? "#fff" : "var(--bi-text)",
+                borderColor: "var(--bi-border)",
+              }}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              {p.title}
+              {p.is_drill_through && <span className="text-[10px] opacity-85">(جزئیات)</span>}
+            </button>
+          ))}
         {editMode && (
           <button
             onClick={handleAddPage}
@@ -1277,6 +1568,32 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
           </button>
         )}
       </div>
+
+      {/* Back Banner when viewing a hidden Drill-Through page */}
+      {currentPage?.is_drill_through && (
+        <div
+          className="px-3.5 py-2 rounded-xl border text-xs flex items-center justify-between gap-2 bg-blue-500/10 border-blue-500/30"
+        >
+          <span className="font-semibold text-blue-600 dark:text-blue-300">
+            {locale === "fa"
+              ? `در حال مشاهده صفحه جزئیات (${currentPage.title})`
+              : `Viewing Drill-Through Details Page (${currentPage.title})`}
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              const targetBack =
+                (prevNonDrillPageId && dash.pages.some((p) => p.id === prevNonDrillPageId) && prevNonDrillPageId) ||
+                dash.pages.find((p) => !p.is_drill_through)?.id ||
+                dash.pages[0]?.id;
+              if (targetBack) setActivePageId(targetBack);
+            }}
+            className="px-3 py-1 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700"
+          >
+            {locale === "fa" ? "بازگشت به صفحه داشبورد" : "Back to Dashboard"}
+          </button>
+        </div>
+      )}
 
       {/* Interactive Analytics Guide Strip */}
       {pageWidgets.some((w) => (w.drill_rule?.hierarchy?.length || 0) > 0 || w.config.interactions?.cross_filter !== false) && (
@@ -1364,25 +1681,29 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
               {sortedMobileWidgets.map((w) => renderWidgetCard(w, true))}
             </div>
           ) : (
-            <ResponsiveGridLayout
-              className="layout"
-              layouts={gridLayouts}
-              breakpoints={{ lg: 1200, md: 996, sm: 768, xs: 480 }}
-              cols={{
-                lg: currentPage?.layout_settings?.columns_count || 12,
-                md: currentPage?.layout_settings?.columns_count || 12,
-                sm: 6,
-                xs: 4,
-              }}
-              rowHeight={currentPage?.layout_settings?.row_height || 42}
-              margin={[currentPage?.layout_settings?.gap_px || 16, currentPage?.layout_settings?.gap_px || 16]}
-              isDraggable={editMode}
-              isResizable={editMode}
-              draggableHandle=".widget-drag-handle"
-              onLayoutChange={(layout) => handleLayoutChange(layout)}
-            >
-              {pageWidgets.map((w) => renderWidgetCard(w, false))}
-            </ResponsiveGridLayout>
+            <div ref={gridContainerRef} dir="ltr" className="w-full min-w-0">
+              <Responsive
+                key={activePageId}
+                className="layout"
+                width={effectiveGridWidth}
+                layouts={gridLayouts}
+                breakpoints={{ lg: 960, md: 680, sm: 480, xs: 0 }}
+                cols={{
+                  lg: colsCount,
+                  md: colsCount,
+                  sm: 6,
+                  xs: 4,
+                }}
+                rowHeight={currentPage?.layout_settings?.row_height || 42}
+                margin={[currentPage?.layout_settings?.gap_px || 16, currentPage?.layout_settings?.gap_px || 16]}
+                isDraggable={editMode}
+                isResizable={editMode}
+                draggableHandle=".widget-drag-handle"
+                onLayoutChange={(layout) => handleLayoutChange(layout)}
+              >
+                {pageWidgets.map((w) => renderWidgetCard(w, false))}
+              </Responsive>
+            </div>
           )}
         </div>
 
@@ -1693,6 +2014,182 @@ export default function DashboardWorkspace({ dashboardId }: { dashboardId: strin
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* KPI / Gauge / Bullet Drill-Down & Underlying Rows Modal */}
+      {kpiDrillWidget && (
+        <div className="fixed inset-0 bg-black/55 z-50 flex items-center justify-center p-3 sm:p-5">
+          <div className="bi-card w-full max-w-4xl max-h-[88vh] flex flex-col overflow-hidden">
+            <div className="p-4 border-b flex flex-wrap items-center justify-between gap-2" style={{ borderColor: "var(--bi-border)" }}>
+              <div className="space-y-0.5 min-w-0">
+                <h3 className="text-sm sm:text-base font-bold truncate">
+                  {locale === "fa" ? `تحلیل و جزئیات KPI: ${kpiDrillWidget.title}` : `KPI Drill-Down: ${kpiDrillWidget.title}`}
+                </h3>
+                {(kpiDrillData?.formula || kpiDrillWidget.query?.visual_spec?.formula) && (
+                  <div dir="ltr" className="text-[11px] font-mono opacity-75 truncate">
+                    {kpiDrillData?.formula || kpiDrillWidget.query?.visual_spec?.formula}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {(kpiDrillData?.drill_through_page_id || kpiDrillWidget.drill_rule?.drill_through_page_id) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetPage =
+                        kpiDrillData?.drill_through_page_id ||
+                        kpiDrillWidget.drill_rule?.drill_through_page_id;
+                      if (targetPage) {
+                        if (!currentPage?.is_drill_through) setPrevNonDrillPageId(activePageId);
+                        setActivePageId(targetPage);
+                      }
+                      setKpiDrillWidget(null);
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold"
+                  >
+                    {locale === "fa" ? "مشاهده در صفحه جزئیات (Drill-Through)" : "Open Details Page"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setKpiDrillWidget(null);
+                    setKpiDrillData(null);
+                  }}
+                  className="p-1.5 rounded-lg hover:bg-rose-500/10 text-rose-500"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4 overflow-y-auto space-y-4 text-xs flex-1">
+              {kpiDrillLoading && (
+                <div className="py-10 text-center opacity-70">
+                  {locale === "fa" ? "در حال بارگذاری تفکیک ابعادی و رکوردهای خام..." : "Loading KPI breakdown & raw records..."}
+                </div>
+              )}
+
+              {!kpiDrillLoading && kpiDrillData && (
+                <>
+                  {/* Dimension Breakdown Section */}
+                  {kpiDrillData.available_dimensions && kpiDrillData.available_dimensions.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-bold">
+                          {locale === "fa" ? "تفکیک ابعادی KPI:" : "KPI Breakdown by Dimension:"}
+                        </span>
+                        <select
+                          value={kpiDrillData.breakdown_dimension || ""}
+                          onChange={(e) => loadKpiDrillDetails(kpiDrillWidget, e.target.value)}
+                          className="px-2.5 py-1.5 rounded-lg border text-xs"
+                          style={{ background: "var(--bi-surface)", color: "var(--bi-text)", borderColor: "var(--bi-border)" }}
+                        >
+                          {kpiDrillData.available_dimensions.map((dim) => (
+                            <option key={dim} value={dim}>{dim}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {kpiDrillData.breakdown_rows && kpiDrillData.breakdown_rows.length > 0 && (
+                        <div className="overflow-x-auto max-h-52 rounded-xl border" style={{ borderColor: "var(--bi-border)" }}>
+                          <table className="w-full text-start border-collapse">
+                            <thead className="sticky top-0" style={{ background: "var(--bi-surface)" }}>
+                              <tr className="border-b" style={{ borderColor: "var(--bi-border)" }}>
+                                {kpiDrillData.breakdown_columns.map((c) => (
+                                  <th key={c} className="p-2 font-bold">{c}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {kpiDrillData.breakdown_rows.map((r, idx) => (
+                                <tr key={idx} className="border-b hover:bg-blue-500/5" style={{ borderColor: "var(--bi-border)" }}>
+                                  {kpiDrillData.breakdown_columns.map((c) => (
+                                    <td key={c} className="p-2">
+                                      {typeof r[c] === "number" ? Number(r[c]).toLocaleString() : String(r[c] ?? "—")}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Underlying Raw Rows Section */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold">
+                        {locale === "fa"
+                          ? `رکوردهای پایه (نمایش ${kpiDrillData.rows?.length || 0} ردیف با رعایت فیلترهای فعال و RLS/CLS)`
+                          : `Underlying Records (${kpiDrillData.rows?.length || 0} rows matching filters & RLS/CLS)`}
+                      </span>
+                    </div>
+                    {kpiDrillData.rows && kpiDrillData.rows.length > 0 ? (
+                      <div className="overflow-x-auto max-h-64 rounded-xl border" style={{ borderColor: "var(--bi-border)" }}>
+                        <table className="w-full text-start border-collapse text-[11px]">
+                          <thead className="sticky top-0" style={{ background: "var(--bi-surface)" }}>
+                            <tr className="border-b" style={{ borderColor: "var(--bi-border)" }}>
+                              {kpiDrillData.columns.map((c) => (
+                                <th key={c} className="p-2 font-bold whitespace-nowrap">{c}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {kpiDrillData.rows.map((r, idx) => (
+                              <tr key={idx} className="border-b hover:bg-blue-500/5" style={{ borderColor: "var(--bi-border)" }}>
+                                {kpiDrillData.columns.map((c) => (
+                                  <td key={c} className="p-2 whitespace-nowrap">
+                                    {typeof r[c] === "number" ? Number(r[c]).toLocaleString() : String(r[c] ?? "—")}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="p-4 text-center rounded-xl border opacity-70" style={{ borderColor: "var(--bi-border)" }}>
+                        {locale === "fa" ? "رکوردی با فیلترهای فعلی یافت نشد." : "No matching records under current filters."}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit KPIs Modal (re-opens IntelligentDashboardStudio in edit/regenerate mode) */}
+      {showEditKpisModal && dash && (
+        <div className="fixed inset-0 bg-black/60 z-50 overflow-y-auto p-3 sm:p-6">
+          <div className="max-w-6xl mx-auto">
+            <IntelligentDashboardStudio
+              initialDatasetId={
+                dash.settings?.kpi_config?.dataset_id ||
+                dash.widgets.find((w) => w.dataset_id)?.dataset_id ||
+                datasets[0]?.id
+              }
+              editingDashboardId={dash.id}
+              initialConfirmedKpis={dash.settings?.kpi_config?.confirmed_kpis || []}
+              initialSettings={{
+                title: dash.title,
+                template_mode: (dash.settings?.kpi_config?.template_mode as any) || "executive",
+                detail_level: (dash.settings?.kpi_config?.detail_level as any) || "standard",
+                calendar_mode: (dash.settings?.kpi_config?.calendar_mode as any) || "jalali",
+                related_dataset_ids: dash.settings?.kpi_config?.related_dataset_ids || [],
+              }}
+              onClose={() => setShowEditKpisModal(false)}
+              onGenerated={async () => {
+                setShowEditKpisModal(false);
+                await loadDashboard();
+              }}
+            />
           </div>
         </div>
       )}

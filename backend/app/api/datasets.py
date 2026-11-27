@@ -1,23 +1,31 @@
+from datetime import datetime, timezone
+import os
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.api.deps import enforce_permission, get_current_user
-from app.core.rls_cls import apply_cls_and_masking, build_data_security_context
+from app.core.audit import record_audit
+from app.core.cache import cache_manager
+from app.core.permissions import permission_resolver
+from app.core.rls_cls import build_data_security_context
+from app.core.tenant import get_dataset_for_org
 from app.database import get_db
-from app.engines.data_engine import DataProfiler
+from app.engines.data_engine import DataDiagnosticsEngine, DataProfiler
+from app.engines.descriptive_builder import _estimate_join_explosion
 from app.engines.filter_engine import get_cascading_filter_options
 from app.engines.query_engine import execute_dataset_sql
-from app.engines.warehouse import warehouse
+from app.engines.warehouse import sanitize_identifier, warehouse
 from app.models.data import (
     DataLineage,
+    DataSource,
     Dataset,
     DatasetField,
     DatasetRelationship,
     DataTransformation,
     SemanticMetric,
 )
-from app.models.identity import User
+from app.models.identity import AccessPolicy, User
 
 router = APIRouter(prefix="/datasets", tags=["Datasets, Semantic Layer & Lineage"])
 
@@ -36,6 +44,13 @@ class RelationshipCreate(BaseModel):
     right_field: str
     join_type: str = "left"
     cardinality: str = "many_to_one"
+    user_confirmed: bool = False
+    confirmation_note: str = ""
+
+
+class RelationshipConfirmRequest(BaseModel):
+    confirmed: bool = True
+    note: str = ""
 
 
 class CalculatedFieldCreate(BaseModel):
@@ -67,7 +82,11 @@ def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(
     rows = db.query(Dataset).filter(Dataset.organization_id == user.organization_id).all()
     out = []
     for d in rows:
+        if not permission_resolver.resolve(db, user, "dataset", d.id, "view").allowed:
+            continue
+        sec_ctx = build_data_security_context(db, user, d.id)
         fields = db.query(DatasetField).filter(DatasetField.dataset_id == d.id).all()
+        visible_fields = [f for f in fields if f.field_name not in sec_ctx.hidden_columns]
         out.append({
             "id": d.id,
             "name": d.name,
@@ -78,8 +97,10 @@ def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(
             "refresh_policy": d.refresh_policy,
             "data_version": d.data_version,
             "row_count": d.row_count,
+            "columns_count": len(visible_fields),
             "last_refreshed_at": d.last_refreshed_at,
             "freshness_status": d.freshness_status,
+            "profile_json": d.profile_json or {},
             "is_uploaded_excel": bool(d.warehouse_table and d.warehouse_table.startswith("wh_file_")),
             "fields": [
                 {
@@ -87,7 +108,7 @@ def list_datasets(user: User = Depends(get_current_user), db: Session = Depends(
                     "data_type": f.data_type, "semantic_role": f.semantic_role,
                     "is_primary_key": f.is_primary_key, "is_calculated": f.is_calculated, "expression": f.expression
                 }
-                for f in fields
+                for f in visible_fields
             ],
         })
     return out
@@ -110,10 +131,11 @@ def list_semantic_metrics(user: User = Depends(get_current_user), db: Session = 
 def create_semantic_metric(
     body: SemanticMetricCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dataset", body.dataset_id, "edit")
+    ds = get_dataset_for_org(db, body.dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "edit")
     sm = SemanticMetric(
         organization_id=user.organization_id,
-        dataset_id=body.dataset_id,
+        dataset_id=ds.id,
         name=body.name,
         slug=body.slug,
         description=body.description,
@@ -129,54 +151,179 @@ def create_semantic_metric(
 @router.get("/relationships")
 def list_relationships(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "dataset", "*", "view")
-    rows = db.query(DatasetRelationship).all()
+    org_ds_ids = {
+        d.id for d in db.query(Dataset.id).filter(Dataset.organization_id == user.organization_id).all()
+    }
+    rows = (
+        db.query(DatasetRelationship)
+        .filter(
+            DatasetRelationship.left_dataset_id.in_(org_ds_ids),
+            DatasetRelationship.right_dataset_id.in_(org_ds_ids),
+        )
+        .all()
+        if org_ds_ids
+        else []
+    )
     return [
         {
-            "id": r.id, "left_dataset_id": r.left_dataset_id, "left_field": r.left_field,
-            "right_dataset_id": r.right_dataset_id, "right_field": r.right_field,
-            "join_type": r.join_type, "cardinality": r.cardinality
+            "id": r.id,
+            "left_dataset_id": r.left_dataset_id,
+            "left_field": r.left_field,
+            "right_dataset_id": r.right_dataset_id,
+            "right_field": r.right_field,
+            "join_type": r.join_type,
+            "cardinality": r.cardinality,
+            "user_confirmed": bool(getattr(r, "user_confirmed", False)),
+            "confirmation_note": getattr(r, "confirmation_note", "") or "",
+            "confirmed_at": getattr(r, "confirmed_at", None),
+            "metadata_json": getattr(r, "metadata_json", {}) or {},
         }
         for r in rows
     ]
+
+
+@router.post("/relationships/analyze-candidate")
+def analyze_relationship_candidate(
+    body: RelationshipCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    left_ds = get_dataset_for_org(db, body.left_dataset_id, user.organization_id)
+    right_ds = get_dataset_for_org(db, body.right_dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", left_ds.id, "view")
+    enforce_permission(db, user, "dataset", right_ds.id, "view")
+    lf = sanitize_identifier(body.left_field)
+    rf = sanitize_identifier(body.right_field)
+    rep = _estimate_join_explosion(db, user, left_ds, lf, right_ds, rf, body.join_type)
+    l_field_obj = db.query(DatasetField).filter(DatasetField.dataset_id == left_ds.id, DatasetField.field_name == lf).first()
+    r_field_obj = db.query(DatasetField).filter(DatasetField.dataset_id == right_ds.id, DatasetField.field_name == rf).first()
+    pk_fk_analysis = {
+        "left_is_pk": bool(l_field_obj.is_primary_key) if l_field_obj else False,
+        "right_is_pk": bool(r_field_obj.is_primary_key) if r_field_obj else False,
+        "left_type": l_field_obj.data_type if l_field_obj else "unknown",
+        "right_type": r_field_obj.data_type if r_field_obj else "unknown",
+        "safe_for_direct_sum": rep.get("risk") == "safe" and rep.get("inferred_cardinality") in ("one_to_one", "many_to_one"),
+        "requires_pre_aggregation": rep.get("inferred_cardinality") in ("one_to_many", "many_to_many") or rep.get("risk") in ("moderate", "high"),
+    }
+    return {
+        "left_dataset_id": left_ds.id,
+        "left_field": lf,
+        "right_dataset_id": right_ds.id,
+        "right_field": rf,
+        "join_type": body.join_type,
+        "pk_fk_analysis": pk_fk_analysis,
+        "explosion_report": rep,
+        "requires_confirmation": True,
+    }
 
 
 @router.post("/relationships")
 def create_relationship(
     body: RelationshipCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dataset", body.left_dataset_id, "edit")
+    left_ds = get_dataset_for_org(db, body.left_dataset_id, user.organization_id)
+    right_ds = get_dataset_for_org(db, body.right_dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", left_ds.id, "edit")
+    enforce_permission(db, user, "dataset", right_ds.id, "view")
+    lf = sanitize_identifier(body.left_field)
+    rf = sanitize_identifier(body.right_field)
+    rep = _estimate_join_explosion(db, user, left_ds, lf, right_ds, rf, body.join_type)
+    inferred_card = rep.get("inferred_cardinality") or body.cardinality
+    now = datetime.now(timezone.utc)
     rel = DatasetRelationship(
-        left_dataset_id=body.left_dataset_id,
-        left_field=body.left_field,
-        right_dataset_id=body.right_dataset_id,
-        right_field=body.right_field,
+        left_dataset_id=left_ds.id,
+        left_field=lf,
+        right_dataset_id=right_ds.id,
+        right_field=rf,
         join_type=body.join_type,
-        cardinality=body.cardinality,
+        cardinality=inferred_card,
+        user_confirmed=bool(body.user_confirmed),
+        confirmation_note=body.confirmation_note or "",
+        confirmed_by=user.id if body.user_confirmed else None,
+        confirmed_at=now if body.user_confirmed else None,
+        validated_at=now,
+        metadata_json={"explosion_report": rep},
     )
     db.add(rel)
     db.commit()
-    return {"id": rel.id}
+    return {
+        "id": rel.id,
+        "cardinality": rel.cardinality,
+        "user_confirmed": rel.user_confirmed,
+        "explosion_report": rep,
+    }
+
+
+@router.post("/relationships/{rel_id}/confirm")
+def confirm_relationship(
+    rel_id: str,
+    body: RelationshipConfirmRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rel = db.query(DatasetRelationship).filter(DatasetRelationship.id == rel_id).first()
+    if not rel:
+        raise HTTPException(status_code=404, detail="Relationship not found")
+    left_ds = get_dataset_for_org(db, rel.left_dataset_id, user.organization_id)
+    right_ds = get_dataset_for_org(db, rel.right_dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", left_ds.id, "edit")
+    enforce_permission(db, user, "dataset", right_ds.id, "view")
+    rep = _estimate_join_explosion(db, user, left_ds, rel.left_field, right_ds, rel.right_field, rel.join_type)
+    now = datetime.now(timezone.utc)
+    rel.user_confirmed = bool(body.confirmed)
+    rel.confirmation_note = body.note or ""
+    rel.confirmed_by = user.id if body.confirmed else None
+    rel.confirmed_at = now if body.confirmed else None
+    rel.validated_at = now
+    rel.metadata_json = {**(rel.metadata_json or {}), "explosion_report": rep}
+    record_audit(
+        db,
+        user.organization_id,
+        "relationship_confirm" if body.confirmed else "relationship_unconfirm",
+        "dataset_relationship",
+        resource_id=rel.id,
+        user_id=user.id,
+        username=user.username,
+        details={"left": f"{left_ds.name}.{rel.left_field}", "right": f"{right_ds.name}.{rel.right_field}", "risk": rep.get("risk")},
+        commit=False,
+    )
+    db.commit()
+    return {
+        "id": rel.id,
+        "user_confirmed": rel.user_confirmed,
+        "cardinality": rel.cardinality,
+        "explosion_report": rep,
+    }
 
 
 @router.get("/{dataset_id}/profile")
 def profile_dataset(dataset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "dataset", dataset_id, "view")
-    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-    return DataProfiler.profile_table(ds.warehouse_table)
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    if not permission_resolver.resolve(db, user, "dataset", ds.id, "view_schema").allowed:
+        enforce_permission(db, user, "dataset", ds.id, "view")
+    else:
+        dec = permission_resolver.resolve(db, user, "dataset", ds.id, "view")
+        if not dec.allowed and dec.reason.startswith("explicit_deny"):
+            enforce_permission(db, user, "dataset", ds.id, "view")
+    sec_ctx = build_data_security_context(db, user, ds.id)
+    return DataProfiler.profile_table(
+        ds.warehouse_table,
+        sec_ctx=sec_ctx,
+    )
 
 
 @router.get("/{dataset_id}/preview")
 def preview_dataset(
     dataset_id: str, limit: int = 50, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dataset", dataset_id, "view")
-    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    if not permission_resolver.resolve(db, user, "dataset", ds.id, "view_data").allowed:
+        enforce_permission(db, user, "dataset", ds.id, "view")
+    else:
+        dec = permission_resolver.resolve(db, user, "dataset", ds.id, "view")
+        if not dec.allowed and dec.reason.startswith("explicit_deny"):
+            enforce_permission(db, user, "dataset", ds.id, "view")
+    bounded = max(1, min(int(limit), 500))
     return execute_dataset_sql(
-        db, user, f'SELECT * FROM "{ds.warehouse_table}" LIMIT {min(limit, 500)}', dataset=ds, use_cache=False
+        db, user, f'SELECT * FROM "{ds.warehouse_table}" LIMIT {bounded}', dataset=ds, limit=bounded, use_cache=False
     )
 
 
@@ -187,22 +334,26 @@ def cascading_filter_options(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    enforce_permission(db, user, "dataset", dataset_id, "view")
-    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
     sec_ctx = build_data_security_context(db, user, ds.id)
     if body.field_name in sec_ctx.hidden_columns:
         return {"values": []}
-    vals = get_cascading_filter_options(
-        ds.warehouse_table,
-        body.field_name,
-        body.parent_filters,
-        sec_ctx.rls_where_clauses,
-        sec_ctx.rls_params,
-        search=body.search,
-        limit=body.limit,
-    )
+    try:
+        vals = get_cascading_filter_options(
+            ds.warehouse_table,
+            body.field_name,
+            body.parent_filters,
+            sec_ctx.rls_where_clauses,
+            sec_ctx.rls_params,
+            search=body.search,
+            limit=body.limit,
+            sec_ctx=sec_ctx,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"field_name": body.field_name, "values": vals}
 
 
@@ -213,13 +364,11 @@ def add_calculated_field(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    enforce_permission(db, user, "dataset", dataset_id, "edit")
-    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "edit")
     f = DatasetField(
         dataset_id=ds.id,
-        field_name=body.field_name,
+        field_name=sanitize_identifier(body.field_name),
         display_name=body.display_name,
         data_type=body.data_type,
         semantic_role=body.semantic_role,
@@ -231,14 +380,37 @@ def add_calculated_field(
     return {"id": f.id, "field_name": f.field_name}
 
 
+@router.get("/{dataset_id}/analytics-diagnostics")
+def analytics_diagnostics_get(
+    dataset_id: str,
+    date_column: Optional[str] = None,
+    metric_column: Optional[str] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
+    sec_ctx = build_data_security_context(db, user, ds.id)
+    res = DataDiagnosticsEngine.analyze(
+        ds.warehouse_table,
+        sec_ctx=sec_ctx,
+        date_column=date_column,
+        metric_column=metric_column,
+    )
+    return {
+        "dataset_id": ds.id,
+        "dataset_name": ds.name,
+        "row_accounting": (ds.profile_json or {}).get("row_accounting"),
+        **res,
+    }
+
+
 @router.get("/{dataset_id}/lineage")
 def get_dataset_lineage(dataset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "dataset", dataset_id, "view")
-    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-    upstream = db.query(DataLineage).filter(DataLineage.target_type == "dataset", DataLineage.target_id == dataset_id).all()
-    downstream = db.query(DataLineage).filter(DataLineage.source_type == "dataset", DataLineage.source_id == dataset_id).all()
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "view")
+    upstream = db.query(DataLineage).filter(DataLineage.target_type == "dataset", DataLineage.target_id == ds.id).all()
+    downstream = db.query(DataLineage).filter(DataLineage.source_type == "dataset", DataLineage.source_id == ds.id).all()
     return {
         "dataset": {
             "id": ds.id, "name": ds.name, "warehouse_table": ds.warehouse_table,
@@ -256,10 +428,11 @@ def add_transformation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    enforce_permission(db, user, "dataset", dataset_id, "edit")
-    cnt = db.query(DataTransformation).filter(DataTransformation.dataset_id == dataset_id).count()
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    enforce_permission(db, user, "dataset", ds.id, "edit")
+    cnt = db.query(DataTransformation).filter(DataTransformation.dataset_id == ds.id).count()
     tr = DataTransformation(
-        dataset_id=dataset_id,
+        dataset_id=ds.id,
         step_order=cnt + 1,
         transform_type=body.transform_type,
         config_json=body.config_json,
@@ -271,13 +444,50 @@ def add_transformation(
 
 @router.delete("/{dataset_id}")
 def delete_dataset(dataset_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    enforce_permission(db, user, "dataset", dataset_id, "edit")
-    ds = db.query(Dataset).filter(Dataset.id == dataset_id, Dataset.organization_id == user.organization_id).first()
-    if not ds:
-        raise HTTPException(status_code=404, detail="Dataset not found")
+    ds = get_dataset_for_org(db, dataset_id, user.organization_id)
+    if not permission_resolver.resolve(db, user, "dataset", ds.id, "delete").allowed:
+        enforce_permission(db, user, "dataset", ds.id, "edit")
+
+    # Remove DuckDB table if not shared by another dataset
+    other_ref = (
+        db.query(Dataset)
+        .filter(Dataset.warehouse_table == ds.warehouse_table, Dataset.id != ds.id)
+        .first()
+    )
+    if not other_ref and ds.warehouse_table:
+        try:
+            warehouse.drop_table(ds.warehouse_table)
+        except Exception:
+            pass
+
+    # Clean up uploaded file if this dataset's data source owns an uploaded file exclusively
+    if ds.data_source_id:
+        src = db.query(DataSource).filter(DataSource.id == ds.data_source_id).first()
+        other_ds_on_src = (
+            db.query(Dataset).filter(Dataset.data_source_id == ds.data_source_id, Dataset.id != ds.id).first()
+        )
+        if src and not other_ds_on_src and src.source_type in (
+            "excel", "csv", "tsv", "json", "jsonl", "ndjson", "log", "txt", "xml"
+        ):
+            fpath = (src.config_json or {}).get("file_path")
+            if fpath and os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+
     db.query(DatasetField).filter(DatasetField.dataset_id == ds.id).delete()
     db.query(DataTransformation).filter(DataTransformation.dataset_id == ds.id).delete()
+    db.query(SemanticMetric).filter(SemanticMetric.dataset_id == ds.id).delete()
+    db.query(DatasetRelationship).filter(
+        (DatasetRelationship.left_dataset_id == ds.id) | (DatasetRelationship.right_dataset_id == ds.id)
+    ).delete()
+    db.query(DataLineage).filter(
+        ((DataLineage.source_type == "dataset") & (DataLineage.source_id == ds.id))
+        | ((DataLineage.target_type == "dataset") & (DataLineage.target_id == ds.id))
+    ).delete()
+    db.query(AccessPolicy).filter(AccessPolicy.dataset_id == ds.id).delete()
+    cache_manager.invalidate_dataset(ds.id)
     db.delete(ds)
     db.commit()
     return {"status": "deleted"}
-

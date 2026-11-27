@@ -6,6 +6,7 @@ import { ArrowDownRight, ArrowUpRight, Search } from "lucide-react";
 import { formatBIValue } from "@/lib/chart-registry";
 import { useBi } from "@/lib/context";
 import BpmnProcessViewer from "@/components/charts/BpmnProcessViewer";
+import type { BpmnAnalyticsPayload } from "@/types/bi";
 
 interface Props {
   chartType: string;
@@ -16,6 +17,14 @@ interface Props {
   visualSpec?: Record<string, any>;
   onPointClick?: (field: string, value: any) => void;
   chartInstanceRef?: React.MutableRefObject<echarts.ECharts | null>;
+  widgetId?: string;
+  datasetId?: string;
+  publicShareToken?: string;
+  activeFilters?: any[];
+  crossFilters?: any[];
+  bpmnAnalytics?: BpmnAnalyticsPayload;
+  onProcessSelect?: (processName: string) => void;
+  onFieldMappingOverride?: (overrides: Record<string, string | null>) => void;
 }
 
 const GEO_CITY_COORDS: Record<string, [number, number]> = {
@@ -46,6 +55,14 @@ export default function WidgetRenderer(props: Props) {
         vizConfig={props.vizConfig}
         visualSpec={props.visualSpec}
         onPointClick={props.onPointClick}
+        widgetId={props.widgetId}
+        datasetId={props.datasetId}
+        publicShareToken={props.publicShareToken}
+        activeFilters={props.activeFilters}
+        crossFilters={props.crossFilters}
+        bpmnAnalytics={props.bpmnAnalytics}
+        onProcessSelect={props.onProcessSelect}
+        onFieldMappingOverride={props.onFieldMappingOverride}
       />
     );
   }
@@ -61,6 +78,7 @@ function StandardWidgetRenderer({
   visualSpec = {},
   onPointClick,
   chartInstanceRef,
+  bpmnAnalytics,
 }: Props) {
   const { locale, activeThemeTokens, activeThemeMode } = useBi();
   const [tableSearch, setTableSearch] = useState("");
@@ -69,6 +87,19 @@ function StandardWidgetRenderer({
   const [isMobile, setIsMobile] = useState(false);
 
   const { columns, rows } = useMemo(() => {
+    if (
+      bpmnAnalytics?.step_summary &&
+      bpmnAnalytics.step_summary.length > 0 &&
+      chartType !== "table"
+    ) {
+      const stepCol = bpmnAnalytics.mapping?.step_field || visualSpec?.bpmn_config?.step_field || "step";
+      const aggRows = bpmnAnalytics.step_summary.map((st) => ({
+        [stepCol]: st.step_name,
+        value: st.avg_wait_hours > 0 ? st.avg_wait_hours : st.total_count,
+        secondary_value: st.pending_count || st.total_count,
+      }));
+      return { columns: [stepCol, "value", "secondary_value"], rows: aggRows };
+    }
     if (
       visualSpec?.bpmn_config &&
       chartType !== "table" &&
@@ -93,7 +124,7 @@ function StandardWidgetRenderer({
       return { columns: [stepCol, "value"], rows: aggRows };
     }
     return { columns: rawColumns, rows: rawRows };
-  }, [rawColumns, rawRows, visualSpec, chartType]);
+  }, [rawColumns, rawRows, visualSpec, chartType, bpmnAnalytics]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -144,12 +175,14 @@ function StandardWidgetRenderer({
 
   // ---------------- 1. KPI CARD ----------------
   if (chartType === "kpi") {
-    const val = rows[0]?.[yField] ?? rows[0]?.[columns[0]] ?? 0;
-    const numericVal = Number(val) || 0;
+    const val = rows[0]?.[yField] ?? rows[0]?.[columns[0]] ?? null;
+    const hasVal = val !== null && val !== undefined && val !== "" && !Number.isNaN(Number(val));
+    const numericVal = hasVal ? Number(val) : 0;
     const target = Number(styleConfig.target_value || 0);
+    const hasPrev = styleConfig.previous_value !== undefined && styleConfig.previous_value !== null && Number(styleConfig.previous_value) !== 0;
     const prev = Number(styleConfig.previous_value || 0);
-    const pctChange = prev > 0 ? ((numericVal - prev) / prev) * 100 : null;
-    const targetPct = target > 0 ? Math.min(100, Math.round((numericVal / target) * 100)) : null;
+    const pctChange = hasVal && hasPrev ? ((numericVal - prev) / Math.abs(prev)) * 100 : null;
+    const targetPct = hasVal && target > 0 ? Math.min(100, Math.round((numericVal / target) * 100)) : null;
     const statusColor =
       targetPct === null
         ? palette[0]
@@ -159,21 +192,42 @@ function StandardWidgetRenderer({
         ? "#f59e0b"
         : "#ef4444";
 
-    // Generate smooth deterministic sparkline from value
-    const sparkPts = [0.68, 0.74, 0.71, 0.82, 0.79, 0.91, 1.0].map((m, idx) => ({
-      x: idx * 20,
-      y: 28 - m * 22,
-    }));
-    const poly = sparkPts.map((p) => `${p.x},${p.y}`).join(" ");
+    const rawSpark: number[] | null =
+      Array.isArray(styleConfig.sparkline_values) && styleConfig.sparkline_values.length >= 2
+        ? styleConfig.sparkline_values.map((x: any) => Number(x) || 0)
+        : null;
+    const sparkNorm = (() => {
+      if (!rawSpark) return [0.68, 0.74, 0.71, 0.82, 0.79, 0.91, 1.0];
+      const mn = Math.min(...rawSpark);
+      const mx = Math.max(...rawSpark);
+      const span = mx - mn || 1;
+      return rawSpark.map((v) => 0.15 + ((v - mn) / span) * 0.85);
+    })();
+    const stepX = sparkNorm.length > 1 ? 120 / (sparkNorm.length - 1) : 20;
+    const poly = sparkNorm.map((m, idx) => `${(idx * stepX).toFixed(1)},${(28 - m * 22).toFixed(1)}`).join(" ");
 
     return (
-      <div className="h-full flex flex-col justify-between p-0.5 sm:p-1">
-        <div className="flex items-start justify-between gap-2">
-          <div className="text-lg sm:text-2xl lg:text-3xl font-bold tracking-tight truncate" style={{ color: textColor }}>
-            {formatBIValue(numericVal, numFmt, decimals, unit, abbreviate)}
+      <div
+        role={onPointClick ? "button" : undefined}
+        tabIndex={onPointClick ? 0 : undefined}
+        onClick={() => onPointClick?.("__kpi_drill__", hasVal ? numericVal : null)}
+        onKeyDown={(e) => {
+          if (onPointClick && (e.key === "Enter" || e.key === " ")) {
+            e.preventDefault();
+            onPointClick("__kpi_drill__", hasVal ? numericVal : null);
+          }
+        }}
+        title={onPointClick ? (locale === "fa" ? "کلیک برای تحلیل جزئیات و رکوردهای KPI" : "Click to inspect KPI breakdown & records") : undefined}
+        className={`h-full flex flex-col justify-between gap-1 p-0.5 rounded-lg transition ${
+          onPointClick ? "cursor-pointer hover:bg-blue-500/5" : ""
+        }`}
+      >
+        <div className="flex items-start justify-between gap-2 min-w-0">
+          <div className="text-lg sm:text-xl lg:text-2xl font-bold tracking-tight leading-tight truncate min-w-0" style={{ color: textColor }}>
+            {hasVal ? formatBIValue(numericVal, numFmt, decimals, unit, abbreviate) : "—"}
           </div>
           {styleConfig.show_sparkline !== false && (
-            <svg viewBox="0 0 120 32" className="w-12 sm:w-24 h-6 sm:h-8 shrink-0 opacity-90">
+            <svg viewBox="0 0 120 32" className="w-12 sm:w-20 h-6 sm:h-7 shrink-0 opacity-90">
               <polyline
                 fill="none"
                 stroke={statusColor}
@@ -196,7 +250,9 @@ function StandardWidgetRenderer({
               {Math.abs(pctChange).toFixed(1)}% {locale === "fa" ? "نسبت به قبل" : "vs prev"}
             </span>
           ) : (
-            <span style={{ color: mutedColor }}>{locale === "fa" ? "شاخص زنده" : "Live KPI"}</span>
+            <span style={{ color: mutedColor }}>
+              {locale === "fa" ? (onPointClick ? "شاخص زنده (کلیک برای جزئیات)" : "شاخص زنده") : (onPointClick ? "Live KPI (Click for details)" : "Live KPI")}
+            </span>
           )}
           {targetPct !== null && (
             <div className="flex items-center gap-1.5 flex-1 min-w-[70px] max-w-[160px]">
@@ -237,6 +293,57 @@ function StandardWidgetRenderer({
             </div>
           );
         })}
+      </div>
+    );
+  }
+
+  // ---------------- 2b. BULLET CHART ----------------
+  if (chartType === "bullet") {
+    const items = rows.slice(0, 8).map((r, idx) => {
+      const lbl = rows.length === 1 && !visualSpec.x_field ? (styleConfig.unit ? `شاخص (${styleConfig.unit})` : "عملکرد فعلی") : String(r[xField] ?? `Item ${idx + 1}`);
+      const actual = Number(r[yField] ?? r[columns[0]] ?? 0);
+      const tgt = secField ? Number(r[secField] ?? 0) : Number(styleConfig.target_value || actual * 1.15 || 100);
+      const maxScale = Math.max(actual * 1.1, tgt * 1.2, 1);
+      const actualPct = Math.min(100, Math.max(0, (actual / maxScale) * 100));
+      const targetPct = Math.min(99, Math.max(1, (tgt / maxScale) * 100));
+      const achievedPct = tgt > 0 ? Math.round((actual / tgt) * 100) : 100;
+      const barColor = achievedPct >= 95 ? "#10b981" : achievedPct >= 75 ? palette[0] : "#f59e0b";
+      return { lbl, actual, tgt, actualPct, targetPct, achievedPct, barColor, rawX: r[xField] };
+    });
+
+    return (
+      <div className="h-full overflow-y-auto flex flex-col justify-center space-y-3 pr-1">
+        {items.map((it, idx) => (
+            <div
+              key={idx}
+              className="space-y-1 cursor-pointer hover:opacity-90"
+              onClick={() =>
+                it.rawX !== undefined
+                  ? onPointClick?.(xField, it.rawX)
+                  : onPointClick?.("__kpi_drill__", it.actual)
+              }
+            >
+            <div className="flex justify-between text-xs font-medium gap-2">
+              <span className="truncate">{it.lbl}</span>
+              <span className="shrink-0 text-[11px]">
+                {formatBIValue(it.actual, numFmt, decimals, unit, true)} / {formatBIValue(it.tgt, numFmt, decimals, unit, true)} ({it.achievedPct}%)
+              </span>
+            </div>
+            <div className="relative h-5 rounded-md overflow-hidden flex bg-slate-500/15">
+              <div className="h-full bg-slate-500/15" style={{ width: "55%" }} />
+              <div className="h-full bg-slate-500/10" style={{ width: "25%" }} />
+              <div
+                className="absolute top-1.5 bottom-1.5 left-0 rounded transition-all"
+                style={{ width: `${it.actualPct}%`, background: it.barColor }}
+              />
+              <div
+                className="absolute top-0.5 bottom-0.5 w-0.5 bg-red-500 shadow"
+                style={{ left: `${it.targetPct}%` }}
+                title={`هدف: ${it.tgt}`}
+              />
+            </div>
+          </div>
+        ))}
       </div>
     );
   }
@@ -464,6 +571,10 @@ function EChartsCanvas(props: {
     chart.on("click", (params: any) => {
       if (!props.onPointClick) return;
       if (props.chartType === "radar") return;
+      if (props.chartType === "gauge") {
+        props.onPointClick("__kpi_drill__", Array.isArray(params.value) ? params.value[0] : params.value);
+        return;
+      }
       let clickedVal: any = params.name;
       if (props.chartType === "sankey" && params.dataType === "edge") {
         clickedVal = params.data?.source;
@@ -500,7 +611,7 @@ function EChartsCanvas(props: {
     };
   }, []);
 
-  return <div ref={containerRef} className="w-full h-full min-h-[160px] cursor-pointer" />;
+  return <div ref={containerRef} className="w-full h-full min-h-[84px] cursor-pointer" />;
 }
 
 function buildEChartsOption(ctx: {
@@ -620,6 +731,43 @@ function buildEChartsOption(ctx: {
         itemStyle: { borderRadius: [0, 4, 4, 0] },
         data: cats.map((c) => rows.filter((r) => String(r[xField]) === c).reduce((a, b) => a + Number(b[yField] ?? 0), 0)),
       }],
+    };
+  }
+
+  if (chartType === "grouped_bar") {
+    if (seriesField) {
+      const { sNames, lookup } = buildSeriesMap();
+      return {
+        textStyle: { fontFamily },
+        color: palette,
+        tooltip: baseTooltip,
+        legend: legendOpt,
+        grid: compactGrid,
+        xAxis: { type: "category", data: cats, axisLabel: xAxisLabel },
+        yAxis: { type: "value", axisLabel: yAxisLabel, splitLine },
+        series: sNames.map((s) => ({
+          name: s,
+          type: "bar",
+          barGap: "12%",
+          itemStyle: { borderRadius: [3, 3, 0, 0] },
+          data: cats.map((c) => lookup[s]?.[c] || 0),
+        })),
+      };
+    }
+    return {
+      textStyle: { fontFamily },
+      color: palette,
+      tooltip: baseTooltip,
+      legend: legendOpt,
+      grid: compactGrid,
+      xAxis: { type: "category", data: cats, axisLabel: xAxisLabel },
+      yAxis: { type: "value", axisLabel: yAxisLabel, splitLine },
+      series: [
+        { name: yField, type: "bar" as const, itemStyle: { borderRadius: [3, 3, 0, 0] }, data: rows.map((r) => Number(r[yField] ?? 0)) },
+        ...(secField
+          ? [{ name: secField, type: "bar" as const, itemStyle: { borderRadius: [3, 3, 0, 0] }, data: rows.map((r) => Number(r[secField] ?? 0)) }]
+          : []),
+      ],
     };
   }
 
@@ -887,16 +1035,27 @@ function buildEChartsOption(ctx: {
     const val = Number(rows[0]?.[yField] ?? 0);
     const maxV = Number(styleConfig.max_value || (val > 100 ? val * 1.5 : 100));
     return {
+      textStyle: { fontFamily },
       color: palette,
       series: [{
         type: "gauge",
+        radius: "92%",
+        center: ["50%", "58%"],
         max: maxV,
-        progress: { show: true, width: 14 },
-        axisLine: { lineStyle: { width: 14 } },
+        progress: { show: true, width: 9 },
+        axisLine: { lineStyle: { width: 9 } },
+        axisTick: { show: false },
+        splitLine: { length: 6, distance: -9, lineStyle: { width: 1.5 } },
+        axisLabel: { distance: 12, fontSize: 9, color: mutedColor, fontFamily },
+        pointer: { length: "52%", width: 4 },
+        title: { offsetCenter: [0, "74%"], fontSize: 10, color: mutedColor, fontFamily },
         detail: {
           valueAnimation: true,
-          fontSize: 20,
+          fontSize: 15,
+          fontWeight: "bold",
+          offsetCenter: [0, "34%"],
           color: textColor,
+          fontFamily,
           formatter: (v: number) => formatBIValue(v, numFmt, decimals, unit, abbreviate),
         },
         data: [{ value: Number(val.toFixed(1)), name: yField }],

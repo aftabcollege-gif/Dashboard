@@ -1,3 +1,5 @@
+import type { BpmnAnalyticsPayload } from "@/types/bi";
+
 export type BpmnNodeType =
   | "startEvent"
   | "endEvent"
@@ -33,6 +35,7 @@ export interface BpmnGraphModel {
 
 export interface BpmnWidgetConfig {
   process_name?: string;
+  process_field?: string;
   step_field?: string;
   wait_field?: string;
   assignee_field?: string;
@@ -50,6 +53,18 @@ export interface BpmnWidgetConfig {
   nodes?: BpmnNode[];
   edges?: BpmnEdge[];
   step_mapping?: Record<string, string>;
+}
+
+export function normalizeBpmnText(val: any): string {
+  return String(val ?? "")
+    .trim()
+    .replace(/ي/g, "ی")
+    .replace(/ى/g, "ی")
+    .replace(/ك/g, "ک")
+    .replace(/\u200c/g, " ")
+    .replace(/\u200f/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 export interface BpmnCartableItem {
@@ -86,9 +101,18 @@ export interface BpmnStepMetrics {
   completedCount: number;
   totalCount: number;
   avgWaitHours: number;
+  minWaitHours: number;
   maxWaitHours: number;
   slaHours: number;
   overdueCount: number;
+  slaBreachPct: number;
+  reworkCount: number;
+  reworkRate: number;
+  assigneeCount: number;
+  bottleneckScore: number;
+  flowSharePct: number;
+  matchedRule?: string | null;
+  severity?: string;
   heatRatio: number; // 0..1 normalized across steps
   isBottleneck: boolean;
   items: BpmnCartableItem[];
@@ -426,6 +450,94 @@ export const DEFAULT_PROCUREMENT_BPMN_GRAPH: BpmnGraphModel = {
   ],
 };
 
+export function buildBpmnGraphFromTransitions(
+  steps: string[],
+  transitions: { source: string; target: string; flow_count?: number }[],
+  processName = "فرآیند سازمانی (BPMN)"
+): BpmnGraphModel {
+  const cleanSteps = Array.from(new Set(steps.map((s) => s.trim()).filter(Boolean))).slice(0, 36);
+  if (cleanSteps.length === 0) {
+    return buildAutoBpmnGraphFromSteps([], processName);
+  }
+  const hasRichBranching =
+    transitions.length > 0 &&
+    transitions.some((t) => cleanSteps.includes(t.source) && cleanSteps.includes(t.target));
+  if (!hasRichBranching || cleanSteps.length > 10) {
+    // Serpentine multi-row BPMN layout keeps 10..36 steps readable without collapsing or overflowing infinitely horizontally
+    const nodes: BpmnNode[] = [
+      { id: "start_1", label: "شروع", stepKey: "__start__", type: "startEvent", x: 36, y: 118, width: 44, height: 44 },
+    ];
+    const edges: BpmnEdge[] = [];
+    const perRow = cleanSteps.length <= 6 ? cleanSteps.length : 5;
+    let prevId = "start_1";
+    const stepIdMap = new Map<string, string>();
+    cleanSteps.forEach((step, idx) => {
+      const id = `task_${idx + 1}`;
+      stepIdMap.set(normalizeBpmnText(step), id);
+      const row = Math.floor(idx / perRow);
+      const colInRow = idx % perRow;
+      const col = row % 2 === 0 ? colInRow : perRow - 1 - colInRow;
+      const x = 115 + col * 215;
+      const y = 92 + row * 142;
+      nodes.push({ id, label: step, stepKey: step, type: "userTask", x, y, width: 178, height: 94 });
+      edges.push({ id: `edge_${prevId}_${id}`, source: prevId, target: id });
+      prevId = id;
+    });
+    const last = nodes[nodes.length - 1];
+    nodes.push({
+      id: "end_1",
+      label: "پایان",
+      stepKey: "__end__",
+      type: "endEvent",
+      x: (last?.x || 115) + 215,
+      y: (last?.y || 92) + 24,
+      width: 44,
+      height: 44,
+    });
+    edges.push({ id: `edge_${prevId}_end_1`, source: prevId, target: "end_1" });
+    return { processName, nodes, edges };
+  }
+
+  const nodes: BpmnNode[] = [
+    { id: "start_1", label: "شروع", stepKey: "__start__", type: "startEvent", x: 36, y: 120, width: 44, height: 44 },
+  ];
+  const stepToNodeId = new Map<string, string>();
+  cleanSteps.forEach((step, idx) => {
+    const id = `task_${idx + 1}`;
+    stepToNodeId.set(normalizeBpmnText(step), id);
+    nodes.push({ id, label: step, stepKey: step, type: "userTask", x: 115 + idx * 215, y: 120, width: 178, height: 94 });
+  });
+  nodes.push({ id: "end_1", label: "پایان", stepKey: "__end__", type: "endEvent", x: 115 + cleanSteps.length * 215, y: 144, width: 44, height: 44 });
+
+  const edges: BpmnEdge[] = [];
+  const hasIncoming = new Set<string>();
+  const hasOutgoing = new Set<string>();
+  transitions.forEach((t, idx) => {
+    const sId = stepToNodeId.get(normalizeBpmnText(t.source));
+    const tId = stepToNodeId.get(normalizeBpmnText(t.target));
+    if (sId && tId && sId !== tId) {
+      edges.push({
+        id: `tr_${idx}`,
+        source: sId,
+        target: tId,
+        label: t.flow_count ? `${t.flow_count.toLocaleString()}` : undefined,
+      });
+      hasIncoming.add(tId);
+      hasOutgoing.add(sId);
+    }
+  });
+  const taskNodes = nodes.filter((n) => n.type === "userTask");
+  const entryNodes = taskNodes.filter((n) => !hasIncoming.has(n.id));
+  (entryNodes.length > 0 ? entryNodes.slice(0, 2) : taskNodes.slice(0, 1)).forEach((n, i) => {
+    edges.push({ id: `e_start_${i}`, source: "start_1", target: n.id });
+  });
+  const exitNodes = taskNodes.filter((n) => !hasOutgoing.has(n.id));
+  (exitNodes.length > 0 ? exitNodes.slice(0, 2) : taskNodes.slice(-1)).forEach((n, i) => {
+    edges.push({ id: `e_end_${i}`, source: n.id, target: "end_1" });
+  });
+  return { processName, nodes: applyAutoLayout(nodes, edges), edges };
+}
+
 export type BpmnColumnDescriptor = string | { name: string; label?: string };
 
 export function inferBpmnFieldMapping(
@@ -434,6 +546,7 @@ export function inferBpmnFieldMapping(
 ): Required<
   Pick<
     BpmnWidgetConfig,
+    | "process_field"
     | "step_field"
     | "wait_field"
     | "assignee_field"
@@ -446,43 +559,95 @@ export function inferBpmnFieldMapping(
     | "department_field"
   >
 > {
+  const normCol = (v: string) =>
+    normalizeBpmnText(v).toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+
   const entries = columns.map((c) =>
     typeof c === "string"
-      ? { name: c, label: c }
-      : { name: c.name, label: c.label || c.name }
+      ? { name: c, label: c, nName: normCol(c), nLabel: normCol(c) }
+      : { name: c.name, label: c.label || c.name, nName: normCol(c.name), nLabel: normCol(c.label || c.name) }
   );
   const colNames = entries.map((e) => e.name);
 
-  const findCol = (preferred: string | undefined, patterns: string[], fallback = ""): string => {
+  const findCol = (
+    preferred: string | undefined,
+    patterns: string[],
+    fallback = "",
+    opts?: { excludeCols?: Set<string>; excludeTokens?: string[] }
+  ): string => {
     if (preferred && colNames.includes(preferred)) return preferred;
+    const exCols = opts?.excludeCols || new Set<string>();
+    const exToks = (opts?.excludeTokens || []).map(normCol).filter(Boolean);
+    const blocked = (e: (typeof entries)[number], patNorm: string) => {
+      if (exCols.has(e.name)) return true;
+      const hay = `${e.nName} ${e.nLabel}`;
+      return exToks.some((t) => hay.includes(t) && !patNorm.includes(t));
+    };
     for (const pat of patterns) {
-      const p = pat.toLowerCase();
-      const hit = entries.find(
-        (e) => e.name.toLowerCase() === p || e.label.toLowerCase() === p
-      );
+      const p = normCol(pat);
+      const hit = entries.find((e) => !blocked(e, p) && (e.nName === p || e.nLabel === p));
       if (hit) return hit.name;
     }
     for (const pat of patterns) {
-      const p = pat.toLowerCase();
-      const hit = entries.find(
-        (e) => e.name.toLowerCase().includes(p) || e.label.toLowerCase().includes(p)
-      );
+      const p = normCol(pat);
+      const hit = entries.find((e) => !blocked(e, p) && (e.nName.includes(p) || e.nLabel.includes(p)));
       if (hit) return hit.name;
     }
     return fallback;
   };
 
+  const process_field = findCol(
+    config?.process_field,
+    [
+      "process_name", "workflow_name", "process_title", "process_type",
+      "نام فرایندهای سازمان", "نام فرایند سازمان", "فرایندهای سازمان",
+      "نام فرایند", "عنوان فرایند", "نوع فرایند", "فرایند", "process", "workflow",
+    ],
+    "",
+    { excludeTokens: ["step", "stage", "activity", "task", "node", "گام", "مرحله", "فعالیت", "کد", "شناسه", "id", "code", "مدت", "زمان", "تاریخ", "wait", "sla", "time"] }
+  );
+
+  const used = new Set<string>();
+  if (process_field) used.add(process_field);
+
+  const step_field = findCol(
+    config?.step_field,
+    [
+      "step_name", "activity_name", "stage_name", "task_name",
+      "گامهای هر فرایند", "گام های هر فرایند", "نام گام", "نام مرحله", "گام فرایند", "مرحله فرایند",
+      "گام", "مرحله", "فعالیت", "step", "activity", "stage", "task",
+    ],
+    colNames.find((c) => !used.has(c)) || colNames[0] || "step_name",
+    { excludeCols: used, excludeTokens: ["کد", "شناسه", "id", "code", "مدت", "زمان", "تاریخ", "wait", "sla", "تعداد"] }
+  );
+  if (step_field) used.add(step_field);
+
+  const assignee_field = findCol(
+    config?.assignee_field && !used.has(config.assignee_field) ? config.assignee_field : undefined,
+    [
+      "assignee_name", "assignee", "actor_name", "actor", "handler", "operator", "agent",
+      "employee_name", "employee", "staff", "owner_name", "owner", "person", "username", "user_name", "user",
+      "نام کارشناس", "صاحب کارتابل", "در کارتابل", "کارتابل", "نام مجری", "مجری",
+      "اقدام کننده", "کاربر اقدام کننده", "تحویل گیرنده", "مسئول کارتابل", "نام مسئول", "مسئول",
+      "نام و نام خانوادگی", "نام خانوادگی", "نام کامل", "نام همکار", "نام کارمند", "نام شخص", "نام فرد", "نام کاربر",
+      "کارشناس", "متصدی", "عامل", "کاربر", "شخص", "پشتیبان",
+    ],
+    "",
+    { excludeCols: used, excludeTokens: ["فرایند", "فرآیند", "گام", "مرحله", "واحد", "بخش", "دپارتمان", "شرکت", "سمت", "نقش"] }
+  );
+
   return {
-    step_field: findCol(config?.step_field, ["step_name", "step", "activity", "stage", "task", "گام", "مرحله", "فعالیت"], colNames[0] || "step_name"),
-    wait_field: findCol(config?.wait_field, ["wait_hours", "wait_time", "duration_hours", "waiting_hours", "wait", "duration", "انتظار", "مدت", "تاخیر", "توقف", "ساعت"], ""),
-    assignee_field: findCol(config?.assignee_field, ["assignee_name", "assignee", "owner", "user", "کارتابل", "مسئول", "کاربر", "شخص", "نام"], ""),
-    assignee_role_field: findCol(config?.assignee_role_field, ["assignee_role", "role", "سمت", "نقش"], ""),
-    request_id_field: findCol(config?.request_id_field, ["request_code", "request_id", "case_id", "ticket_id", "id", "کد", "شناسه"], ""),
-    request_title_field: findCol(config?.request_title_field, ["request_title", "title", "subject", "description", "عنوان", "موضوع"], ""),
-    status_field: findCol(config?.status_field, ["status", "state", "وضعیت"], ""),
-    sla_field: findCol(config?.sla_field, ["sla_hours", "sla", "target_hours", "سقف", "مهلت", "مجاز"], ""),
-    entered_at_field: findCol(config?.entered_at_field, ["entered_at", "created_at", "timestamp", "date", "تاریخ", "ورود"], ""),
-    department_field: findCol(config?.department_field, ["department", "unit", "واحد", "بخش"], ""),
+    process_field,
+    step_field,
+    wait_field: findCol(config?.wait_field, ["wait_hours", "wait_time", "duration_hours", "waiting_hours", "cycle_hours", "wait", "duration", "انتظار", "مدت", "تاخیر", "توقف", "ساعت"], "", { excludeCols: used }),
+    assignee_field,
+    assignee_role_field: findCol(config?.assignee_role_field, ["assignee_role", "actor_role", "role", "سمت", "نقش", "پست"], "", { excludeCols: used }),
+    request_id_field: findCol(config?.request_id_field, ["request_code", "request_id", "case_id", "instance_id", "ticket_id", "کد درخواست", "شماره درخواست", "شناسه درخواست", "شناسه پرونده", "کد رهگیری", "پرونده", "درخواست"], "", { excludeCols: used }),
+    request_title_field: findCol(config?.request_title_field, ["request_title", "case_title", "title", "subject", "description", "عنوان درخواست", "موضوع درخواست", "عنوان", "موضوع"], "", { excludeCols: used }),
+    status_field: findCol(config?.status_field, ["status", "state", "وضعیت درخواست", "وضعیت"], "", { excludeCols: used }),
+    sla_field: findCol(config?.sla_field, ["sla_hours", "sla", "target_hours", "سقف مجاز", "سقف", "مهلت", "مجاز"], "", { excludeCols: used }),
+    entered_at_field: findCol(config?.entered_at_field, ["entered_at", "event_time", "start_time", "created_at", "timestamp", "date", "تاریخ ورود", "زمان ورود", "تاریخ", "ورود"], "", { excludeCols: used }),
+    department_field: findCol(config?.department_field, ["department", "unit", "org_unit", "واحد سازمانی", "واحد", "بخش", "دپارتمان"], "", { excludeCols: used }),
   };
 }
 
@@ -502,7 +667,8 @@ export function computeBpmnAnalytics(
   rows: Record<string, any>[],
   columns: string[],
   config?: BpmnWidgetConfig,
-  heatmapMetric: "avg_wait" | "max_wait" | "pending_count" = "avg_wait"
+  heatmapMetric: "avg_wait" | "max_wait" | "pending_count" = "avg_wait",
+  serverAnalytics?: BpmnAnalyticsPayload
 ): {
   graph: BpmnGraphModel;
   stepMap: Record<string, BpmnStepMetrics>;
@@ -513,13 +679,38 @@ export function computeBpmnAnalytics(
   bottleneckStep: BpmnStepMetrics | null;
   mapping: ReturnType<typeof inferBpmnFieldMapping>;
 } {
-  const mapping = inferBpmnFieldMapping(columns, config);
-  const stepMapping = config?.step_mapping || {};
+  const effectiveCols =
+    columns.length > 0 ? columns : serverAnalytics?.available_columns || [];
+  const mergedConfig: BpmnWidgetConfig | undefined = serverAnalytics?.mapping
+    ? { ...(serverAnalytics.mapping as BpmnWidgetConfig), ...config }
+    : config;
+  const mapping = inferBpmnFieldMapping(effectiveCols, mergedConfig);
+  const stepMapping = mergedConfig?.step_mapping || {};
+
+  const serverSteps = serverAnalytics?.step_summary || [];
+  const useServerStats =
+    Boolean(serverAnalytics) &&
+    serverSteps.length > 0 &&
+    (serverAnalytics?.mode === "sql_aggregated" ||
+      (serverAnalytics?.active_source_rows || 0) > rows.length ||
+      rows.length === 0);
 
   // Build or resolve BPMN Graph
   let graph: BpmnGraphModel;
-  if (config?.nodes && config.nodes.length > 0) {
-    const normNodes: BpmnNode[] = config.nodes.map((n: any, idx: number) => ({
+  const defaultTaskKeys = new Set(
+    DEFAULT_PROCUREMENT_BPMN_GRAPH.nodes
+      .filter(
+        (n) =>
+          n.type !== "startEvent" &&
+          n.type !== "endEvent" &&
+          n.type !== "exclusiveGateway" &&
+          n.type !== "parallelGateway"
+      )
+      .map((n) => normalizeBpmnText(n.stepKey))
+  );
+
+  if (mergedConfig?.nodes && mergedConfig.nodes.length > 0) {
+    const normNodes: BpmnNode[] = mergedConfig.nodes.map((n: any, idx: number) => ({
       id: String(n.id || `node_${idx}`),
       label: String(n.label || n.name || n.id || ""),
       stepKey: String(n.stepKey || n.label || n.name || n.id || ""),
@@ -529,47 +720,63 @@ export function computeBpmnAnalytics(
       width: Number(n.width ?? 178),
       height: Number(n.height ?? 92),
     }));
-    const normEdges: BpmnEdge[] = (config.edges || []).map((e: any, idx: number) => ({
+    const normEdges: BpmnEdge[] = (mergedConfig.edges || []).map((e: any, idx: number) => ({
       id: String(e.id || `edge_${idx}`),
       source: String(e.source || e.sourceRef || ""),
       target: String(e.target || e.targetRef || ""),
       label: e.label || e.name || undefined,
     }));
     graph = {
-      processName: config.process_name || "فرآیند BPMN",
+      processName: serverAnalytics?.active_process || mergedConfig.process_name || "فرآیند BPMN",
       nodes: normNodes,
       edges: normEdges,
     };
-  } else if (config?.bpmn_xml) {
-    graph = parseBpmnXml(config.bpmn_xml);
-    if (config.process_name) graph.processName = config.process_name;
+  } else if (mergedConfig?.bpmn_xml) {
+    graph = parseBpmnXml(mergedConfig.bpmn_xml);
+    if (serverAnalytics?.active_process || mergedConfig.process_name) {
+      graph.processName = serverAnalytics?.active_process || mergedConfig.process_name || graph.processName;
+    }
+  } else if (serverSteps.length > 0) {
+    const srvStepNames = serverSteps.map((s) => s.step_name).filter(Boolean);
+    const matchesDefault =
+      srvStepNames.length > 0 && srvStepNames.every((s) => defaultTaskKeys.has(normalizeBpmnText(s)));
+    if (matchesDefault) {
+      graph = DEFAULT_PROCUREMENT_BPMN_GRAPH;
+    } else {
+      graph = buildBpmnGraphFromTransitions(
+        srvStepNames,
+        serverAnalytics?.transitions || [],
+        serverAnalytics?.active_process || mergedConfig?.process_name || "گردش فرآیند سازمانی (BPMN)"
+      );
+    }
   } else {
     const distinctSteps = Array.from(
       new Set(rows.map((r) => String(r[mapping.step_field] ?? "").trim()).filter(Boolean))
     );
-    const defaultTaskKeys = new Set(
-      DEFAULT_PROCUREMENT_BPMN_GRAPH.nodes
-        .filter((n) => n.type !== "startEvent" && n.type !== "endEvent" && n.type !== "exclusiveGateway" && n.type !== "parallelGateway")
-        .map((n) => n.stepKey)
-    );
-    const matchesDefault = distinctSteps.length > 0 && distinctSteps.every((s) => defaultTaskKeys.has(s));
+    const matchesDefault =
+      distinctSteps.length > 0 && distinctSteps.every((s) => defaultTaskKeys.has(normalizeBpmnText(s)));
     if (matchesDefault) {
       graph = DEFAULT_PROCUREMENT_BPMN_GRAPH;
     } else {
-      graph = buildAutoBpmnGraphFromSteps(distinctSteps, config?.process_name || "گردش فرآیند (BPMN)");
+      graph = buildBpmnGraphFromTransitions(
+        distinctSteps,
+        [],
+        mergedConfig?.process_name || "گردش فرآیند (BPMN)"
+      );
     }
   }
 
-  // Group rows by normalized step key
-  const itemsByStep = new Map<string, BpmnCartableItem[]>();
+  // Group sampled / local rows by normalized step key
+  const itemsByNormStep = new Map<string, BpmnCartableItem[]>();
   rows.forEach((r, idx) => {
     const rawStep = String(r[mapping.step_field] ?? "").trim();
     if (!rawStep) return;
     const mappedStep = stepMapping[rawStep] || rawStep;
+    const normStep = normalizeBpmnText(mappedStep);
     const waitHours = mapping.wait_field ? Number(r[mapping.wait_field] ?? 0) || 0 : 0;
     const slaHours = mapping.sla_field ? Number(r[mapping.sla_field] ?? 24) || 24 : 24;
     const statusStr = mapping.status_field ? String(r[mapping.status_field] ?? "در انتظار اقدام") : "در انتظار اقدام";
-    const isPending = mapping.status_field ? isRowPendingStatus(statusStr, config?.pending_status_values) : true;
+    const isPending = mapping.status_field ? isRowPendingStatus(statusStr, mergedConfig?.pending_status_values) : true;
     const assigneeName = mapping.assignee_field ? String(r[mapping.assignee_field] ?? "").trim() || "تخصیص‌نیافته" : "کارتابل عمومی";
     const assigneeRole = mapping.assignee_role_field ? String(r[mapping.assignee_role_field] ?? "").trim() : "";
     const requestId = mapping.request_id_field ? String(r[mapping.request_id_field] ?? `REQ-${idx + 1}`) : `REQ-${idx + 1}`;
@@ -593,9 +800,21 @@ export function computeBpmnAnalytics(
       enteredAt,
       rawRow: r,
     };
-    if (!itemsByStep.has(mappedStep)) itemsByStep.set(mappedStep, []);
-    itemsByStep.get(mappedStep)!.push(item);
+    if (!itemsByNormStep.has(normStep)) itemsByNormStep.set(normStep, []);
+    itemsByNormStep.get(normStep)!.push(item);
   });
+
+  // Index server step summaries & assignees by normalized step key
+  const srvStepByNorm = new Map<string, (typeof serverSteps)[number]>();
+  for (const ss of serverSteps) {
+    srvStepByNorm.set(normalizeBpmnText(ss.step_name), ss);
+  }
+  const srvAssgByNorm = new Map<string, BpmnAnalyticsPayload["assignees_by_step"][string]>();
+  if (serverAnalytics?.assignees_by_step) {
+    for (const [k, list] of Object.entries(serverAnalytics.assignees_by_step)) {
+      srvAssgByNorm.set(normalizeBpmnText(k), list);
+    }
+  }
 
   // Compute metrics for each task node in the graph
   const taskNodes = graph.nodes.filter(
@@ -605,76 +824,185 @@ export function computeBpmnAnalytics(
   const metricValues: number[] = [];
 
   for (const node of taskNodes) {
+    const kNorm = normalizeBpmnText(node.stepKey);
+    const lNorm = normalizeBpmnText(node.label);
     const matchedItems =
-      itemsByStep.get(node.stepKey) ||
-      itemsByStep.get(node.label) ||
-      itemsByStep.get(node.id) ||
+      itemsByNormStep.get(kNorm) ||
+      itemsByNormStep.get(lNorm) ||
       [];
     const pendingItems = matchedItems
       .filter((it) => it.isPending)
       .sort((a, b) => b.waitHours - a.waitHours);
-    const completedCount = matchedItems.length - pendingItems.length;
-    const statPool = pendingItems.length > 0 ? pendingItems : matchedItems;
-    const avgWaitHours =
-      statPool.length > 0
-        ? Math.round((statPool.reduce((acc, it) => acc + it.waitHours, 0) / statPool.length) * 10) / 10
-        : 0;
-    const maxWaitHours =
-      statPool.length > 0
-        ? Math.round(Math.max(...statPool.map((it) => it.waitHours)) * 10) / 10
-        : 0;
-    const slaHours =
-      statPool.length > 0
-        ? Math.round(statPool.reduce((acc, it) => acc + it.slaHours, 0) / statPool.length)
-        : 24;
-    const overdueCount = pendingItems.filter((it) => it.isOverdue).length;
 
-    // Group pending (or all) items by assignee for drill-down view
-    const byAssignee = new Map<string, BpmnCartableItem[]>();
-    const drillPool = pendingItems.length > 0 ? pendingItems : matchedItems;
-    for (const it of drillPool) {
-      if (!byAssignee.has(it.assigneeName)) byAssignee.set(it.assigneeName, []);
-      byAssignee.get(it.assigneeName)!.push(it);
+    const srvStep = srvStepByNorm.get(kNorm) || srvStepByNorm.get(lNorm);
+    const srvAssignees = srvAssgByNorm.get(kNorm) || srvAssgByNorm.get(lNorm) || [];
+
+    let pendingCount: number;
+    let completedCount: number;
+    let totalCount: number;
+    let avgWaitHours: number;
+    let minWaitHours: number;
+    let maxWaitHours: number;
+    let slaHours: number;
+    let overdueCount: number;
+    let slaBreachPct: number;
+    let reworkCount: number;
+    let reworkRate: number;
+    let assigneeCount: number;
+    let bottleneckScore: number;
+    let flowSharePct: number;
+    let srvIsBottleneck: boolean | undefined;
+    let matchedRule: string | null | undefined;
+    let severity: string | undefined;
+    let assignees: BpmnAssigneeSummary[];
+
+    if (useServerStats && srvStep) {
+      pendingCount = srvStep.pending_count;
+      completedCount = srvStep.completed_count;
+      totalCount = srvStep.total_count;
+      avgWaitHours = srvStep.avg_wait_hours;
+      minWaitHours = srvStep.min_wait_hours ?? 0;
+      maxWaitHours = srvStep.max_wait_hours;
+      slaHours = srvStep.sla_hours || 24;
+      overdueCount = srvStep.overdue_count;
+      slaBreachPct = srvStep.sla_breach_pct ?? (totalCount > 0 ? Math.round((overdueCount / totalCount) * 1000) / 10 : 0);
+      reworkCount = srvStep.rework_count ?? 0;
+      reworkRate = srvStep.rework_rate ?? 0;
+      assigneeCount = srvStep.assignee_count ?? srvAssignees.length;
+      bottleneckScore = srvStep.bottleneck_score ?? 0;
+      flowSharePct = srvStep.flow_share_pct ?? 0;
+      srvIsBottleneck = srvStep.is_bottleneck;
+      matchedRule = srvStep.matched_rule;
+      severity = srvStep.severity;
+
+      if (srvAssignees.length > 0) {
+        assignees = srvAssignees.map((sa) => ({
+          assigneeName: sa.assigneeName,
+          assigneeRole: sa.assigneeRole || "",
+          pendingCount: sa.pendingCount,
+          totalCount: sa.totalCount,
+          avgWaitHours: sa.avgWaitHours,
+          maxWaitHours: sa.maxWaitHours,
+          overdueCount: sa.overdueCount,
+          items: matchedItems.filter(
+            (it) => normalizeBpmnText(it.assigneeName) === normalizeBpmnText(sa.assigneeName)
+          ),
+        }));
+      } else {
+        assignees = [
+          {
+            assigneeName: "کارتابل عمومی",
+            assigneeRole: "",
+            pendingCount,
+            totalCount,
+            avgWaitHours,
+            maxWaitHours,
+            overdueCount,
+            items: matchedItems,
+          },
+        ];
+      }
+    } else {
+      completedCount = matchedItems.length - pendingItems.length;
+      pendingCount = pendingItems.length;
+      totalCount = matchedItems.length;
+      const statPool = pendingItems.length > 0 ? pendingItems : matchedItems;
+      avgWaitHours =
+        statPool.length > 0
+          ? Math.round((statPool.reduce((acc, it) => acc + it.waitHours, 0) / statPool.length) * 10) / 10
+          : 0;
+      minWaitHours =
+        statPool.length > 0
+          ? Math.round(Math.min(...statPool.map((it) => it.waitHours)) * 10) / 10
+          : 0;
+      maxWaitHours =
+        statPool.length > 0
+          ? Math.round(Math.max(...statPool.map((it) => it.waitHours)) * 10) / 10
+          : 0;
+      slaHours =
+        statPool.length > 0
+          ? Math.round(statPool.reduce((acc, it) => acc + it.slaHours, 0) / statPool.length)
+          : 24;
+      overdueCount = pendingItems.filter((it) => it.isOverdue).length;
+      slaBreachPct = totalCount > 0 ? Math.round((overdueCount / totalCount) * 1000) / 10 : 0;
+      reworkCount = srvStep?.rework_count ?? 0;
+      reworkRate = srvStep?.rework_rate ?? 0;
+      bottleneckScore = srvStep?.bottleneck_score ?? 0;
+      flowSharePct = srvStep?.flow_share_pct ?? 0;
+      srvIsBottleneck = srvStep?.is_bottleneck;
+      matchedRule = srvStep?.matched_rule;
+      severity = srvStep?.severity;
+
+      // Also fall back to server assignees if present and local mapping yielded only "کارتابل عمومی"
+      const byAssignee = new Map<string, BpmnCartableItem[]>();
+      const drillPool = pendingItems.length > 0 ? pendingItems : matchedItems;
+      for (const it of drillPool) {
+        if (!byAssignee.has(it.assigneeName)) byAssignee.set(it.assigneeName, []);
+        byAssignee.get(it.assigneeName)!.push(it);
+      }
+      if (srvAssignees.length > 0 && (!mapping.assignee_field || (byAssignee.size === 1 && byAssignee.has("کارتابل عمومی")))) {
+        assignees = srvAssignees.map((sa) => ({
+          assigneeName: sa.assigneeName,
+          assigneeRole: sa.assigneeRole || "",
+          pendingCount: sa.pendingCount,
+          totalCount: sa.totalCount,
+          avgWaitHours: sa.avgWaitHours,
+          maxWaitHours: sa.maxWaitHours,
+          overdueCount: sa.overdueCount,
+          items: matchedItems,
+        }));
+      } else {
+        assignees = Array.from(byAssignee.entries())
+          .map(([assigneeName, list]) => {
+            const sorted = [...list].sort((a, b) => b.waitHours - a.waitHours);
+            const pCount = sorted.filter((x) => x.isPending).length;
+            const avgW = Math.round((sorted.reduce((s, x) => s + x.waitHours, 0) / sorted.length) * 10) / 10;
+            const maxW = Math.round(Math.max(...sorted.map((x) => x.waitHours)) * 10) / 10;
+            return {
+              assigneeName,
+              assigneeRole: sorted[0]?.assigneeRole || "",
+              pendingCount: pCount,
+              totalCount: sorted.length,
+              avgWaitHours: avgW,
+              maxWaitHours: maxW,
+              overdueCount: sorted.filter((x) => x.isOverdue).length,
+              items: sorted,
+            };
+          })
+          .sort((a, b) => b.pendingCount - a.pendingCount || b.avgWaitHours - a.avgWaitHours);
+      }
+      assigneeCount = srvStep?.assignee_count ?? assignees.length;
     }
-    const assignees: BpmnAssigneeSummary[] = Array.from(byAssignee.entries())
-      .map(([assigneeName, list]) => {
-        const sorted = [...list].sort((a, b) => b.waitHours - a.waitHours);
-        const pCount = sorted.filter((x) => x.isPending).length;
-        const avgW = Math.round((sorted.reduce((s, x) => s + x.waitHours, 0) / sorted.length) * 10) / 10;
-        const maxW = Math.round(Math.max(...sorted.map((x) => x.waitHours)) * 10) / 10;
-        return {
-          assigneeName,
-          assigneeRole: sorted[0]?.assigneeRole || "",
-          pendingCount: pCount,
-          totalCount: sorted.length,
-          avgWaitHours: avgW,
-          maxWaitHours: maxW,
-          overdueCount: sorted.filter((x) => x.isOverdue).length,
-          items: sorted,
-        };
-      })
-      .sort((a, b) => b.pendingCount - a.pendingCount || b.avgWaitHours - a.avgWaitHours);
 
     const mVal =
       heatmapMetric === "max_wait"
         ? maxWaitHours
         : heatmapMetric === "pending_count"
-        ? pendingItems.length
+        ? pendingCount
         : avgWaitHours;
-    if (matchedItems.length > 0) metricValues.push(mVal);
+    if (totalCount > 0) metricValues.push(mVal);
 
     const metrics: BpmnStepMetrics = {
       stepKey: node.stepKey,
       stepLabel: node.label,
-      pendingCount: pendingItems.length,
+      pendingCount,
       completedCount,
-      totalCount: matchedItems.length,
+      totalCount,
       avgWaitHours,
+      minWaitHours,
       maxWaitHours,
       slaHours,
       overdueCount,
+      slaBreachPct,
+      reworkCount,
+      reworkRate,
+      assigneeCount,
+      bottleneckScore,
+      flowSharePct,
+      matchedRule,
+      severity,
       heatRatio: 0,
-      isBottleneck: false,
+      isBottleneck: Boolean(srvIsBottleneck),
       items: matchedItems,
       pendingItems,
       assignees,
@@ -702,7 +1030,9 @@ export function computeBpmnAnalytics(
         : m.avgWaitHours;
     const span = Math.max(1e-6, maxMetricValue - minMetricValue);
     m.heatRatio = m.totalCount === 0 ? 0 : maxMetricValue === minMetricValue ? (rawVal > 0 ? 0.5 : 0) : (rawVal - minMetricValue) / span;
-    m.isBottleneck = m.pendingCount > 0 && (m.heatRatio >= 0.72 || m.avgWaitHours > m.slaHours * 1.15);
+    if (!m.isBottleneck) {
+      m.isBottleneck = m.pendingCount > 0 && (m.heatRatio >= 0.72 || m.avgWaitHours > m.slaHours * 1.15);
+    }
 
     totalPendingRequests += m.pendingCount;
     const w = m.pendingCount > 0 ? m.pendingCount : m.totalCount;

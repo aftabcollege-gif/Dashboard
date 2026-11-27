@@ -33,6 +33,10 @@ class EtlPipeline(Base, TimestampMixin):
     priority: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_running: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    fence_token: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    active_worker_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class EtlPipelineStep(Base, TimestampMixin):
@@ -88,6 +92,10 @@ class EtlJobRun(Base, TimestampMixin):
         String(64), ForeignKey("etl_pipelines.id", ondelete="CASCADE"), nullable=False, index=True
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    fence_token: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    worker_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     rows_extracted: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     rows_inserted: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     rows_updated: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)

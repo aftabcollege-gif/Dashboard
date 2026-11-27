@@ -2,8 +2,9 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, Bot, FolderKanban, Plus, Trash2, Wand2 } from "lucide-react";
+import { ArrowRight, Bot, FolderKanban, Plus, Sparkles, Trash2, Wand2 } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { PersianAssistantPanel } from "@/components/ai/PersianAssistantPanel";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
@@ -16,6 +17,8 @@ export default function DashboardsListPage() {
   const [datasets, setDatasets] = useState<any[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [showAssistant, setShowAssistant] = useState(true);
+  const [showSmartStudio, setShowSmartStudio] = useState(false);
+  const [studioDatasetId, setStudioDatasetId] = useState("");
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
 
@@ -57,15 +60,11 @@ export default function DashboardsListPage() {
     }
   };
 
-  const handleAiGen = async (dsId: string) => {
-    try {
-      const res = await apiFetch<{ dashboard_id: string }>("/ai/generate-dashboard", {
-        method: "POST",
-        body: JSON.stringify({ dataset_id: dsId }),
-      });
-      window.location.href = `/dashboards/${res.dashboard_id}`;
-    } catch (err: any) {
-      showToast(err.message);
+  const handleAiGen = (dsId: string) => {
+    setStudioDatasetId(dsId);
+    setShowSmartStudio(true);
+    if (typeof window !== "undefined") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
     }
   };
 
@@ -85,6 +84,21 @@ export default function DashboardsListPage() {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowSmartStudio((s) => !s)}
+              className="px-3.5 py-2 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 flex items-center gap-1.5"
+            >
+              <Sparkles className="w-4 h-4" />
+              {showSmartStudio ? "بستن استودیوی KPI" : isFa ? "استودیوی هوشمند KPI (۷ صفحه)" : "Smart KPI Studio"}
+            </button>
+            <Link
+              href="/descriptive-builder"
+              className="px-3.5 py-2 rounded-lg text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 flex items-center gap-1.5"
+            >
+              <Sparkles className="w-4 h-4" />
+              {isFa ? "تولید داشبورد توصیفی" : "Descriptive Builder"}
+            </Link>
             <button
               type="button"
               onClick={() => setShowAssistant((s) => !s)}
@@ -109,6 +123,14 @@ export default function DashboardsListPage() {
             </button>
           </div>
         </div>
+
+        {showSmartStudio && (
+          <IntelligentDashboardStudio
+            key={studioDatasetId || datasets[0]?.id || "default"}
+            initialDatasetId={studioDatasetId || datasets[0]?.id}
+            onClose={() => setShowSmartStudio(false)}
+          />
+        )}
 
         {showAssistant && (
           <PersianAssistantPanel
@@ -174,7 +196,7 @@ export default function DashboardsListPage() {
         {datasets.length > 0 && (
           <div className="bi-card p-5 space-y-3">
             <div className="flex items-center gap-2 text-sm font-bold">
-              <Bot className="w-4 h-4 text-violet-500" /> {isFa ? "ساخت سریع ۱-کلیکی داشبورد از منبع داده" : "Generate AI Dashboard from Dataset"}
+              <Bot className="w-4 h-4 text-violet-500" /> {isFa ? "تحلیل و انتخاب KPIها برای ساخت داشبورد از منبع داده" : "Analyze & Confirm KPIs to Generate AI Dashboard"}
             </div>
             <div className="flex flex-wrap gap-2">
               {datasets.map((ds) => (

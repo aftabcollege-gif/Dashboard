@@ -1,5 +1,6 @@
 import csv
 import io
+import re
 from datetime import datetime, timezone
 from typing import Any
 from openpyxl import Workbook
@@ -30,8 +31,15 @@ def export_to_excel_bytes(
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
 
+    used_names: set[str] = set()
     for idx, sheet in enumerate(sheets_data):
-        sname = str(sheet.get("name", f"Sheet_{idx+1}"))[:30].replace("/", "-")
+        raw_name = str(sheet.get("name", f"Sheet_{idx+1}"))
+        cleaned = re.sub(r"[\\/?*\[\]:]", "-", raw_name).strip(" '") or f"Sheet_{idx+1}"
+        sname = cleaned[:30]
+        if sname.lower() in used_names:
+            suffix = f"_{idx+1}"
+            sname = f"{cleaned[:30 - len(suffix)]}{suffix}"
+        used_names.add(sname.lower())
         ws = wb.create_sheet(title=sname)
         ws.append([f"{title} — {sname}"])
         ws.append([f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"])

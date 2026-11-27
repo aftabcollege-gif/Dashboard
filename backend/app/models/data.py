@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
-    String, Boolean, Integer, BigInteger, Text, DateTime, ForeignKey, UniqueConstraint, JSON
+    String, Boolean, Integer, BigInteger, Float, Text, DateTime, ForeignKey, UniqueConstraint, JSON
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
@@ -79,6 +79,18 @@ class DatasetField(Base, TimestampMixin):
     expression: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     format_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     stats_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    calculation_type: Mapped[str] = mapped_column(String(32), default="physical", nullable=False)
+    dependent_fields_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    access_scope: Mapped[str] = mapped_column(String(32), default="dataset", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    semantic_class: Mapped[str] = mapped_column(String(48), default="", nullable=False)
+    classification_confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    aggregation_policy: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    user_override_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class DatasetRelationship(Base, TimestampMixin):
@@ -95,6 +107,15 @@ class DatasetRelationship(Base, TimestampMixin):
     right_field: Mapped[str] = mapped_column(String(140), nullable=False)
     join_type: Mapped[str] = mapped_column(String(24), default="left", nullable=False)
     cardinality: Mapped[str] = mapped_column(String(24), default="many_to_one", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    user_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    confirmation_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    confirmed_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    validated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SemanticMetric(Base, TimestampMixin):
@@ -115,6 +136,20 @@ class SemanticMetric(Base, TimestampMixin):
     formula: Mapped[str] = mapped_column(Text, nullable=False)
     format_type: Mapped[str] = mapped_column(String(32), default="number", nullable=False)
     unit: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    metric_kind: Mapped[str] = mapped_column(String(32), default="analytical_metric", nullable=False)
+    output_data_type: Mapped[str] = mapped_column(String(48), default="double", nullable=False)
+    dependent_datasets_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    dependent_fields_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    dependent_metrics_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    access_scope: Mapped[str] = mapped_column(String(32), default="organization", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    category: Mapped[str] = mapped_column(String(48), default="analytical", nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    target_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    kpi_metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class SavedQuery(Base, TimestampMixin):
@@ -158,8 +193,13 @@ class DataModel(Base, TimestampMixin):
         String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
     )
     name: Mapped[str] = mapped_column(String(180), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     model_type: Mapped[str] = mapped_column(String(32), default="star_schema", nullable=False)
     definition_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
 
 class DataTransformation(Base, TimestampMixin):
@@ -187,3 +227,29 @@ class DataLineage(Base, TimestampMixin):
     target_type: Mapped[str] = mapped_column(String(48), nullable=False)
     target_id: Mapped[str] = mapped_column(String(64), nullable=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class CompositeDataset(Base, TimestampMixin):
+    """Shared Data Source Layer: multi-table/view query & join definition materialized as a Dataset."""
+    __tablename__ = "composite_datasets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    data_source_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("data_sources.id", ondelete="CASCADE"), nullable=False
+    )
+    dataset_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(180), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    definition_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    refresh_schedule: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
+    last_refreshed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )

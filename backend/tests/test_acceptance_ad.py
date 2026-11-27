@@ -41,6 +41,7 @@ def test_a_active_directory_full_lifecycle(client, admin_headers):
             "auth_mode": "active_directory",
             "domain": "corp.enterprise.local",
         },
+        headers={"X-Auth-Mode": "bearer"},
     )
     assert domain_login.status_code == 200
     sara_token = domain_login.json()["access_token"]

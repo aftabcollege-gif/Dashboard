@@ -1,20 +1,26 @@
 import os
+import re
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from app.api.dashboards import _execute_single_widget
-from app.api.deps import enforce_permission, get_client_ip, get_current_user
+from app.api.deps import enforce_permission, enforce_scoped_rate_limit, get_client_ip, get_current_user
 from app.config import settings
 from app.core.audit import record_audit
 from app.core.permissions import permission_resolver
+from app.core.tenant import (
+    get_dashboard_for_org,
+    get_scheduled_report_for_org,
+    get_widget_for_org,
+)
 from app.database import get_db
 from app.engines.export_engine import (
     export_to_csv_bytes,
     export_to_excel_bytes,
     export_to_pdf_bytes,
 )
-from app.models.dashboard import Dashboard, Widget
+from app.models.dashboard import Widget
 from app.models.etl import ScheduledReport
 from app.models.identity import User
 
@@ -37,9 +43,17 @@ def export_dashboard(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    dash = db.query(Dashboard).filter(Dashboard.id == dashboard_id).first()
-    if not dash:
-        raise HTTPException(status_code=404, detail="Dashboard not found")
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "export_dash",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN // 2 or 30,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 3,
+    )
+    dash = get_dashboard_for_org(db, dashboard_id, user.organization_id)
 
     fmt_low = fmt.lower()
     if not permission_resolver.resolve(db, user, "dashboard", dash.id, "export").allowed:
@@ -99,12 +113,20 @@ def export_widget(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    w = db.query(Widget).filter(Widget.id == widget_id).first()
-    if not w:
-        raise HTTPException(status_code=404, detail="Widget not found")
-    parent_chain = [("dashboard", w.dashboard_id), ("dashboard_page", w.page_id)]
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "export_widget",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN // 2 or 30,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 3,
+    )
+    w, dash = get_widget_for_org(db, widget_id, user.organization_id)
+    parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
     if not permission_resolver.resolve(db, user, "widget", w.id, "export", parent_chain).allowed:
-        enforce_permission(db, user, "dashboard", w.dashboard_id, "export", ip_address=get_client_ip(request))
+        enforce_permission(db, user, "dashboard", dash.id, "export", ip_address=get_client_ip(request))
 
     res = _execute_single_widget(db, user, w, [], [], [], use_cache=True, ip_address=get_client_ip(request))
     fmt_low = fmt.lower()
@@ -127,6 +149,7 @@ def export_widget(
 
 @router.get("/scheduled-reports")
 def list_scheduled_reports(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    enforce_permission(db, user, "export", "*", "view")
     rows = db.query(ScheduledReport).filter(ScheduledReport.organization_id == user.organization_id).all()
     return [
         {
@@ -142,9 +165,10 @@ def list_scheduled_reports(user: User = Depends(get_current_user), db: Session =
 def create_scheduled_report(
     body: ScheduledReportCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    enforce_permission(db, user, "dashboard", body.dashboard_id, "export")
+    dash = get_dashboard_for_org(db, body.dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "export")
     sr = ScheduledReport(
-        organization_id=user.organization_id, dashboard_id=body.dashboard_id, name=body.name,
+        organization_id=user.organization_id, dashboard_id=dash.id, name=body.name,
         format=body.format, cron_expression=body.cron_expression, recipients_json=body.recipients,
     )
     db.add(sr)
@@ -156,18 +180,35 @@ def create_scheduled_report(
 def run_scheduled_report_now(
     report_id: str, request: Request, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    sr = db.query(ScheduledReport).filter(ScheduledReport.id == report_id).first()
-    if not sr:
-        raise HTTPException(status_code=404, detail="Scheduled report not found")
-    dash = db.query(Dashboard).filter(Dashboard.id == sr.dashboard_id).first()
-    widgets = db.query(Widget).filter(Widget.dashboard_id == sr.dashboard_id).all()
+    ip = get_client_ip(request)
+    enforce_scoped_rate_limit(
+        "run_report",
+        ip=ip,
+        user_id=user.id,
+        org_id=user.organization_id,
+        ip_limit=settings.RATE_LIMIT_SQL_PER_MIN,
+        user_limit=settings.RATE_LIMIT_SQL_PER_MIN // 2 or 30,
+        org_limit=settings.RATE_LIMIT_SQL_PER_MIN * 3,
+    )
+    sr = get_scheduled_report_for_org(db, report_id, user.organization_id)
+    dash = get_dashboard_for_org(db, sr.dashboard_id, user.organization_id)
+    enforce_permission(db, user, "dashboard", dash.id, "export", ip_address=get_client_ip(request))
+
+    widgets = db.query(Widget).filter(Widget.dashboard_id == dash.id).all()
     sections = []
     for w in widgets:
-        res = _execute_single_widget(db, user, w, [], [], [], use_cache=True)
+        parent_chain = [("dashboard", dash.id), ("dashboard_page", w.page_id)]
+        if not permission_resolver.resolve(db, user, "widget", w.id, "view", parent_chain).allowed:
+            continue
+        res = _execute_single_widget(db, user, w, [], [], [], use_cache=True, ip_address=get_client_ip(request))
         sections.append({"name": w.title, "columns": res.get("columns", []), "rows": res.get("rows", [])})
 
-    ext = "xlsx" if sr.format in ("excel", "xlsx") else sr.format
-    out_path = os.path.join(settings.EXPORTS_DIR, f"report_{sr.id[:8]}.{ext}")
+    ext = "xlsx" if sr.format in ("excel", "xlsx") else ("csv" if sr.format == "csv" else "pdf")
+    safe_org = re.sub(r"[^A-Za-z0-9_-]", "", user.organization_id) or "default"
+    org_export_dir = os.path.join(settings.EXPORTS_DIR, safe_org)
+    os.makedirs(org_export_dir, exist_ok=True)
+    out_path = os.path.join(org_export_dir, f"report_{sr.id[:8]}.{ext}")
+
     if ext == "pdf":
         b = export_to_pdf_bytes(dash.title, dash.description, sections)
     elif ext == "xlsx":
@@ -180,4 +221,4 @@ def run_scheduled_report_now(
     sr.last_sent_at = datetime.now(timezone.utc)
     sr.last_file_path = out_path
     db.commit()
-    return {"status": "generated", "file_path": out_path, "bytes": len(b)}
+    return {"status": "generated", "file_path": out_path, "bytes": len(b), "format": ext}

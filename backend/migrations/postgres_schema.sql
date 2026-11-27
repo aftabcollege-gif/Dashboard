@@ -59,6 +59,20 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id              VARCHAR(64) PRIMARY KEY,
+    user_id         VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    jti             VARCHAR(128) NOT NULL UNIQUE,
+    ip_address      VARCHAR(64),
+    user_agent      VARCHAR(300),
+    is_revoked      BOOLEAN NOT NULL DEFAULT FALSE,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id, is_revoked);
+
 CREATE TABLE IF NOT EXISTS identity_providers (
     id              VARCHAR(64) PRIMARY KEY,
     organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -103,7 +117,7 @@ CREATE TABLE IF NOT EXISTS external_identities (
     synced_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (provider_type, external_id)
+    CONSTRAINT uq_ext_conn_provider_id UNIQUE (directory_connection_id, provider_type, external_id)
 );
 
 CREATE TABLE IF NOT EXISTS directory_sync_jobs (
@@ -253,6 +267,13 @@ CREATE TABLE IF NOT EXISTS audit_logs_default PARTITION OF audit_logs DEFAULT;
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action_time ON audit_logs(action, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_time ON audit_logs(user_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS system_bootstrap_state (
+    id              VARCHAR(32) PRIMARY KEY,
+    completed       BOOLEAN NOT NULL DEFAULT FALSE,
+    bootstrapped_by VARCHAR(64),
+    completed_at    TIMESTAMPTZ
+);
+
 -- =============================================================================
 -- 2. DASHBOARD MANAGEMENT
 -- =============================================================================
@@ -292,6 +313,10 @@ CREATE TABLE IF NOT EXISTS dashboards (
     embed_token         VARCHAR(128) UNIQUE,
     refresh_interval_sec INTEGER NOT NULL DEFAULT 0,
     settings_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    allow_public_restricted BOOLEAN NOT NULL DEFAULT FALSE,
+    public_restricted_reason TEXT,
+    public_restricted_by VARCHAR(64),
+    public_restricted_at TIMESTAMPTZ,
     created_by          VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -416,6 +441,32 @@ CREATE TABLE IF NOT EXISTS dashboard_versions (
     UNIQUE (dashboard_id, version_number)
 );
 
+CREATE TABLE IF NOT EXISTS dashboard_comments (
+    id              VARCHAR(64) PRIMARY KEY,
+    dashboard_id    VARCHAR(64) NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+    widget_id       VARCHAR(64),
+    user_id         VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    author_name     VARCHAR(150) NOT NULL,
+    content         TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dashboard_comments_dash ON dashboard_comments(dashboard_id, created_at);
+
+CREATE TABLE IF NOT EXISTS dashboard_states (
+    id                      VARCHAR(64) PRIMARY KEY,
+    dashboard_id            VARCHAR(64) NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+    user_id                 VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    active_page_id          VARCHAR(64),
+    filter_state_json       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    drill_state_json        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    widget_overrides_json   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (dashboard_id, user_id)
+);
+
 -- =============================================================================
 -- 3. DATA MANAGEMENT & SEMANTIC LAYER
 -- =============================================================================
@@ -476,6 +527,16 @@ CREATE TABLE IF NOT EXISTS dataset_fields (
     expression      TEXT,
     format_json     JSONB NOT NULL DEFAULT '{}'::jsonb,
     stats_json      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    description     TEXT NOT NULL DEFAULT '',
+    calculation_type VARCHAR(32) NOT NULL DEFAULT 'physical',
+    dependent_fields_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    access_scope    VARCHAR(32) NOT NULL DEFAULT 'dataset',
+    version         INTEGER NOT NULL DEFAULT 1,
+    semantic_class  VARCHAR(48) NOT NULL DEFAULT '',
+    classification_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    aggregation_policy VARCHAR(32) NOT NULL DEFAULT '',
+    user_override_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by      VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (dataset_id, field_name)
@@ -489,8 +550,38 @@ CREATE TABLE IF NOT EXISTS dataset_relationships (
     right_field     VARCHAR(140) NOT NULL,
     join_type       VARCHAR(24) NOT NULL DEFAULT 'left', -- inner|left|right|full
     cardinality     VARCHAR(24) NOT NULL DEFAULT 'many_to_one',
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata_json   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    validated_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS semantic_metrics (
+    id              VARCHAR(64) PRIMARY KEY,
+    organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    dataset_id      VARCHAR(64) NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    name            VARCHAR(160) NOT NULL,
+    slug            VARCHAR(120) NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    formula         TEXT NOT NULL,
+    format_type     VARCHAR(32) NOT NULL DEFAULT 'number',
+    unit            VARCHAR(32) NOT NULL DEFAULT '',
+    metric_kind     VARCHAR(32) NOT NULL DEFAULT 'analytical_metric',
+    output_data_type VARCHAR(48) NOT NULL DEFAULT 'double',
+    dependent_datasets_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dependent_fields_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dependent_metrics_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    access_scope    VARCHAR(32) NOT NULL DEFAULT 'organization',
+    version         INTEGER NOT NULL DEFAULT 1,
+    category        VARCHAR(48) NOT NULL DEFAULT 'analytical',
+    confidence      DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    target_value    DOUBLE PRECISION,
+    kpi_metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by      VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (organization_id, slug)
 );
 
 CREATE TABLE IF NOT EXISTS queries (
@@ -522,8 +613,11 @@ CREATE TABLE IF NOT EXISTS data_models (
     id              VARCHAR(64) PRIMARY KEY,
     organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     name            VARCHAR(180) NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
     model_type      VARCHAR(32) NOT NULL DEFAULT 'star_schema', -- star_schema|snowflake_schema
     definition_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    version         INTEGER NOT NULL DEFAULT 1,
+    created_by      VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -570,6 +664,10 @@ CREATE TABLE IF NOT EXISTS etl_pipelines (
     priority            INTEGER NOT NULL DEFAULT 5,
     is_active           BOOLEAN NOT NULL DEFAULT TRUE,
     is_running          BOOLEAN NOT NULL DEFAULT FALSE,
+    fence_token         BIGINT NOT NULL DEFAULT 0,
+    active_worker_id    VARCHAR(128),
+    heartbeat_at        TIMESTAMPTZ,
+    lease_expires_at    TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -615,6 +713,10 @@ CREATE TABLE IF NOT EXISTS etl_job_runs (
     job_id              VARCHAR(64) NOT NULL REFERENCES etl_jobs(id) ON DELETE CASCADE,
     pipeline_id         VARCHAR(64) NOT NULL REFERENCES etl_pipelines(id) ON DELETE CASCADE,
     status              VARCHAR(32) NOT NULL,
+    fence_token         BIGINT NOT NULL DEFAULT 0,
+    worker_id           VARCHAR(128),
+    heartbeat_at        TIMESTAMPTZ,
+    lease_expires_at    TIMESTAMPTZ,
     rows_extracted      BIGINT NOT NULL DEFAULT 0,
     rows_inserted       BIGINT NOT NULL DEFAULT 0,
     rows_updated        BIGINT NOT NULL DEFAULT 0,
@@ -658,6 +760,21 @@ CREATE TABLE IF NOT EXISTS etl_metrics (
     throughput_rows_sec DOUBLE PRECISION NOT NULL DEFAULT 0,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scheduled_reports (
+    id              VARCHAR(64) PRIMARY KEY,
+    organization_id VARCHAR(64) NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    dashboard_id    VARCHAR(64) NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+    name            VARCHAR(180) NOT NULL,
+    format          VARCHAR(16) NOT NULL DEFAULT 'pdf', -- pdf|xlsx|csv
+    cron_expression VARCHAR(120) NOT NULL DEFAULT '0 8 * * 1',
+    recipients_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    is_enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+    last_sent_at    TIMESTAMPTZ,
+    last_file_path  TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- =============================================================================

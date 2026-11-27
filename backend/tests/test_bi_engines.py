@@ -45,8 +45,8 @@ def test_formula_compiler_and_bi_engines(client, admin_headers):
     assert imp.status_code == 200
     ds_id = imp.json()["dataset_id"]
 
-    # AI Auto Generate Dashboard from imported Excel
-    ai_dash = client.post("/api/v1/ai/generate-dashboard", json={"dataset_id": ds_id}, headers=admin_headers)
+    # AI Auto Generate Dashboard from imported Excel (legacy auto mode)
+    ai_dash = client.post("/api/v1/ai/generate-dashboard", json={"dataset_id": ds_id, "auto_generate_kpis": True}, headers=admin_headers)
     assert ai_dash.status_code == 200
     dash_id = ai_dash.json()["dashboard_id"]
 

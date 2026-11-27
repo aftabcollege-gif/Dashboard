@@ -1,0 +1,110 @@
+name: Security, Migrations & Quality CI
+
+on:
+  push:
+    branches: ["main", "arena/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  backend-security-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install backend dev & security dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements-dev.txt
+
+      - name: Audit production Python dependencies (pip-audit)
+        run: pip-audit -r backend/requirements.txt
+
+      - name: Run Bandit SAST scan (High & non-B608 Medium)
+        run: |
+          bandit -r backend/app -lll -q
+          bandit -r backend/app -ll -s B608 -q
+
+      - name: Verify Alembic migrations & zero schema drift
+        run: |
+          cd backend
+          rm -f /tmp/ci_alembic.db
+          DATABASE_URL=sqlite:////tmp/ci_alembic.db alembic upgrade head
+          DATABASE_URL=sqlite:////tmp/ci_alembic.db alembic check
+          rm -f /tmp/ci_alembic.db
+
+      - name: Run backend test suite
+        run: pytest backend/tests -v
+
+  frontend-security-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Audit production npm packages
+        run: npm audit --omit=dev
+
+      - name: Type-check, lint & production Next.js build
+        run: |
+          npm run lint
+          npx tsc --noEmit
+          npm run build
+
+  desktop-gateway-e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend & frontend standalone dependencies
+        run: |
+          pip install -r backend/requirements.txt
+          cd frontend && npm ci
+          NEXT_OUTPUT_MODE=standalone NEXT_DISABLE_BUILD_REWRITES=1 npm run build
+
+      - name: Run Desktop Security & Gateway E2E
+        run: python winsetup/tests/test_desktop_security_e2e.py

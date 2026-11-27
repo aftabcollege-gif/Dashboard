@@ -1,70 +1,149 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
     container_name: bi_app_db
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: bi_admin
-      POSTGRES_PASSWORD: ChangeMeStrongPass2026
-      POSTGRES_DB: bi_platform
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-bi_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-bi_platform}
+    expose:
+      - "5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./backend/migrations/postgres_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bi_admin -d bi_platform"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bi_admin} -d ${POSTGRES_DB:-bi_platform}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    security_opt:
+      - no-new-privileges:true
 
   redis:
     image: redis:7-alpine
     container_name: bi_cache_redis
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    security_opt:
+      - no-new-privileges:true
+
+  migrate:
+    build:
+      context: ./backend
+    container_name: bi_db_migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      BI_SEED_DEMO_USERS: "false"
+      BI_REQUIRE_GENERATED_SECRETS: "true"
+      BI_AUTO_CREATE_SCHEMA: "false"
+      BI_ENABLE_SCHEDULER: "false"
+      BI_DATA_DIR: /app/data
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-bi_admin}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-bi_platform}
+      BI_JWT_SECRET: ${BI_JWT_SECRET:?Set BI_JWT_SECRET in .env}
+      BI_CRED_KEY: ${BI_CRED_KEY:?Set BI_CRED_KEY in .env}
+    command: ["python", "-m", "app.db_migrate"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   backend:
     build:
       context: ./backend
     container_name: bi_api_server
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgresql+psycopg2://bi_admin:ChangeMeStrongPass2026@postgres:5432/bi_platform
-      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: production
+      BI_SEED_DEMO_USERS: "false"
+      BI_REQUIRE_GENERATED_SECRETS: "true"
+      BI_AUTO_CREATE_SCHEMA: "false"
+      BI_DATA_DIR: /app/data
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-bi_admin}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-bi_platform}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0
+      WAREHOUSE_PATH: /app/data/warehouse.duckdb
       WAREHOUSE_DUCKDB_PATH: /app/data/warehouse.duckdb
       UPLOAD_DIR: /app/uploads
       EXPORT_DIR: /app/exports
+      BI_JWT_SECRET: ${BI_JWT_SECRET:?Set BI_JWT_SECRET in .env}
+      BI_CRED_KEY: ${BI_CRED_KEY:?Set BI_CRED_KEY in .env}
+      BI_INITIAL_SETUP_TOKEN: ${BI_INITIAL_SETUP_TOKEN:?Set BI_INITIAL_SETUP_TOKEN in .env}
+      BI_CORS_ORIGINS: ${BI_CORS_ORIGINS:?Set BI_CORS_ORIGINS in .env}
+      BI_COOKIE_SECURE: ${BI_COOKIE_SECURE:-true}
+      BI_COOKIE_SAMESITE: ${BI_COOKIE_SAMESITE:-lax}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,::1}
+      BI_ENABLE_SCHEDULER: ${BI_ENABLE_SCHEDULER:-true}
+      BI_REQUIRE_ADMIN_MFA_IN_PROD: ${BI_REQUIRE_ADMIN_MFA_IN_PROD:-true}
+      RATE_LIMIT_FAIL_CLOSED_PROD: "true"
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - bi_warehouse:/app/data
       - bi_uploads:/app/uploads
       - bi_exports:/app/exports
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   frontend:
     build:
       context: ./frontend
+      args:
+        BACKEND_INTERNAL_URL: http://backend:8000
     container_name: bi_web_ui
+    restart: unless-stopped
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     environment:
+      NODE_ENV: production
       BACKEND_INTERNAL_URL: http://backend:8000
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   pg_data:

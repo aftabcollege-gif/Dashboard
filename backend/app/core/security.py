@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -7,7 +8,33 @@ import bcrypt
 import jwt
 import pyotp
 from cryptography.fernet import Fernet
+from fastapi import HTTPException
 from app.config import settings
+
+
+COMMON_WEAK_PASSWORDS = {
+    "Admin!2026",
+    "Designer!2026",
+    "Analyst!2026",
+    "Viewer!2026",
+    "Manager!2026",
+    "Password123!",
+    "ChangeMe!123",
+    "1234567890Aa!",
+}
+
+
+def validate_password_strength(password: str, *, allow_demo_passwords: bool = False) -> None:
+    if not password or len(password) < 10:
+        raise HTTPException(status_code=400, detail="Password must be at least 10 characters long")
+    if len(password) > 128:
+        raise HTTPException(status_code=400, detail="Password length must not exceed 128 characters")
+    if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password):
+        raise HTTPException(status_code=400, detail="Password must include both uppercase and lowercase letters")
+    if not re.search(r"[0-9\W_]", password):
+        raise HTTPException(status_code=400, detail="Password must include at least one number or symbol")
+    if not allow_demo_passwords and password in COMMON_WEAK_PASSWORDS:
+        raise HTTPException(status_code=400, detail="Common or default demo passwords cannot be used")
 
 
 def _get_fernet() -> Fernet:
@@ -67,7 +94,7 @@ def create_access_token(
     return encoded, token_jti, exp
 
 
-def create_refresh_token(user_id: str, organization_id: str, jti: str) -> str:
+def create_refresh_token(user_id: str, organization_id: str, jti: str) -> tuple[str, datetime]:
     exp = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     payload = {
         "sub": user_id,
@@ -77,7 +104,8 @@ def create_refresh_token(user_id: str, organization_id: str, jti: str) -> str:
         "exp": exp,
         "iat": datetime.now(timezone.utc),
     }
-    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    encoded = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return encoded, exp
 
 
 def decode_token(token: str) -> dict:

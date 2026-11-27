@@ -2,6 +2,7 @@ import math
 import re
 from typing import Any, Optional
 from sqlalchemy.orm import Session
+from app.core.rls_cls import build_data_security_context
 from app.engines.data_engine import DataProfiler
 from app.engines.query_engine import execute_dataset_sql
 from app.engines.warehouse import warehouse
@@ -30,220 +31,88 @@ class AiAnalyticsEngine:
     """
 
     @staticmethod
-    def recommend_widgets_for_dataset(db: Session, dataset: Dataset) -> dict[str, Any]:
-        fields = db.query(DatasetField).filter(DatasetField.dataset_id == dataset.id).all()
-        label_map: dict[str, str] = {}
-        if not fields:
-            # Infer from warehouse table directly
-            cols = warehouse.describe_table(dataset.warehouse_table)
-            measures = [
-                c["column_name"]
-                for c in cols
-                if any(k in c["column_type"].lower() for k in ("int", "double", "float", "decimal"))
-                and not c["column_name"].endswith("_id")
-                and c["column_name"] not in ("year", "month", "quarter", "day")
-            ]
-            times = [
-                c["column_name"]
-                for c in cols
-                if any(k in c["column_name"].lower() for k in ("date", "month", "year", "quarter"))
-            ]
-            geos = [
-                c["column_name"]
-                for c in cols
-                if any(k in c["column_name"].lower() for k in ("country", "region", "province", "city"))
-            ]
-            dims = [
-                c["column_name"]
-                for c in cols
-                if c["column_name"] not in measures and c["column_name"] not in times and not c["column_name"].endswith("_id")
-            ]
-            for c in cols:
-                label_map[c["column_name"]] = c["column_name"].replace("_", " ").title()
-        else:
-            for f in fields:
-                label_map[f.field_name] = f.display_name or f.field_name.replace("_", " ").title()
-            measures = [f.field_name for f in fields if f.semantic_role == "measure"]
-            times = [f.field_name for f in fields if f.semantic_role == "time"]
-            geos = [f.field_name for f in fields if f.semantic_role == "geo"]
-            dims = [f.field_name for f in fields if f.semantic_role in ("dimension", "geo")]
+    def recommend_widgets_for_dataset(
+        db: Session,
+        dataset: Dataset,
+        user: Optional[User] = None,
+        include_profile: bool = True,
+        *,
+        related_dataset_ids: Optional[list[str]] = None,
+        calendar_mode: str = "jalali",
+        domain_override: Optional[str] = None,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        from app.engines.kpi_engine import IntelligentKpiEngine
 
-        def _lbl(col_name: Optional[str]) -> str:
-            if not col_name or col_name == "*":
-                return "تعداد"
-            return label_map.get(col_name, col_name.replace("_", " ").title())
-
-        primary_m = measures[0] if measures else "*"
-        secondary_m = measures[1] if len(measures) > 1 else None
-        primary_t = times[0] if times else None
-        primary_d = dims[0] if dims else None
-        secondary_d = dims[1] if len(dims) > 1 else (geos[0] if geos else primary_d)
-
-        specs: list[dict[str, Any]] = []
-        all_col_dicts = [{"name": k, "label": label_map.get(k, k)} for k in list(label_map.keys())]
-        bpmn_inferred = AiAnalyticsEngine._infer_bpmn_config_from_cols(all_col_dicts)
-        is_bpmn_ds = bool(bpmn_inferred and (bpmn_inferred.get("step_field") or "bpmn" in (dataset.warehouse_table or "").lower()))
-
-        if is_bpmn_ds and bpmn_inferred:
-            w_field = bpmn_inferred.get("wait_field") or primary_m
-            s_field = bpmn_inferred.get("step_field") or primary_d
-            a_field = bpmn_inferred.get("assignee_field") or secondary_d
-            specs.extend([
-                {
-                    "title": "تعداد رویدادها / درخواست‌ها",
-                    "chart_type": "kpi",
-                    "layout": {"x": 0, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": "*", "aggregation": "COUNT"},
-                    "style": {"number_format": "number"},
-                },
-                {
-                    "title": f"میانگین {_lbl(w_field)}",
-                    "chart_type": "kpi",
-                    "layout": {"x": 4, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
-                    "style": {"number_format": "number"},
-                },
-                {
-                    "title": f"بیشترین {_lbl(w_field)}",
-                    "chart_type": "kpi",
-                    "layout": {"x": 8, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": w_field, "aggregation": "MAX" if w_field != "*" else "COUNT"},
-                    "style": {"number_format": "number"},
-                },
-                {
-                    "title": f"نقشه فرآیند BPMN و گلوگاه‌ها — {dataset.name}",
-                    "chart_type": "bpmn",
-                    "layout": {"x": 0, "y": 3, "w": 12, "h": 10},
-                    "visual_spec": {
-                        "x_field": s_field,
-                        "y_field": w_field,
-                        "aggregation": "AVG" if w_field != "*" else "COUNT",
-                        "bpmn_config": {**bpmn_inferred, "process_name": dataset.name, "heatmap_enabled": True},
-                    },
-                    "style": {"number_format": "number"},
-                },
-            ])
-            if s_field:
-                specs.append({
-                    "title": f"مقایسه گلوگاه‌های {_lbl(s_field)}",
-                    "chart_type": "horizontal_bar",
-                    "layout": {"x": 0, "y": 13, "w": 6, "h": 7},
-                    "visual_spec": {"x_field": s_field, "y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
-                })
-            if a_field:
-                specs.append({
-                    "title": f"تراکم و زمان انتظار در کارتابل ({_lbl(a_field)})",
-                    "chart_type": "bar",
-                    "layout": {"x": 6, "y": 13, "w": 6, "h": 7},
-                    "visual_spec": {"x_field": a_field, "y_field": w_field, "aggregation": "AVG" if w_field != "*" else "COUNT"},
-                })
-            suggested_filters = [
-                {"name": _lbl(d), "field_name": d, "filter_type": "multi_select"}
-                for d in [s_field, a_field, bpmn_inferred.get("status_field"), bpmn_inferred.get("department_field")]
-                if d
-            ][:4]
-            return {
-                "profile": DataProfiler.profile_table(dataset.warehouse_table),
-                "suggested_widgets": specs,
-                "suggested_filters": suggested_filters,
-            }
-
-        # Up to 3 KPI cards
-        for idx, m in enumerate(measures[:3]):
-            m_lbl = _lbl(m)
-            specs.append(
-                {
-                    "title": f"مجموع {m_lbl}" if any(ord(ch) > 127 for ch in m_lbl) else f"Total {m_lbl}",
-                    "chart_type": "kpi",
-                    "layout": {"x": idx * 4, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": m, "aggregation": "SUM"},
-                    "style": {"number_format": "currency" if any(k in f"{m} {m_lbl}".lower() for k in ("rev", "cost", "profit", "price", "amount", "مبلغ", "ریال", "تومان", "هزینه")) else "number"},
-                }
-            )
-        if not measures:
-            specs.append(
-                {
-                    "title": f"تعداد کل ({dataset.name})",
-                    "chart_type": "kpi",
-                    "layout": {"x": 0, "y": 0, "w": 4, "h": 3},
-                    "visual_spec": {"y_field": "*", "aggregation": "COUNT"},
-                    "style": {"number_format": "number"},
-                }
-            )
-
-        # Time-series trend chart
-        if primary_t:
-            m_lbl = _lbl(primary_m)
-            t_lbl = _lbl(primary_t)
-            specs.append(
-                {
-                    "title": f"روند {m_lbl} بر اساس {t_lbl}" if any(ord(ch) > 127 for ch in f"{m_lbl}{t_lbl}") else f"{m_lbl} Trend Over Time",
-                    "chart_type": "area",
-                    "layout": {"x": 0, "y": 3, "w": 8, "h": 7},
-                    "visual_spec": {
-                        "x_field": primary_t,
-                        "y_field": primary_m,
-                        "aggregation": "SUM" if primary_m != "*" else "COUNT",
-                    },
-                    "drill_hierarchy": [t for t in ("year", "quarter", "month") if t in (times + dims)] or [primary_t],
-                }
-            )
-
-        # Category Breakdown Donut / Bar
-        if primary_d:
-            m_lbl = _lbl(primary_m)
-            d_lbl = _lbl(primary_d)
-            specs.append(
-                {
-                    "title": f"{m_lbl} به تفکیک {d_lbl}" if any(ord(ch) > 127 for ch in f"{m_lbl}{d_lbl}") else f"{m_lbl} by {d_lbl}",
-                    "chart_type": "bar",
-                    "layout": {"x": 8 if primary_t else 0, "y": 3, "w": 4 if primary_t else 6, "h": 7},
-                    "visual_spec": {
-                        "x_field": primary_d,
-                        "y_field": primary_m,
-                        "aggregation": "SUM" if primary_m != "*" else "COUNT",
-                    },
-                }
-            )
-
-        if secondary_d:
-            d2_lbl = _lbl(secondary_d)
-            specs.append(
-                {
-                    "title": f"سهم بر اساس {d2_lbl}" if any(ord(ch) > 127 for ch in d2_lbl) else f"Share by {d2_lbl}",
-                    "chart_type": "donut",
-                    "layout": {"x": 0, "y": 10, "w": 5, "h": 7},
-                    "visual_spec": {
-                        "x_field": secondary_d,
-                        "y_field": primary_m,
-                        "aggregation": "SUM" if primary_m != "*" else "COUNT",
-                    },
-                }
-            )
-
-        # Comparison table
-        specs.append(
-            {
-                "title": f"جدول تفکیکی — {dataset.name}" if any(ord(ch) > 127 for ch in f"{dataset.name}{_lbl(primary_d)}{_lbl(primary_m)}") else f"Detailed Breakdown — {dataset.name}",
-                "chart_type": "table",
-                "layout": {"x": 5 if secondary_d else 0, "y": 10, "w": 7 if secondary_d else 12, "h": 7},
-                "visual_spec": {
-                    "x_field": primary_d or primary_t,
-                    "y_field": primary_m,
-                    "secondary_y_field": secondary_m,
-                    "aggregation": "SUM" if primary_m != "*" else "COUNT",
-                },
-            }
+        plan = IntelligentKpiEngine.build_intelligent_dashboard_plan(
+            db,
+            dataset,
+            user=user,
+            calendar_mode=calendar_mode,
+            related_dataset_ids=related_dataset_ids,
+            domain_override=domain_override,
+            auto_generate_kpis=True,
+            force_refresh=force_refresh,
         )
+        # Flatten pages into backward-compatible suggested_widgets list while exposing full 5-stage analysis
+        suggested_widgets: list[dict[str, Any]] = []
+        for page in plan["pages"]:
+            for w in page["widgets"]:
+                suggested_widgets.append({
+                    "title": w["title"],
+                    "description": w.get("description", ""),
+                    "chart_type": w["chart_type"],
+                    "layout": w["layout"],
+                    "visual_spec": w["visual_spec"],
+                    "style": w.get("style", {}),
+                    "visualization": w.get("visualization", {}),
+                    "advanced": w.get("advanced", {}),
+                    "drill_hierarchy": [d["field"] for d in (w.get("drill_hierarchy") or []) if isinstance(d, dict) and d.get("field")],
+                    "page_title": page["title"],
+                    "page_key": page.get("page_key"),
+                })
 
-        suggested_filters = [
-            {"name": _lbl(d), "field_name": d, "filter_type": "multi_select"}
-            for d in (dims + geos)[:3]
-        ]
+        sec_ctx = build_data_security_context(db, user, dataset.id) if user is not None else None
+        legacy_profile = None
+        if include_profile:
+            legacy_profile = {
+                "table_name": dataset.warehouse_table,
+                "row_count": plan["deep_profile"]["row_count"],
+                "fields": [
+                    {
+                        "field_name": f["field_name"],
+                        "raw_type": f["raw_type"],
+                        "distinct_count": f["distinct_count"],
+                        "null_count": f["null_count"],
+                        "min": f["min"],
+                        "max": f["max"],
+                        "avg": f["avg"],
+                        "median": f["median"],
+                    }
+                    for f in plan["deep_profile"]["fields"]
+                ],
+            }
+
         return {
-            "profile": DataProfiler.profile_table(dataset.warehouse_table),
-            "suggested_widgets": specs,
-            "suggested_filters": suggested_filters,
+            "dataset_id": dataset.id,
+            "dataset_name": dataset.name,
+            "profile": legacy_profile,
+            "deep_profile": plan["deep_profile"],
+            "field_classifications": plan["field_classifications"],
+            "domain_detection": plan["domain_detection"],
+            "kpis": plan["kpis"],
+            "recommended_pages": [
+                {
+                    "title": p["title"],
+                    "page_key": p.get("page_key"),
+                    "widgets_count": len(p["widgets"]),
+                    "chart_types": [w["chart_type"] for w in p["widgets"]],
+                }
+                for p in plan["pages"]
+            ],
+            "suggested_widgets": suggested_widgets,
+            "suggested_filters": plan["suggested_filters"],
+            "multi_source_analysis": plan["kpis"].get("multi_source_analysis", {}),
         }
 
     @staticmethod
@@ -253,86 +122,43 @@ class AiAnalyticsEngine:
         workspace_id: str,
         dataset: Dataset,
         title: Optional[str] = None,
+        *,
+        template_mode: str = "executive",
+        detail_level: str = "standard",
+        calendar_mode: str = "jalali",
+        date_range: Optional[dict[str, Any]] = None,
+        max_pages: int = 7,
+        theme_id: Optional[str] = None,
+        selected_kpi_ids: Optional[list[str]] = None,
+        confirmed_kpis: Optional[list[dict[str, Any]]] = None,
+        auto_generate_kpis: bool = False,
+        custom_kpis: Optional[list[dict[str, Any]]] = None,
+        target_values: Optional[dict[str, float]] = None,
+        related_dataset_ids: Optional[list[str]] = None,
+        dashboard_id: Optional[str] = None,
     ) -> Dashboard:
-        rec = AiAnalyticsEngine.recommend_widgets_for_dataset(db, dataset)
-        dash = Dashboard(
-            workspace_id=workspace_id,
-            title=title or f"AI Executive Insights — {dataset.name}",
-            description=f"Auto-generated AI analytical dashboard from dataset '{dataset.name}'",
-            created_by=user.id,
+        from app.engines.kpi_engine import IntelligentKpiEngine
+
+        dash, _meta = IntelligentKpiEngine.generate_and_persist_dashboard(
+            db,
+            user,
+            workspace_id,
+            dataset,
+            title=title,
+            template_mode=template_mode,
+            detail_level=detail_level,
+            calendar_mode=calendar_mode,
+            date_range=date_range,
+            max_pages=max_pages,
+            theme_id=theme_id,
+            selected_kpi_ids=selected_kpi_ids,
+            confirmed_kpis=confirmed_kpis,
+            auto_generate_kpis=auto_generate_kpis,
+            custom_kpis=custom_kpis,
+            target_values=target_values,
+            related_dataset_ids=related_dataset_ids,
+            dashboard_id=dashboard_id,
         )
-        db.add(dash)
-        db.flush()
-
-        page = DashboardPage(dashboard_id=dash.id, title="AI Overview", page_order=0)
-        db.add(page)
-        db.flush()
-
-        layout_items = []
-        for idx, spec in enumerate(rec["suggested_widgets"]):
-            lay = spec["layout"]
-            w = Widget(
-                dashboard_id=dash.id,
-                page_id=page.id,
-                title=spec["title"],
-                chart_type=spec["chart_type"],
-                dataset_id=dataset.id,
-                layout_x=lay["x"],
-                layout_y=lay["y"],
-                layout_w=lay["w"],
-                layout_h=lay["h"],
-            )
-            db.add(w)
-            db.flush()
-            layout_items.append({"i": w.id, **lay})
-
-            db.add(
-                WidgetConfig(
-                    widget_id=w.id,
-                    style_json=spec.get("style", {}),
-                    visualization_json={"show_legend": True, "show_tooltip": True, "data_labels": False},
-                    interactions_json={"cross_filter": True},
-                    advanced_json={"ai_generated": True},
-                )
-            )
-            db.add(
-                WidgetQuery(
-                    widget_id=w.id,
-                    dataset_id=dataset.id,
-                    query_mode="visual",
-                    visual_spec_json=spec["visual_spec"],
-                )
-            )
-            if spec.get("drill_hierarchy"):
-                db.add(
-                    WidgetDrillRule(
-                        widget_id=w.id,
-                        hierarchy_json=[{"field": f} for f in spec["drill_hierarchy"]],
-                        level_rules_json=[
-                            {"level": 0, "chart_type": "bar"},
-                            {"level": 1, "chart_type": "line"},
-                            {"level": 2, "chart_type": "area"},
-                        ],
-                    )
-                )
-
-        db.add(DashboardLayout(page_id=page.id, columns_count=12, layout_json=layout_items))
-
-        for sf in rec["suggested_filters"]:
-            db.add(
-                DashboardFilter(
-                    dashboard_id=dash.id,
-                    scope="global",
-                    name=sf["name"],
-                    field_name=sf["field_name"],
-                    dataset_id=dataset.id,
-                    filter_type=sf["filter_type"],
-                    operator="in",
-                )
-            )
-
-        db.commit()
-        db.refresh(dash)
         return dash
 
     @staticmethod
@@ -388,7 +214,19 @@ class AiAnalyticsEngine:
             "هزینه": ["cost", "expense", "amount"],
             "سود": ["profit", "net_profit", "margin"],
             "تعداد": ["quantity", "units", "count"],
+            "انتظار": ["wait_hours", "wait", "delay", "duration"],
+            "حقوق": ["salary", "payroll", "wage"],
+            "مالیات": ["tax", "vat"],
+            "تخفیف": ["discount"],
+            "موجودی": ["inventory", "stock", "balance"],
+            "بیمار": ["patient"],
         }
+        explicit_metric_concept: Optional[str] = None
+        for fa_k in fa_measure_hints:
+            if fa_k in q_low:
+                explicit_metric_concept = fa_k
+                break
+
         if not chosen_measure:
             for c in num_cols:
                 if c.replace("_", " ") in q_low or c in q_low:
@@ -404,8 +242,25 @@ class AiAnalyticsEngine:
                                 break
                         if chosen_measure:
                             break
+        if not chosen_measure and explicit_metric_concept and explicit_metric_concept != "تعداد":
+            return {
+                "status": "needs_data",
+                "question": question,
+                "answer_fa": (
+                    f"در مجموعه‌داده «{dataset.name}» هیچ ستون یا شاخصی متناظر با «{explicit_metric_concept}» یافت نشد. "
+                    f"برای جلوگیری از پاسخ نادرست، محاسبه‌ای انجام نشد. می‌توانید از ستون‌های موجود استفاده کنید: "
+                    f"{', '.join(num_cols[:8]) or 'ندارد'}."
+                ),
+                "missing_concept": explicit_metric_concept,
+                "available_measures": num_cols,
+                "available_dimensions": [c for c in col_names if c not in num_cols],
+                "source_datasets": [dataset.name],
+                "generated_sql": None,
+                "recommended_chart_type": "kpi",
+                "result": {"columns": [], "rows": [], "row_count": 0},
+            }
         if not chosen_measure:
-            chosen_measure = f'{agg}("{num_cols[0]}")' if num_cols else "COUNT(*)"
+            chosen_measure = f'{agg}("{num_cols[0]}")' if (num_cols and agg != "COUNT") else "COUNT(*)"
 
         # Dimension matching (EN + FA)
         dim_cols = [c["column_name"] for c in cols if c["column_name"] not in num_cols and not c["column_name"].endswith("_id")]
@@ -421,6 +276,10 @@ class AiAnalyticsEngine:
             "سال": ["year"],
             "تاریخ": ["order_date", "transaction_date", "date"],
             "کشور": ["country"],
+            "گام": ["step_name", "activity"],
+            "مرحله": ["step_name", "activity"],
+            "کارتابل": ["assignee_name", "assignee"],
+            "فرآیند": ["process_name"],
         }
         chosen_dim: Optional[str] = None
         for c in dim_cols:
@@ -439,7 +298,7 @@ class AiAnalyticsEngine:
                             break
 
         if not chosen_dim and any(k in q_low for k in ("by ", "بر اساس", "به تفکیک", "per ", "trend", "روند")):
-            for candidate in ("region", "department", "category", "month", "year", "product"):
+            for candidate in ("region", "department", "category", "step_name", "month", "year", "product"):
                 if candidate in col_names:
                     chosen_dim = candidate
                     break
@@ -458,12 +317,27 @@ class AiAnalyticsEngine:
             chart_type = "kpi"
 
         result = execute_dataset_sql(db, user, sql, dataset=dataset, use_cache=False)
+        rows = result.get("rows") or []
+        if not rows:
+            answer_fa = f"در مجموعه‌داده «{dataset.name}» هیچ داده‌ای مطابق با این پرسش یافت نشد."
+        elif chosen_dim:
+            top_items = [f"{r.get(chosen_dim)}: {r.get('value')}" for r in rows[:3]]
+            answer_fa = f"بر اساس منبع «{dataset.name}» ({result.get('row_count', len(rows))} گروه): " + " | ".join(top_items)
+        else:
+            val = rows[0].get("value")
+            answer_fa = f"مقدار محاسبه‌شده از منبع «{dataset.name}»: {val}"
+
         return {
+            "status": "answered",
             "question": question,
+            "answer_fa": answer_fa,
             "generated_sql": sql,
             "recommended_chart_type": chart_type,
             "x_field": chosen_dim,
             "y_field": "value",
+            "source_datasets": [dataset.name],
+            "confidence": 0.92,
+            "limitations": [],
             "result": result,
         }
 
@@ -545,44 +419,166 @@ class AiAnalyticsEngine:
         return s
 
     @staticmethod
-    def _infer_bpmn_config_from_cols(cols_info: list[dict[str, str]]) -> Optional[dict[str, Any]]:
-        """Detects BPMN process columns (step, wait time, SLA, assignee, status) from dataset columns."""
+    def _norm_col_text(val: Any) -> str:
+        s = str(val or "").strip().lower()
+        for a, b in (
+            ("ي", "ی"),
+            ("ى", "ی"),
+            ("ك", "ک"),
+            ("آ", "ا"),
+            ("أ", "ا"),
+            ("إ", "ا"),
+            ("\u200c", " "),
+            ("\u200f", ""),
+            ("_", " "),
+            ("-", " "),
+        ):
+            s = s.replace(a, b)
+        return re.sub(r"\s+", " ", s).strip()
+
+    @staticmethod
+    def _infer_bpmn_config_from_cols(cols_info: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        """Detects BPMN process columns (process, step, wait time, SLA, assignee, status, timestamps) from dataset columns."""
         if not cols_info:
             return None
 
-        def _pick(hints: tuple[str, ...]) -> Optional[str]:
-            for h in hints:
-                for c in cols_info:
-                    hay = f"{c.get('name', '')} {c.get('label', '')}".lower()
-                    if h in hay:
-                        return c["name"]
+        norm_cols: list[dict[str, str]] = []
+        for c in cols_info:
+            cname = c.get("name") or c.get("field_name") or c.get("column_name") or ""
+            if not cname:
+                continue
+            clabel = c.get("label") or c.get("display_name") or cname
+            norm_cols.append({
+                "name": str(cname),
+                "n_name": AiAnalyticsEngine._norm_col_text(cname),
+                "n_label": AiAnalyticsEngine._norm_col_text(clabel),
+            })
+
+        if not norm_cols:
             return None
 
-        step_col = _pick(("step_name", "step", "stage", "activity", "task", "گام", "مرحله", "فعالیت"))
-        wait_col = _pick(("wait_hours", "wait_time", "wait", "duration", "delay", "انتظار", "تاخیر", "توقف", "مدت"))
-        assignee_col = _pick(("assignee_name", "assignee", "owner", "person", "user", "کارتابل", "مسئول", "شخص", "کاربر"))
-        sla_col = _pick(("sla_hours", "sla", "target_hours", "سقف", "مجاز"))
-        status_col = _pick(("status", "state", "وضعیت"))
-        req_col = _pick(("request_code", "request_id", "case_id", "ticket", "کد درخواست", "درخواست", "شماره"))
-        dept_col = _pick(("department", "unit", "واحد", "بخش"))
-        role_col = _pick(("assignee_role", "role", "سمت"))
+        def _pick(
+            hints: tuple[str, ...],
+            *,
+            exclude_names: set[str] | None = None,
+            exclude_tokens: tuple[str, ...] = (),
+        ) -> Optional[str]:
+            ex = exclude_names or set()
+            norm_hints = [AiAnalyticsEngine._norm_col_text(h) for h in hints]
+            norm_ex_toks = [AiAnalyticsEngine._norm_col_text(t) for t in exclude_tokens if t]
 
-        # Must at least look like a process dataset (step + wait or step + assignee)
-        if not step_col or (not wait_col and not assignee_col):
+            def _blocked(item: dict[str, str], hint: str) -> bool:
+                if item["name"] in ex:
+                    return True
+                hay = f"{item['n_name']} {item['n_label']}"
+                for t in norm_ex_toks:
+                    if t in hay and t not in hint:
+                        return True
+                return False
+
+            # Pass 1: exact match on normalized name or label
+            for h in norm_hints:
+                for item in norm_cols:
+                    if _blocked(item, h):
+                        continue
+                    if item["n_name"] == h or item["n_label"] == h:
+                        return item["name"]
+
+            # Pass 2: phrase substring match
+            for h in norm_hints:
+                for item in norm_cols:
+                    if _blocked(item, h):
+                        continue
+                    if h in item["n_name"] or h in item["n_label"]:
+                        return item["name"]
+            return None
+
+        # 1) Process name column (must NOT match step/stage/activity/code/time columns like "مرحله فرایند" or "گام فرایند")
+        process_col = _pick(
+            (
+                "process_name", "workflow_name", "process_title", "process_type",
+                "نام فرایندهای سازمان", "نام فرایند سازمان", "فرایندهای سازمان",
+                "نام فرایند", "عنوان فرایند", "نوع فرایند", "فرایند",
+                "process", "workflow",
+            ),
+            exclude_tokens=("step", "stage", "activity", "task", "node", "گام", "مرحله", "فعالیت", "کد", "شناسه", "id", "code", "مدت", "زمان", "تاریخ", "wait", "sla", "time"),
+        )
+
+        # 2) Step / activity column (must exclude process_col if found)
+        used = {process_col} if process_col else set()
+        step_col = _pick(
+            (
+                "step_name", "activity_name", "stage_name", "task_name",
+                "گامهای هر فرایند", "گام های هر فرایند", "نام گام", "نام مرحله", "گام فرایند", "مرحله فرایند",
+                "گام", "مرحله", "فعالیت", "step", "stage", "activity", "task",
+            ),
+            exclude_names=used,
+            exclude_tokens=("کد", "شناسه", "id", "code", "مدت", "زمان", "تاریخ", "wait", "sla", "تعداد"),
+        )
+        if not step_col:
+            step_col = _pick(("step_name", "step", "stage", "activity", "task", "گام", "مرحله", "فعالیت"), exclude_names=used)
+        if step_col:
+            used.add(step_col)
+
+        # 3) Wait / duration / delay column
+        wait_col = _pick(
+            (
+                "wait_hours", "wait_time", "waiting_hours", "duration_hours", "cycle_hours", "delay_hours",
+                "مدت انتظار", "زمان انتظار", "میزان انتظار", "تاخیر", "توقف", "مدت زمان", "مدت",
+                "wait", "duration", "delay", "latency",
+            ),
+            exclude_names=used,
+        )
+
+        # 4) Assignee / cartable owner / person column (NEVER steal process_col or step_col!)
+        assignee_col = _pick(
+            (
+                "assignee_name", "assignee", "actor_name", "actor", "handler", "operator", "agent",
+                "employee_name", "employee", "staff", "owner_name", "owner", "person", "username", "user_name", "user",
+                "نام کارشناس", "صاحب کارتابل", "در کارتابل", "کارتابل", "نام مجری", "مجری",
+                "اقدام کننده", "کاربر اقدام کننده", "تحویل گیرنده", "مسئول کارتابل", "نام مسئول", "مسئول",
+                "نام و نام خانوادگی", "نام خانوادگی", "نام کامل", "نام همکار", "نام کارمند", "نام شخص", "نام فرد", "نام کاربر",
+                "کارشناس", "متصدی", "عامل", "کاربر", "شخص", "پشتیبان", "درخواست دهنده",
+            ),
+            exclude_names=used,
+            exclude_tokens=("فرایند", "فرآیند", "گام", "مرحله", "واحد", "بخش", "دپارتمان", "شرکت", "سمت", "نقش", "نقش کارتابل"),
+        )
+
+        sla_col = _pick(("sla_hours", "sla", "target_hours", "max_hours", "سقف مجاز", "سقف", "مهلت", "مجاز", "هدف"), exclude_names=used)
+        status_col = _pick(("status", "state", "وضعیت درخواست", "وضعیت گام", "وضعیت"), exclude_names=used)
+        req_col = _pick(
+            (
+                "request_code", "request_id", "case_id", "instance_id", "process_instance_id", "ticket_id", "ticket_code",
+                "کد درخواست", "شماره درخواست", "شناسه درخواست", "شماره پرونده", "کد پرونده", "شناسه پرونده", "کد رهگیری",
+                "درخواست", "پرونده", "case", "request", "ticket",
+            ),
+            exclude_names=used,
+        )
+        req_title_col = _pick(("request_title", "case_title", "title", "subject", "description", "عنوان درخواست", "موضوع درخواست", "عنوان", "موضوع", "شرح"), exclude_names=used)
+        entered_at_col = _pick(("entered_at", "event_time", "start_time", "created_at", "timestamp", "date", "تاریخ ورود", "زمان ورود", "تاریخ ثبت", "تاریخ", "زمان"), exclude_names=used)
+        dept_col = _pick(("department", "unit", "org_unit", "واحد سازمانی", "واحد", "بخش", "دپارتمان", "اداره", "معاونت"), exclude_names=used)
+        role_col = _pick(("assignee_role", "actor_role", "role", "position", "سمت", "نقش", "پست"), exclude_names=used)
+        step_id_col = _pick(("step_id", "node_id", "task_id", "کد گام", "کد مرحله", "شناسه گام"), exclude_names=used)
+
+        # Must look like a process dataset (step + any of process / wait / assignee / req)
+        if not step_col or (not process_col and not wait_col and not assignee_col and not req_col):
             return None
 
         return {
+            "process_field": process_col,
             "step_field": step_col,
-            "step_id_field": _pick(("step_id", "node_id")),
+            "step_id_field": step_id_col,
             "wait_field": wait_col,
             "sla_field": sla_col,
             "assignee_field": assignee_col,
             "assignee_role_field": role_col,
             "request_id_field": req_col,
+            "request_title_field": req_title_col,
+            "entered_at_field": entered_at_col,
             "status_field": status_col,
             "department_field": dept_col,
             "heatmap_enabled": True,
-            "heatmap_metric": "avg_wait",
+            "heatmap_metric": "avg_wait" if wait_col else "pending_count",
         }
 
     @staticmethod
@@ -618,8 +614,16 @@ class AiAnalyticsEngine:
         return None
 
     @staticmethod
-    def _get_dataset_schema(db: Session, ds: Dataset) -> tuple[list[dict[str, str]], list[str], list[str]]:
-        fields = db.query(DatasetField).filter(DatasetField.dataset_id == ds.id).all()
+    def _get_dataset_schema(
+        db: Session, ds: Dataset, user: Optional[User] = None
+    ) -> tuple[list[dict[str, str]], list[str], list[str]]:
+        sec_ctx = build_data_security_context(db, user, ds.id) if user is not None else None
+        hidden = sec_ctx.hidden_columns if sec_ctx else set()
+        fields = [
+            f
+            for f in db.query(DatasetField).filter(DatasetField.dataset_id == ds.id).all()
+            if f.field_name not in hidden
+        ]
         cols_info: list[dict[str, str]] = []
         if fields:
             for f in fields:
@@ -635,6 +639,8 @@ class AiAnalyticsEngine:
             raw_cols = warehouse.describe_table(ds.warehouse_table)
             for c in raw_cols:
                 cname = c["column_name"]
+                if cname in hidden:
+                    continue
                 ctype = (c.get("column_type") or "").lower()
                 is_num = (
                     any(k in ctype for k in ("int", "double", "float", "decimal", "numeric"))
@@ -879,7 +885,7 @@ class AiAnalyticsEngine:
                 matching_ds: list[Dataset] = []
                 probe_text = dim_mention or semantic_low
                 for d in datasets:
-                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d)
+                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d, user=user)
                     if dim_mention and AiAnalyticsEngine._match_column(dim_mention, cinfo, role_filter="dim"):
                         matching_ds.append(d)
                     elif not dim_mention and AiAnalyticsEngine._match_column(probe_text, cinfo):
@@ -941,7 +947,7 @@ class AiAnalyticsEngine:
             }
 
         # Now we have chosen_ds -> inspect its real columns!
-        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, chosen_ds)
+        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, chosen_ds, user=user)
 
         # Question B: Chart type if completely unspecified
         if not chart_type:
@@ -1123,39 +1129,73 @@ class AiAnalyticsEngine:
         viz_cfg = {"show_legend": True, "show_tooltip": True, "data_labels": False}
 
         sec_ctx = build_data_security_context(db, user, chosen_ds.id)
-        sql, params, _ = build_visual_query_sql(
-            db, chosen_ds, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
-            raw_mode=(eff_chart == "bpmn"),
-        )
-        raw_preview = warehouse.execute_query(sql, params)
-        vis_cols, vis_rows = apply_cls_and_masking(raw_preview["columns"], raw_preview["rows"], sec_ctx)
-        preview_data = {
-            "columns": vis_cols,
-            "rows": vis_rows,
-            "row_count": len(vis_rows),
-        }
+        if eff_chart == "bpmn":
+            from app.engines.bpmn_analytics import execute_bpmn_widget_sql
+
+            bpmn_res = execute_bpmn_widget_sql(
+                db,
+                chosen_ds,
+                visual_spec,
+                viz_cfg,
+                [],
+                sec_ctx.rls_where_clauses,
+                sec_ctx.rls_params,
+                user=user,
+            )
+            sql = bpmn_res.get("generated_sql", "")
+            preview_data = {
+                "columns": bpmn_res["columns"],
+                "rows": bpmn_res["rows"],
+                "row_count": bpmn_res["row_count"],
+                "bpmn_analytics": bpmn_res.get("bpmn_analytics"),
+            }
+        else:
+            sql, params, _ = build_visual_query_sql(
+                db, chosen_ds, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
+                raw_mode=False,
+                user=user,
+            )
+            raw_preview = warehouse.execute_query(sql, params)
+            vis_cols, vis_rows = apply_cls_and_masking(raw_preview["columns"], raw_preview["rows"], sec_ctx)
+            preview_data = {
+                "columns": vis_cols,
+                "rows": vis_rows,
+                "row_count": len(vis_rows),
+            }
 
         created_widget = None
         if create_widget and dashboard_id:
-            enforce_permission(db, user, "dashboard", dashboard_id, "add_widget")
+            from app.core.cache import cache_manager
+            from app.core.tenant import get_dashboard_for_org
+
+            dash_obj = get_dashboard_for_org(db, dashboard_id, user.organization_id)
+            enforce_permission(db, user, "dashboard", dash_obj.id, "add_widget")
             target_page_id = page_id
             if not target_page_id:
                 p0 = (
                     db.query(DashboardPage)
-                    .filter(DashboardPage.dashboard_id == dashboard_id)
+                    .filter(DashboardPage.dashboard_id == dash_obj.id)
                     .order_by(DashboardPage.page_order.asc())
                     .first()
                 )
                 target_page_id = p0.id if p0 else None
             if target_page_id:
+                page_obj = (
+                    db.query(DashboardPage)
+                    .filter(DashboardPage.id == target_page_id, DashboardPage.dashboard_id == dash_obj.id)
+                    .first()
+                )
+                if not page_obj:
+                    target_page_id = None
+            if target_page_id:
                 existing_widgets = db.query(Widget).filter(
-                    Widget.dashboard_id == dashboard_id, Widget.page_id == target_page_id
+                    Widget.dashboard_id == dash_obj.id, Widget.page_id == target_page_id
                 ).all()
                 next_y = max((w.layout_y + w.layout_h for w in existing_widgets), default=0)
                 lay_w = 12 if eff_chart == "bpmn" else (4 if eff_chart in ("kpi", "gauge") else 6)
                 lay_h = 10 if eff_chart == "bpmn" else (3 if eff_chart in ("kpi", "gauge") else 7)
                 w = Widget(
-                    dashboard_id=dashboard_id,
+                    dashboard_id=dash_obj.id,
                     page_id=target_page_id,
                     title=extracted_title,
                     description=f"AI Text-to-Widget ({chosen_ds.name})",
@@ -1189,16 +1229,17 @@ class AiAnalyticsEngine:
                     DataLineage.source_type == "dataset",
                     DataLineage.source_id == chosen_ds.id,
                     DataLineage.target_type == "dashboard",
-                    DataLineage.target_id == dashboard_id,
+                    DataLineage.target_id == dash_obj.id,
                 ).first():
                     db.add(
                         DataLineage(
                             source_type="dataset",
                             source_id=chosen_ds.id,
                             target_type="dashboard",
-                            target_id=dashboard_id,
+                            target_id=dash_obj.id,
                         )
                     )
+                cache_manager.invalidate_dashboard(dash_obj.id)
                 db.commit()
                 created_widget = {
                     "id": w.id,
@@ -1275,6 +1316,7 @@ class AiAnalyticsEngine:
             (["فروش", "درآمد", "سود", "سفارش", "محصول", "مناطق", "منطقه", "sales", "revenue"], ["sales", "revenue"]),
             (["هزینه", "بودجه", "خرج", "مالی", "expense", "budget", "cost"], ["expense", "cost", "budget"]),
             (["پرسنل", "کارمند", "کارکنان", "حقوق", "منابع انسانی", "نیروی انسانی", "hr", "employee"], ["hr", "workforce"]),
+            (["لاگ", "خطا", "سرور", "درخواست", "log", "error", "request", "access", "nginx"], ["log", "لاگ", "access", "error"]),
         ]
         for kws, targets in syn_groups:
             if any(k in text_low for k in kws):
@@ -1287,7 +1329,11 @@ class AiAnalyticsEngine:
 
     @staticmethod
     def _resolve_theme_from_text(db: Session, org_id: str, text_low: str) -> Optional[DashboardTheme]:
-        themes = db.query(DashboardTheme).filter(DashboardTheme.organization_id == org_id).all()
+        themes = (
+            db.query(DashboardTheme)
+            .filter((DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == org_id))
+            .all()
+        )
         if not themes:
             return None
         for th in themes:
@@ -1325,7 +1371,7 @@ class AiAnalyticsEngine:
             db.add(ws)
             db.flush()
 
-        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, ds)
+        cols_info, num_cols, dim_cols = AiAnalyticsEngine._get_dataset_schema(db, ds, user=user)
         col_label_map = {c["name"]: c["label"] for c in cols_info}
 
         def _lbl(col: Optional[str]) -> str:
@@ -1334,14 +1380,14 @@ class AiAnalyticsEngine:
             return col_label_map.get(col, col.replace("_", " ").title())
 
         # Prioritize meaningful dimensions & measures
-        pref_dims = [c for c in ("contractor_name", "region", "project_type", "category", "department", "product", "channel", "city") if c in dim_cols]
+        pref_dims = [c for c in ("contractor_name", "region", "project_type", "category", "department", "product", "channel", "city", "level", "status_code", "service", "method", "logger", "host") if c in dim_cols]
         rest_dims = [c for c in dim_cols if c not in pref_dims and not c.endswith("_code")]
         ordered_dims = pref_dims + rest_dims
         primary_dim = ordered_dims[0] if ordered_dims else None
         secondary_dim = ordered_dims[1] if len(ordered_dims) > 1 else primary_dim
         time_col = next((c["name"] for c in cols_info if c.get("role") == "time"), None)
 
-        pref_nums = [c for c in ("project_count", "revenue", "profit", "actual_amount", "performance_score", "contract_value", "salary") if c in num_cols]
+        pref_nums = [c for c in ("project_count", "revenue", "profit", "actual_amount", "performance_score", "contract_value", "salary", "latency_ms", "duration_ms", "response_bytes", "bytes") if c in num_cols]
         rest_nums = [c for c in num_cols if c not in pref_nums]
         ordered_nums = pref_nums + rest_nums
         primary_num = ordered_nums[0] if ordered_nums else "*"
@@ -1608,7 +1654,11 @@ class AiAnalyticsEngine:
 
         # Resolve theme
         chosen_theme: Optional[DashboardTheme] = None
-        themes = db.query(DashboardTheme).filter(DashboardTheme.organization_id == user.organization_id).all()
+        themes = (
+            db.query(DashboardTheme)
+            .filter((DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == user.organization_id))
+            .all()
+        )
         if clarifications.get("theme_id"):
             if clarifications["theme_id"] == "__default__":
                 chosen_theme = themes[0] if themes else None
@@ -1832,7 +1882,14 @@ class AiAnalyticsEngine:
             # 1) Theme change
             resolved_theme = None
             if clarifications.get("theme_id"):
-                resolved_theme = db.query(DashboardTheme).filter(DashboardTheme.id == clarifications["theme_id"]).first()
+                resolved_theme = (
+                    db.query(DashboardTheme)
+                    .filter(
+                        DashboardTheme.id == clarifications["theme_id"],
+                        (DashboardTheme.is_builtin == True) | (DashboardTheme.organization_id == user.organization_id),
+                    )
+                    .first()
+                )
             if not resolved_theme:
                 resolved_theme = AiAnalyticsEngine._resolve_theme_from_text(db, user.organization_id, combined_low)
 
@@ -1877,14 +1934,14 @@ class AiAnalyticsEngine:
                     if w.dataset_id:
                         d_obj = next((x for x in ds_candidates if x.id == w.dataset_id), None)
                         if d_obj:
-                            cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d_obj)
+                            cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, d_obj, user=user)
                             col = AiAnalyticsEngine._match_column(combined_low, cinfo, role_filter="dim")
                             if col:
                                 matched_col = col
                                 matched_ds = d_obj
                                 break
                 if matched_col and matched_ds:
-                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, matched_ds)
+                    cinfo, _, _ = AiAnalyticsEngine._get_dataset_schema(db, matched_ds, user=user)
                     lbl = next((c["label"] for c in cinfo if c["name"] == matched_col), matched_col)
                     db.add(
                         DashboardFilter(
@@ -1950,10 +2007,13 @@ class AiAnalyticsEngine:
 
         is_delete = edit_action == "delete" or any(k in combined_low for k in ("حذف", "پاک کن", "بردار", "delete", "remove"))
         if is_delete:
+            from app.core.cache import cache_manager
+
             enforce_permission(db, user, "dashboard", target_dash.id, "delete_widget")
             w_title = target_widget.title
             w_id = target_widget.id
             db.delete(target_widget)
+            cache_manager.invalidate_dashboard(target_dash.id)
             db.commit()
             return {
                 "status": "widget_deleted",
@@ -1983,7 +2043,7 @@ class AiAnalyticsEngine:
         new_y: Optional[str] = None
         new_agg: Optional[str] = None
         if ds_obj:
-            cinfo, num_cols, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj)
+            cinfo, num_cols, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj, user=user)
             m_dim = re.search(
                 r"(?:بر\s+اساس|به\s+تفکیک|بر\s+حسب|روی\s+محور)\s+[\"«']?([^\"»'\n]+?)[\"»']?(?=\s*(?:نشان|نمایش|تبدیل|کن|بده|$))",
                 combined_text,
@@ -2044,13 +2104,15 @@ class AiAnalyticsEngine:
         if new_agg:
             visual_spec["aggregation"] = new_agg
         if target_widget.chart_type == "bpmn" and not visual_spec.get("bpmn_config") and ds_obj:
-            cinfo_e, _, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj)
+            cinfo_e, _, _ = AiAnalyticsEngine._get_dataset_schema(db, ds_obj, user=user)
             inferred_e = AiAnalyticsEngine._infer_bpmn_config_from_cols(cinfo_e)
             if inferred_e:
                 visual_spec["bpmn_config"] = {**inferred_e, "heatmap_enabled": True}
         if wq:
             wq.visual_spec_json = visual_spec
 
+        from app.core.cache import cache_manager
+        cache_manager.invalidate_dashboard(target_dash.id)
         db.commit()
 
         preview_data = None
@@ -2060,6 +2122,7 @@ class AiAnalyticsEngine:
             generated_sql, params, _ = build_visual_query_sql(
                 db, ds_obj, visual_spec, [], sec_ctx.rls_where_clauses, sec_ctx.rls_params,
                 raw_mode=(target_widget.chart_type == "bpmn"),
+                user=user,
             )
             raw_prev = warehouse.execute_query(generated_sql, params)
             vis_cols, vis_rows = apply_cls_and_masking(raw_prev["columns"], raw_prev["rows"], sec_ctx)
@@ -2088,6 +2151,76 @@ class AiAnalyticsEngine:
             },
             "generated_sql": generated_sql,
             "preview_data": preview_data,
+        }
+
+    @staticmethod
+    def _handle_qa_chat(
+        db: Session,
+        user: User,
+        prompt: str,
+        clarifications: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        clar = dict(clarifications or {})
+        datasets = db.query(Dataset).filter(Dataset.organization_id == user.organization_id).all()
+        if not datasets:
+            return {
+                "status": "needs_data",
+                "action": "qa",
+                "message_fa": "هنوز هیچ منبع داده‌ای در سامانه ثبت نشده است. لطفاً ابتدا فایل اکسل یا منبع داده وارد کنید.",
+                "source_datasets": [],
+            }
+
+        chosen_ds = None
+        if clar.get("dataset_id"):
+            chosen_ds = next((d for d in datasets if d.id == clar["dataset_id"]), None)
+        if not chosen_ds:
+            low = AiAnalyticsEngine._normalize_text(prompt).lower()
+            for d in datasets:
+                if d.name.lower() in low or any(tok in low for tok in d.name.lower().split() if len(tok) >= 3):
+                    chosen_ds = d
+                    break
+        if not chosen_ds and len(datasets) == 1:
+            chosen_ds = datasets[0]
+        if not chosen_ds:
+            return {
+                "status": "needs_clarification",
+                "action": "qa",
+                "message_fa": "این پرسش باید از روی کدام منبع داده پاسخ داده شود؟",
+                "questions": [
+                    {
+                        "key": "dataset_id",
+                        "question": "منبع داده مورد نظر را انتخاب کنید:",
+                        "options": [
+                            {"value": d.id, "label": d.name, "hint": f"{d.row_count or 0} ردیف"}
+                            for d in datasets[:8]
+                        ],
+                    }
+                ],
+                "parsed": {"mode": "qa"},
+            }
+
+        nlq = AiAnalyticsEngine.natural_language_query(db, user, prompt, chosen_ds)
+        if nlq.get("status") == "needs_data":
+            return {
+                "status": "needs_data",
+                "action": "qa",
+                "message_fa": nlq["answer_fa"],
+                "available_measures": nlq.get("available_measures", []),
+                "available_dimensions": nlq.get("available_dimensions", []),
+                "source_datasets": nlq.get("source_datasets", [chosen_ds.name]),
+            }
+        return {
+            "status": "qa_answered",
+            "action": "qa",
+            "message_fa": nlq["answer_fa"],
+            "generated_sql": nlq["generated_sql"],
+            "recommended_chart_type": nlq["recommended_chart_type"],
+            "x_field": nlq.get("x_field"),
+            "y_field": nlq.get("y_field"),
+            "source_datasets": nlq.get("source_datasets", [chosen_ds.name]),
+            "confidence": nlq.get("confidence", 0.9),
+            "limitations": nlq.get("limitations", []),
+            "preview_data": nlq.get("result"),
         }
 
     @staticmethod
@@ -2129,11 +2262,15 @@ class AiAnalyticsEngine:
             )
             has_dash_word = any(k in norm_low for k in ("داشبورد", "dashboard", "صفحه گزارش"))
             has_widget_word = any(k in norm_low for k in ("ویجت", "نمودار", "کارت", "جدول", "شاخص", "kpi", "chart", "widget", "bpmn", "گلوگاه", "گردش کار"))
+            has_create_verb = any(k in norm_low for k in ("بساز", "ایجاد کن", "بکش", "اضافه کن", "بیفزا", "create", "build", "add"))
+            is_qa_kw = any(k in norm_low for k in ("چقدر", "کدام", "چند ", "میانگین", "مجموع", "جمع ", "بیشترین", "کمترین", "چرا", "چه کسی", "how many", "what is", "which", "؟", "?"))
 
             if widget_id or is_edit_kw:
                 eff_mode = "edit"
             elif has_dash_word and not has_widget_word:
                 eff_mode = "create_dashboard"
+            elif is_qa_kw and not has_create_verb and not has_widget_word:
+                eff_mode = "qa"
             elif has_widget_word or any(k in norm_low for k in ("از روی منبع", "بر اساس", "به تفکیک")):
                 eff_mode = "add_widget"
 
@@ -2147,6 +2284,7 @@ class AiAnalyticsEngine:
                         "key": "mode",
                         "question": "یکی از کارهای زیر را انتخاب کنید:",
                         "options": [
+                            {"value": "qa", "label": "پرسش و تحلیل مستقیم از داده‌ها (Q&A)", "hint": "محاسبه واقعی از SQL با منبع و عدم توهم"},
                             {"value": "create_dashboard", "label": "ساخت یک داشبورد کامل جدید", "hint": "با چند نمودار و کارت خلاصه آماده"},
                             {"value": "add_widget", "label": "افزودن یک نمودار یا عدد آماری جدید", "hint": "به داشبورد فعلی یا دلخواه"},
                             {"value": "edit", "label": "ویرایش داشبورد یا نمودارهای موجود", "hint": "تغییر رنگ/ظاهر، نام، نوع نمودار یا حذف"},
@@ -2156,6 +2294,8 @@ class AiAnalyticsEngine:
                 "parsed": {},
             }
 
+        if eff_mode == "qa":
+            return AiAnalyticsEngine._handle_qa_chat(db, user, prompt, clar)
         if eff_mode == "create_dashboard":
             return AiAnalyticsEngine._handle_create_dashboard_chat(db, user, prompt, clar)
         if eff_mode == "edit":

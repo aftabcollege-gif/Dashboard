@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowRight, Bot, Database, FolderKanban, Layers, Plus, RefreshCw, ShieldCheck } from "lucide-react";
 import AppShell from "@/components/layout/AppShell";
+import { IntelligentDashboardStudio } from "@/components/ai/IntelligentDashboardStudio";
 import { PersianAssistantPanel } from "@/components/ai/PersianAssistantPanel";
 import { apiFetch } from "@/lib/api";
 import { useBi } from "@/lib/context";
@@ -16,7 +17,7 @@ export default function HomePage() {
   const [datasets, setDatasets] = useState<any[]>([]);
   const [etlMon, setEtlMon] = useState<any>(null);
   const [aiDatasetId, setAiDatasetId] = useState("");
-  const [generating, setGenerating] = useState(false);
+  const [showSmartStudio, setShowSmartStudio] = useState(false);
   const [targetDashId, setTargetDashId] = useState("");
 
   const loadDashboards = useCallback(() => {
@@ -41,21 +42,9 @@ export default function HomePage() {
     apiFetch("/etl/monitor").then(setEtlMon).catch(() => {});
   }, [user, loadDashboards]);
 
-  const handleAiBuild = async () => {
+  const handleAiBuild = () => {
     if (!aiDatasetId) return;
-    setGenerating(true);
-    try {
-      const res = await apiFetch<{ dashboard_id: string }>("/ai/generate-dashboard", {
-        method: "POST",
-        body: JSON.stringify({ dataset_id: aiDatasetId }),
-      });
-      showToast(isFa ? "داشبورد هوشمند ساخته شد!" : "AI Dashboard generated!");
-      window.location.href = `/dashboards/${res.dashboard_id}`;
-    } catch (err: any) {
-      showToast(err.message);
-    } finally {
-      setGenerating(false);
-    }
+    setShowSmartStudio(true);
   };
 
   return (
@@ -172,13 +161,27 @@ export default function HomePage() {
               </select>
               <button
                 onClick={handleAiBuild}
-                disabled={generating}
+                disabled={!aiDatasetId}
                 className="px-4 py-2 rounded-lg text-xs font-semibold text-white bg-violet-600 hover:bg-violet-700 w-full sm:w-auto shrink-0"
               >
-                {generating ? "..." : isFa ? "تولید خودکار داشبورد" : "Auto-Generate Dashboard"}
+                {isFa ? "تحلیل و انتخاب KPIها ← ساخت داشبورد" : "Analyze & Confirm KPIs → Generate"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSmartStudio((s) => !s)}
+                className="px-4 py-2 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 w-full sm:w-auto shrink-0"
+              >
+                {showSmartStudio ? "بستن استودیو" : isFa ? "باز کردن استودیوی KPI" : "Smart KPI Studio"}
               </button>
             </div>
           </div>
+        )}
+
+        {showSmartStudio && aiDatasetId && (
+          <IntelligentDashboardStudio
+            initialDatasetId={aiDatasetId}
+            onClose={() => setShowSmartStudio(false)}
+          />
         )}
 
         {/* Dashboards Grid */}

@@ -9,8 +9,14 @@ import {
   saveDemoUploadedDataset,
 } from "@/lib/demoStore";
 import { parseSpreadsheetBuffer } from "@/lib/excelParser";
+import {
+  evaluateDemoKpiFormula,
+  evaluateDemoStandardAndBusinessKpis,
+  formatKpiVal,
+} from "@/lib/vercelDemoKpi";
 
 const TOKEN_KEY = "bi_access_token";
+const CSRF_COOKIE_NAME = "bi_csrf_token";
 
 export function getStoredToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -23,12 +29,49 @@ export function setStoredToken(token: string | null) {
   else localStorage.removeItem(TOKEN_KEY);
 }
 
+export function getCsrfCookie(): string | null {
+  if (typeof document === "undefined") return null;
+  const escaped = CSRF_COOKIE_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  detail?: any;
+  constructor(status: number, message: string, detail?: any) {
     super(message);
     this.status = status;
+    this.detail = detail;
   }
+}
+
+let refreshPromise: Promise<boolean> | null = null;
+
+async function attemptCookieRefresh(): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  if (isDemoPreviewMode()) return false;
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = (async () => {
+    try {
+      const headers: Record<string, string> = {};
+      const csrf = getCsrfCookie();
+      if (csrf) headers["X-CSRF-Token"] = csrf;
+      const res = await fetch("/api/v1/auth/refresh", {
+        method: "POST",
+        credentials: "include",
+        headers,
+      });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
 }
 
 async function handleClientDemoFileUpload(path: string, fd: FormData): Promise<any> {
@@ -48,7 +91,7 @@ async function handleClientDemoFileUpload(path: string, fd: FormData): Promise<a
     if (typeof t === "string" && t) typeOverrides = JSON.parse(t);
   } catch { /* ignore */ }
 
-  const parsed = parseSpreadsheetBuffer(buf, fileEntry.name, {
+  const parsed = await parseSpreadsheetBuffer(buf, fileEntry.name, {
     sheetName: (fd.get("sheet_name") as string) || undefined,
     hasHeader: String(fd.get("has_header") ?? "true") !== "false",
     nullStrategy: (fd.get("null_strategy") as string) || "keep",
@@ -121,19 +164,34 @@ export async function apiFetch<T = any>(
       if (method === "GET" && mProfile) {
         const hit = uploaded.find((d) => d.id === mProfile[1]);
         if (hit) {
-          return {
-            dataset_id: hit.id,
-            row_count: hit.row_count,
-            columns: hit.fields.map((f) => ({
+          const profFields = hit.fields.map((f) => {
+            let nullCount = 0;
+            const distinctSet = new Set<any>();
+            for (const r of hit.rows) {
+              const v = r[f.field_name];
+              if (v === "" || v === null || v === undefined) {
+                nullCount++;
+              } else if (distinctSet.size < 50000) {
+                distinctSet.add(v);
+              }
+            }
+            return {
               field_name: f.field_name,
               column_name: f.field_name,
               display_name: f.display_name,
               data_type: f.data_type,
+              raw_type: f.data_type.toUpperCase(),
               semantic_role: f.semantic_role,
               nullable: f.nullable,
-              null_count: hit.rows.filter((r) => r[f.field_name] === "" || r[f.field_name] === null || r[f.field_name] === undefined).length,
-              distinct_count: new Set(hit.rows.map((r) => r[f.field_name])).size,
-            })),
+              null_count: nullCount,
+              distinct_count: distinctSet.size,
+            };
+          });
+          return {
+            dataset_id: hit.id,
+            row_count: hit.row_count,
+            fields: profFields,
+            columns: profFields,
           } as unknown as T;
         }
       }
@@ -156,46 +214,206 @@ export async function apiFetch<T = any>(
           return { status: "deleted" } as unknown as T;
         }
       }
+
+      const mRec = path.match(/^\/ai\/recommend\/([^/?]+)(\?.*)?$/);
+      if (method === "GET" && mRec) {
+        const hit = uploaded.find((d) => d.id === mRec[1]);
+        if (hit) {
+          const sp = new URLSearchParams((mRec[2] || "").replace(/^\?/, ""));
+          const calMode = sp.get("calendar_mode") || "jalali";
+          const evalRes = evaluateDemoStandardAndBusinessKpis(hit, hit.rows || [], calMode, {});
+          const fieldsCls = (hit.fields || []).map((f) => {
+            const isNum = ["int", "integer", "float", "double", "decimal", "numeric", "number"].includes(
+              String(f.data_type || "").toLowerCase()
+            );
+            const vals = isNum
+              ? (hit.rows || []).map((r) => Number(r[f.field_name])).filter((v) => !Number.isNaN(v))
+              : [];
+            const avg = vals.length ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100 : undefined;
+            return {
+              field_name: f.field_name,
+              display_name: f.display_name || f.field_name,
+              data_type: isNum ? "numeric" : String(f.data_type).includes("date") ? "date" : "categorical",
+              raw_type: f.data_type,
+              semantic_class: isNum ? "Additive Measure" : "Category",
+              confidence: 0.9,
+              needs_user_confirmation: false,
+              default_aggregation: isNum ? "SUM" : "COUNT",
+              sum_allowed: isNum,
+              stats: {
+                avg,
+                median: avg,
+                stddev: avg ? Math.round(avg * 0.25 * 100) / 100 : undefined,
+                null_pct: 0,
+                distinct_count: new Set((hit.rows || []).map((r) => r[f.field_name])).size,
+                iqr_outlier_count: 0,
+              },
+            };
+          });
+          const numExtra = fieldsCls
+            .filter((f) => f.data_type === "numeric")
+            .slice(0, 4)
+            .map((f, idx) => {
+              const form = `SUM("${f.field_name}")`;
+              const val = evaluateDemoKpiFormula(form, hit.rows || [], calMode);
+              return {
+                id: `demo_${f.field_name}`,
+                slug: `${f.field_name}_sum`,
+                name: `مجموع ${f.display_name}`,
+                formula: form,
+                base_fields: [f.field_name],
+                format_type: "number",
+                display_format: "number",
+                unit: "",
+                value: val !== null ? Math.round(val * 100) / 100 : null,
+                formatted_value: formatKpiVal(val, "number", ""),
+                category: idx === 0 ? "domain" : "aggregate",
+                score: 88 - idx * 3,
+                confidence: 0.9,
+                status: "suggested",
+                computability_status: "computable",
+                computability_status_fa: "قابل محاسبه",
+                source: hit.name,
+                comparison_basis: "کل دوره داده‌ها",
+                limitations: [],
+              };
+            });
+          const stdSigs = new Set(evalRes.computableStandard.map((k) => k.formula.toLowerCase().replace(/\s+/g, "")));
+          const extraClean = numExtra.filter((k) => !stdSigs.has(k.formula.toLowerCase().replace(/\s+/g, "")));
+          const allBiz = [...evalRes.computableStandard, ...extraClean];
+          return {
+            dataset_id: hit.id,
+            dataset_name: hit.name,
+            domain_detection: {
+              primary_domain: "sales_marketing",
+              primary_domain_fa: "تحلیل داده فایل آپلودی",
+              confidence: 0.88,
+              evidence_fa: `تحلیل ${hit.row_count} ردیف و ${hit.columns_count} ستون`,
+            },
+            deep_profile: {
+              row_count: hit.row_count,
+              field_count: hit.columns_count,
+              duplicate_row_count: 0,
+              completeness_pct: 100,
+              is_approximate: false,
+            },
+            field_classifications: fieldsCls,
+            kpis: {
+              standard: evalRes.standard,
+              selected: allBiz.slice(0, 5),
+              suggested: allBiz.slice(5),
+              needs_confirmation: [],
+              needs_data: evalRes.needsData,
+              data_quality: [
+                {
+                  id: "dq_completeness_pct",
+                  name: "درصد تکمیل داده‌ها",
+                  formula: "100.0",
+                  formatted_value: "100%",
+                },
+              ],
+              uncomputable: evalRes.uncomputable,
+              all_business: allBiz,
+              all_candidates: [...evalRes.standard, ...extraClean],
+            },
+            recommended_pages: [
+              { title: "۱. خلاصه مدیریتی و KPIها", page_key: "executive_summary", widgets_count: 6, chart_types: ["kpi", "area", "bar"] },
+              { title: "۲. تحلیل روند زمانی", page_key: "trends", widgets_count: 2, chart_types: ["line", "area"] },
+              { title: "۳. تفکیک و مقایسه ابعادی", page_key: "breakdown", widgets_count: 3, chart_types: ["grouped_bar", "pie"] },
+            ],
+            suggested_widgets: [],
+          } as unknown as T;
+        }
+      }
+
+      const mKpiPrev = path.match(/^\/ai\/datasets\/([^/]+)\/kpis\/preview$/);
+      if (method === "POST" && mKpiPrev && typeof options.body === "string") {
+        const hit = uploaded.find((d) => d.id === mKpiPrev[1]);
+        if (hit) {
+          const pBody = JSON.parse(options.body);
+          const val = evaluateDemoKpiFormula(
+            pBody.formula || "",
+            hit.rows || [],
+            pBody.calendar_mode || "jalali",
+            pBody.multi_source_agg || null
+          );
+          return {
+            valid: true,
+            name: pBody.name || "Custom KPI",
+            formula: pBody.formula,
+            value: val !== null ? Math.round(val * 10000) / 10000 : null,
+            formatted_value: formatKpiVal(val, pBody.format_type || "number", pBody.unit || ""),
+            target_value: pBody.target_value,
+            warnings: [],
+          } as unknown as T;
+        }
+      }
     }
   }
 
-  const token = getStoredToken();
-  const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string> || {}),
+  const buildHeaders = () => {
+    const headers: Record<string, string> = {
+      ...(options.headers as Record<string, string> || {}),
+    };
+    const token = inDemo ? getStoredToken() : null;
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+      const csrf = getCsrfCookie();
+      if (csrf && !headers["X-CSRF-Token"]) {
+        headers["X-CSRF-Token"] = csrf;
+      }
+    }
+    if (!(options.body instanceof FormData) && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+    return headers;
   };
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
 
   let effectiveBody = options.body;
-  if (!(effectiveBody instanceof FormData) && !headers["Content-Type"]) {
-    headers["Content-Type"] = "application/json";
-  }
-
   // Automatically include uploaded Excel datasets and custom dashboards in Preview Demo API calls
   if (
     inDemo &&
     method === "POST" &&
     typeof effectiveBody === "string" &&
     (path.startsWith("/ai/") ||
+      path.startsWith("/descriptive-builder/") ||
       path.startsWith("/queries/") ||
       path.includes("/execute-batch") ||
       path.includes("/filter-options") ||
-      (path.startsWith("/dashboards/widgets/") && path.endsWith("/data")))
+      (path.startsWith("/dashboards/") &&
+        (path.endsWith("/data") ||
+          path.endsWith("/drill-details") ||
+          path.endsWith("/bpmn-drill") ||
+          path.endsWith("/bpmn-drill/export"))))
   ) {
     try {
       const parsedBody = JSON.parse(effectiveBody);
       const uploaded = getDemoUploadedDatasets();
       const customDashes = getDemoCreatedDashboards();
       if (uploaded.length > 0 && !parsedBody.demo_uploaded_datasets) {
-        // Send only target dataset for fast query/filter calls; send all for AI endpoints
-        if (path.startsWith("/ai/")) {
-          parsedBody.demo_uploaded_datasets = uploaded;
+        const capRowsForServerDemo = (u: DemoUploadedDataset) => ({
+          ...u,
+          is_uploaded_excel: true,
+          rows: (u.rows || []).slice(0, 5000),
+        });
+        if (path === "/ai/generate-dashboard") {
+          const wantedIds = new Set<string>([
+            ...(parsedBody.dataset_id ? [parsedBody.dataset_id] : []),
+            ...(Array.isArray(parsedBody.related_dataset_ids) ? parsedBody.related_dataset_ids : []),
+          ]);
+          const target = wantedIds.size > 0
+            ? uploaded.filter((u) => wantedIds.has(u.id))
+            : uploaded;
+          parsedBody.demo_uploaded_datasets = target.map(capRowsForServerDemo);
+        } else if (path.startsWith("/ai/")) {
+          parsedBody.demo_uploaded_datasets = uploaded.map(capRowsForServerDemo);
         } else if (parsedBody.dataset_id) {
           const one = uploaded.find((u) => u.id === parsedBody.dataset_id);
-          if (one) parsedBody.demo_uploaded_datasets = [one];
+          if (one) parsedBody.demo_uploaded_datasets = [capRowsForServerDemo(one)];
         } else {
-          parsedBody.demo_uploaded_datasets = uploaded;
+          parsedBody.demo_uploaded_datasets = uploaded.map(capRowsForServerDemo);
         }
       }
       if (customDashes.length > 0 && !parsedBody.demo_context?.custom_dashboards) {
@@ -210,21 +428,43 @@ export async function apiFetch<T = any>(
     }
   }
 
-  const res = await fetch(`/api/v1${path}`, {
-    ...options,
-    body: effectiveBody,
-    headers,
-  });
+  const doFetch = () =>
+    fetch(`/api/v1${path}`, {
+      ...options,
+      credentials: "include",
+      body: effectiveBody,
+      headers: buildHeaders(),
+    });
+
+  let res = await doFetch();
+
+  const skipRefreshPaths = ["/auth/login", "/auth/refresh", "/auth/bootstrap-admin", "/auth/status"];
+  if (
+    res.status === 401 &&
+    !inDemo &&
+    !skipRefreshPaths.some((p) => path.startsWith(p))
+  ) {
+    const refreshed = await attemptCookieRefresh();
+    if (refreshed) {
+      res = await doFetch();
+    }
+  }
 
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
+    let detail: any = undefined;
     try {
       const errJson = await res.json();
-      msg = errJson.detail || errJson.message || msg;
+      detail = errJson.detail;
+      if (detail && typeof detail === "object") {
+        msg = detail.message || JSON.stringify(detail);
+      } else {
+        msg = detail || errJson.message || msg;
+      }
     } catch {
       // ignore parse err
     }
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, detail);
   }
 
   const contentType = res.headers.get("content-type") || "";
@@ -233,7 +473,41 @@ export async function apiFetch<T = any>(
     if (inDemo && method === "GET" && path === "/datasets" && Array.isArray(jsonRes)) {
       return mergeDemoDatasetList(jsonRes) as unknown as T;
     }
-    if (inDemo && method === "POST" && path === "/ai/generate-dashboard" && jsonRes?.created_dashboard) {
+    if (inDemo && method === "GET" && path === "/descriptive-builder/datasets" && Array.isArray(jsonRes?.datasets)) {
+      const existingIds = new Set(jsonRes.datasets.map((d: any) => d.id));
+      const uploadedExtras = getDemoUploadedDatasets()
+        .filter((u) => !existingIds.has(u.id))
+        .map((u) => ({
+          id: u.id,
+          name: u.name,
+          description: `Uploaded dataset (${u.row_count} rows)`,
+          schema_type: "fact",
+          row_count: u.row_count,
+          freshness_status: "fresh",
+          last_refreshed_at: new Date().toISOString(),
+          has_security_restrictions: false,
+          fields: (u.fields || []).map((f: any) => ({
+            ...f,
+            is_primary_key: false,
+            is_calculated: false,
+            calculation_type: "physical",
+            expression: null,
+            format_type: "number",
+            unit: "",
+            description: "",
+            version: 1,
+            access_scope: "dataset",
+          })),
+          metrics: [],
+        }));
+      return { ...jsonRes, datasets: [...uploadedExtras, ...jsonRes.datasets] } as unknown as T;
+    }
+    if (
+      inDemo &&
+      method === "POST" &&
+      (path === "/ai/generate-dashboard" || path === "/descriptive-builder/save") &&
+      jsonRes?.created_dashboard
+    ) {
       saveDemoCreatedDashboard(jsonRes.created_dashboard);
     }
     return jsonRes;
@@ -242,10 +516,20 @@ export async function apiFetch<T = any>(
 }
 
 export async function apiDownload(path: string, filename: string) {
-  const token = getStoredToken();
-  const res = await fetch(`/api/v1${path}`, {
+  const inDemo = typeof window !== "undefined" && isDemoPreviewMode();
+  const token = inDemo ? getStoredToken() : null;
+  let res = await fetch(`/api/v1${path}`, {
+    credentials: "include",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
+  if (res.status === 401 && !inDemo) {
+    const refreshed = await attemptCookieRefresh();
+    if (refreshed) {
+      res = await fetch(`/api/v1${path}`, {
+        credentials: "include",
+      });
+    }
+  }
   if (!res.ok) {
     throw new ApiError(res.status, `Download failed (${res.status})`);
   }

@@ -1,5 +1,6 @@
+from datetime import datetime
 from typing import Optional
-from sqlalchemy import String, Boolean, Integer, Text, ForeignKey, UniqueConstraint, JSON, Index
+from sqlalchemy import String, Boolean, Integer, Text, DateTime, ForeignKey, UniqueConstraint, JSON, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 from app.models.common import TimestampMixin, gen_uuid
@@ -54,6 +55,10 @@ class Dashboard(Base, TimestampMixin):
     embed_token: Mapped[Optional[str]] = mapped_column(String(128), unique=True, nullable=True)
     refresh_interval_sec: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     settings_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    allow_public_restricted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    public_restricted_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    public_restricted_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    public_restricted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -234,3 +239,20 @@ class DashboardState(Base, TimestampMixin):
     filter_state_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     drill_state_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     widget_overrides_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class NamedDashboardLayout(Base, TimestampMixin):
+    """Named layout presets per dashboard allowing multiple saved layouts and quick switching."""
+    __tablename__ = "named_dashboard_layouts"
+    __table_args__ = (UniqueConstraint("dashboard_id", "name", name="uq_dash_named_layout"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_uuid)
+    dashboard_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("dashboards.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    layout_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )

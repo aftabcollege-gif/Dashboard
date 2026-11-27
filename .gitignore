@@ -14,6 +14,7 @@ node_modules/
 .next/
 out/
 .turbo/
+*.tsbuildinfo
 npm-debug.log*
 
 # Runtime generated databases, caches & uploads (excluded from git; created on startup/seed)

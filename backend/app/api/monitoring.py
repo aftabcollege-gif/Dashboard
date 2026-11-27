@@ -8,6 +8,7 @@ from app.core.cache import cache_manager
 from app.database import get_db
 from app.engines.export_engine import export_to_csv_bytes
 from app.engines.warehouse import warehouse
+from app.models.dashboard import Dashboard, Workspace
 from app.models.identity import AuditLog, User
 from app.models.performance import (
     DashboardPerformanceLog,
@@ -23,6 +24,7 @@ def get_audit_logs(
     action: Optional[str] = None,
     status: Optional[str] = None,
     username: Optional[str] = None,
+    search: Optional[str] = None,
     limit: int = 100,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -35,6 +37,13 @@ def get_audit_logs(
         q = q.filter(AuditLog.status == status)
     if username:
         q = q.filter(AuditLog.username.ilike(f"%{username}%"))
+    if search:
+        pat = f"%{search}%"
+        q = q.filter(
+            AuditLog.action.ilike(pat)
+            | AuditLog.username.ilike(pat)
+            | AuditLog.resource_type.ilike(pat)
+        )
     rows = q.order_by(AuditLog.created_at.desc()).limit(min(limit, 500)).all()
     return [
         {
@@ -81,18 +90,49 @@ def export_audit_logs_csv(user: User = Depends(get_current_user), db: Session = 
 def performance_dashboard(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "view")
     proc = psutil.Process()
-    avg_dash_ms = db.query(func.avg(DashboardPerformanceLog.load_ms)).scalar() or 0.0
-    avg_widget_ms = db.query(func.avg(WidgetPerformanceLog.load_ms)).scalar() or 0.0
-    avg_query_ms = db.query(func.avg(QueryExecutionLog.execution_ms)).scalar() or 0.0
 
-    slowest_widgets = (
-        db.query(WidgetPerformanceLog)
-        .order_by(WidgetPerformanceLog.load_ms.desc())
-        .limit(10)
+    org_dash_ids = [
+        d.id
+        for d in db.query(Dashboard.id)
+        .join(Workspace, Workspace.id == Dashboard.workspace_id)
+        .filter(Workspace.organization_id == user.organization_id)
         .all()
+    ]
+
+    if org_dash_ids:
+        avg_dash_ms = (
+            db.query(func.avg(DashboardPerformanceLog.load_ms))
+            .filter(DashboardPerformanceLog.dashboard_id.in_(org_dash_ids))
+            .scalar()
+            or 0.0
+        )
+        avg_widget_ms = (
+            db.query(func.avg(WidgetPerformanceLog.load_ms))
+            .filter(WidgetPerformanceLog.dashboard_id.in_(org_dash_ids))
+            .scalar()
+            or 0.0
+        )
+        slowest_widgets = (
+            db.query(WidgetPerformanceLog)
+            .filter(WidgetPerformanceLog.dashboard_id.in_(org_dash_ids))
+            .order_by(WidgetPerformanceLog.load_ms.desc())
+            .limit(10)
+            .all()
+        )
+    else:
+        avg_dash_ms = 0.0
+        avg_widget_ms = 0.0
+        slowest_widgets = []
+
+    avg_query_ms = (
+        db.query(func.avg(QueryExecutionLog.execution_ms))
+        .filter(QueryExecutionLog.organization_id == user.organization_id)
+        .scalar()
+        or 0.0
     )
     slowest_queries = (
         db.query(QueryExecutionLog)
+        .filter(QueryExecutionLog.organization_id == user.organization_id)
         .order_by(QueryExecutionLog.execution_ms.desc())
         .limit(10)
         .all()
@@ -104,7 +144,7 @@ def performance_dashboard(user: User = Depends(get_current_user), db: Session = 
             "memory_mb": round(proc.memory_info().rss / (1024 * 1024), 2),
             "warehouse_size_bytes": warehouse.storage_size_bytes(),
         },
-        "cache": cache_manager.stats(),
+        "cache": cache_manager.stats(organization_id=user.organization_id),
         "averages": {
             "dashboard_load_ms": round(float(avg_dash_ms), 2),
             "widget_load_ms": round(float(avg_widget_ms), 2),
@@ -132,5 +172,5 @@ def performance_dashboard(user: User = Depends(get_current_user), db: Session = 
 @router.post("/cache/invalidate")
 def invalidate_system_cache(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     enforce_permission(db, user, "admin", "*", "edit")
-    cleared = cache_manager.invalidate_all()
+    cleared = cache_manager.invalidate_org(user.organization_id)
     return {"cleared_entries": cleared}

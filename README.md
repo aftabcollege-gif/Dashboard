@@ -1,14 +1,14 @@
-# Enterprise Intelligence Dashboard Platform (AI-Powered BI & Dynamic Dashboard Builder)
+# Enterprise Intelligence Dashboard Platform (NexusBI Enterprise v1.2.0)
 
-Production-grade, decoupled Business Intelligence and Dynamic Dashboard Builder built with **FastAPI**, **DuckDB OLAP Warehouse**, **PostgreSQL / SQLite Metadata DB**, **Redis / Smart Cache**, **Next.js 14**, **Apache ECharts**, and **Active Directory / Enterprise RBAC**.
+Production-grade, decoupled Business Intelligence, Process Intelligence (BPMN), and SOC Tier 1/2 Platform built with **FastAPI**, **DuckDB OLAP Warehouse**, **PostgreSQL / SQLite Metadata DB (Alembic 0007)**, **Redis / Smart Cache**, **Next.js 16**, **Apache ECharts**, and **Active Directory / Persian Enterprise RBAC**.
 
 ---
 
 ## Live Architecture Overview (Three-Layer Separation)
 
-1. **Layer 1 — Application Metadata DB (`backend/app/models/`, `backend/migrations/postgres_schema.sql`)**:
-   - SQLAlchemy 2.x supporting **PostgreSQL 16** (with range-partitioned `audit_logs`, `widget_load_logs`, `query_execution_logs`) and zero-config local **SQLite WAL**.
-   - Stores Users, Roles, Groups, Resource Permissions, AD Connections, RLS/CLS Policies, Workspaces, Dashboards, Pages, Widgets, Filters, Themes, ETL Definitions, and Telemetry.
+1. **Layer 1 — Application Metadata DB (`backend/app/models/`, `backend/alembic/versions/`)**:
+   - SQLAlchemy 2.x + Alembic (`0007_enterprise_platform_v12`) supporting **PostgreSQL 16** and zero-config local **SQLite WAL**.
+   - Stores Users, Roles, Groups, Resource Permissions, AD Connections, RLS/CLS Policies, Workspaces, Dashboards, Named Layouts, Widgets, Themes, Composite Datasets, Background Jobs, BPMN Bottleneck Rules & Layouts, SOC Tier 1/2 Alerts/Incidents/CVE Exposures, Action Items, and Audit Telemetry.
 2. **Layer 2 — Independent Analytical Data Warehouse (`backend/app/engines/warehouse.py`)**:
    - Powered by embedded **DuckDB** columnar OLAP engine.
    - Completely isolated from operational sources and application UI; updated exclusively via decoupled ETL pipelines and file ingestion with atomic staging-to-production table swaps.
